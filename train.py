@@ -55,7 +55,7 @@ def estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_dat
                                    no_event_token_rate=no_event_token_rate, 
                                    cut_batch=True)
             with ctx:
-                logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
+                logits, loss, att, embeddings = model(X, A, Y, B, validation_loss_mode=True)
             losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
         out[split] = losses.mean(0)
     model.train()   
@@ -346,7 +346,7 @@ def main(args, replacement_values, code_to_exec):
                 local_client.log_batch(run_id, metrics=metric_objs)
             metric_buffer.clear()
                 
-        if step % EVAL_INTERVAL == 0 and iter_num > 0:
+        if iter_num % EVAL_INTERVAL == 0 and iter_num > 0:
             
             losses = estimate_loss(model, eval_iters, 
                 batch_size, block_size, 
@@ -379,7 +379,7 @@ def main(args, replacement_values, code_to_exec):
             }
 
             for k, v in metrics.items():
-                local_client.log_metric(run_id, k, v, step=step)
+                local_client.log_metric(run_id, k, v, step=iter_num)
 
             if val_loss is not None and (val_loss < best_val_loss * (1 - eps)):
                 patience_counter = 0
@@ -424,18 +424,21 @@ def main(args, replacement_values, code_to_exec):
                 local_client.log_artifact(run_id, ckpt_path, artifact_path="checkpoints")
 
         # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-        step += 1
+        iter_num += 1
         for micro_step in range(gradient_accumulation_steps):
 
             with ctx:
-                logits, loss, att, _ = model(X, A, Y, B)
+                logits, loss, att, embeddings = model(X, A, Y, B)
 
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             ix = torch.randint(len(train_p2i), (batch_size,))
             
-            X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
-                                   padding='random', lifestyle_augmentations=True, select='left',
-                                   no_event_token_rate=no_event_token_rate, cut_batch=True)
+            X, A, Y, B = get_batch(
+                ix, train_data, train_p2i, 
+                block_size=block_size, device=device,
+                padding='random', lifestyle_augmentations=True, select='left',
+                no_event_token_rate=no_event_token_rate, cut_batch=True
+            )
     
             # backward pass, with gradient scaling if training in fp16
             loss = loss['loss_ce'] + loss['loss_dt']
@@ -460,9 +463,10 @@ def main(args, replacement_values, code_to_exec):
         if iter_num % log_interval == 0:
             lossf = loss.item()  # loss as float. note: this is a CPU-GPU sync point
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
-    
-        iter_num += 1
-        if max_steps <= step:
+
+        print(f"{iter_num=}")    
+
+        if max_steps <= iter_num:
             break
         
     torch.save(best_ckpt, best_ckpt_path)
