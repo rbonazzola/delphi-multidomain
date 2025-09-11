@@ -4,6 +4,7 @@ import math
 import pickle as pkl
 from contextlib import nullcontext
 
+import tempfile
 import numpy as np
 import pandas as pd
 import torch
@@ -333,12 +334,13 @@ def main(args, replacement_values, code_to_exec):
 
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num, learning_rate, warmup_iters, lr_decay_iters, min_lr) if decay_lr else learning_rate
+
         if iter_num % MLFLOW_LOG_INTERVAL == 0:
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr            
                 metric_buffer["instant_learning_rate"].append((step, lr))
         
-        if iter_num % MLFLOW_LOG_INTERVAL == 0: # and mlflow.active_run():
+        if iter_num % MLFLOW_LOG_INTERVAL == 0:
             for metric_name, values in metric_buffer.items():
                 metric_objs = [Metric(key=metric_name, value=v, timestamp=int(time.time()*1000), step=s) for s, v in values]
                 local_client.log_batch(run_id, metrics=metric_objs)
@@ -346,28 +348,38 @@ def main(args, replacement_values, code_to_exec):
                 
         if step % EVAL_INTERVAL == 0 and iter_num > 0:
             
-            losses = estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_data, train_p2i, val_p2i, no_event_token_rate, device, ctx)
+            losses = estimate_loss(model, eval_iters, 
+                batch_size, block_size, 
+                train_data, val_data, train_p2i, val_p2i, 
+                no_event_token_rate, device, ctx
+            )
 
             # Raw losses
-            val_loss_raw = losses['val'].sum().item()
             train_loss_raw = losses['train'].sum().item()
+            val_loss_raw   = losses['val'].sum().item()
             
-            # Smooth losses
+            # Smooth losses out
             if val_loss is None:
-                val_loss_unpooled = losses['val']
                 train_loss_unpooled = losses['train']
-            val_loss_unpooled = (gamma := 0.3) * losses['val'] + (1 - gamma) * val_loss_unpooled
-            train_loss_unpooled = gamma * losses['train'] + (1 - gamma) * train_loss_unpooled
+                val_loss_unpooled   = losses['val']
+                
+            train_loss_unpooled = (gamma := 0.3) * losses['train'] + (1 - gamma) * train_loss_unpooled
+            val_loss_unpooled   = gamma * losses['val'] + (1 - gamma) * val_loss_unpooled
             
-            val_loss = val_loss_unpooled.sum().item()
             train_loss = train_loss_unpooled.sum().item()
-            
+            val_loss   = val_loss_unpooled.sum().item()
+                        
             # Logging
-            local_client.log_metric(run_id, "exp_avg_gamma", gamma, step=step)
-            local_client.log_metric(run_id, "val_loss", val_loss, step=step)
-            local_client.log_metric(run_id, "val_loss_raw", val_loss_raw, step=step)
-            local_client.log_metric(run_id, "train_loss", train_loss, step=step)
-            local_client.log_metric(run_id, "train_loss_raw", train_loss_raw, step=step)
+            metrics = {
+                "val_loss": val_loss,
+                "val_loss_raw": val_loss_raw,
+                "train_loss": train_loss,
+                "train_loss_raw": train_loss_raw,
+                "exp_avg_gamma": gamma,
+            }
+
+            for k, v in metrics.items():
+                local_client.log_metric(run_id, k, v, step=step)
 
             if val_loss is not None and (val_loss < best_val_loss * (1 - eps)):
                 patience_counter = 0
@@ -392,6 +404,7 @@ def main(args, replacement_values, code_to_exec):
                     print(f"saving checkpoint to {out_dir}")
                     best_iter_num = iter_num
                     best_ckpt_path = os.path.join(out_dir, ckpt_file := f'best_ckpt__{run_id}__{iter_num}.pt')
+                    
                     # torch.save(checkpoint, ckpt_path)
                     # mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
 
@@ -403,16 +416,20 @@ def main(args, replacement_values, code_to_exec):
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': full_config,
+                    'labels': labels
                 }
                 print(f"saving checkpoint to {out_dir}")
                 ckpt_path = os.path.join(out_dir, ckpt_file := f'ckpt__{run_id}__{iter_num}.pt')
                 torch.save(checkpoint, ckpt_path)
                 local_client.log_artifact(run_id, ckpt_path, artifact_path="checkpoints")
 
+        # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————
         step += 1
         for micro_step in range(gradient_accumulation_steps):
+
             with ctx:
                 logits, loss, att, _ = model(X, A, Y, B)
+
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             ix = torch.randint(len(train_p2i), (batch_size,))
             
@@ -428,12 +445,15 @@ def main(args, replacement_values, code_to_exec):
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
         # step the optimizer and scaler if training in fp16
         scaler.step(optimizer)
         scaler.update()
+        
         # flush the gradients as soon as we can, no need for this memory anymore
         optimizer.zero_grad(set_to_none=True)
-    
+        # ———————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
         # timing and logging
         dt = (t1 := time.time()) - t0
         t0 = t1
@@ -448,8 +468,41 @@ def main(args, replacement_values, code_to_exec):
     torch.save(best_ckpt, best_ckpt_path)
     local_client.log_metric(run_id, "best_val_loss", best_val_loss)
     local_client.log_artifact(run_id, best_ckpt_path, artifact_path="checkpoints")
-    # local_iter_num += 1
     
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        if args.compute_auc:
+
+            print("Computing AUC on the test set...")
+            from evaluate import evaluate_auc_pipeline
+
+            auc_unpooled_df, auc_merged_df = evaluate_auc_pipeline( 
+                model, test_data, output_path, 
+                delphi_labels, diseases_of_interest=None, filter_min_total=args.filter_min_total,
+                disease_chunk_size=args.disease_chunk_size, device=device, seed=seed, n_bootstrap=args.n_bootstrap
+            )
+            
+            auc_unpooled_df.to_csv(os.path.join(tmpdir, "auc_unpooled.csv"), index=False)
+            auc_merged_df.to_csv(os.path.join(tmpdir, "auc_merged.csv"), index=False)
+        
+            mlflow.log_artifact(os.path.join(tmpdir, "auc_unpooled.csv"))
+            mlflow.log_artifact(os.path.join(tmpdir, "auc_merged.csv"))
+    
+        # --- Splits ---
+        splits = {
+            "train_ids": train_ids.tolist(),
+            "val_ids":   val_ids.tolist(),
+            "test_ids":  test_ids.tolist()
+        }
+
+        with open(os.path.join(tmpdir, "splits.json"), "w") as f:
+            for name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
+                open(os.path.join(tmpdir, f"{name}_ids.csv"), "w").write("\n".join(ids)).close()
+                # df = pd.DataFrame({"id": ids}, header=None)
+                # path = os.path.join(tmpdir, f"{name}_ids.csv")
+                # df.to_csv(path, index=False)
+                mlflow.log_artifact(path)
+
     mlflow.end_run()
 
 
@@ -497,13 +550,13 @@ if __name__ == "__main__":
     parser.add_argument("--data", dest="data", default=None)
     parser.add_argument("--test_fold", type=int)
     parser.add_argument("--experiment-name", "--experiment_name", "-x", dest="experiment_name", default=None, help="Default: delphi-hla or delphi (if --no-hla is set)")
-
-    # parser.add_argument("--no-hla", "--no_hla", dest="no_hla", action="store_true", default=False)
-
     parser.add_argument("--show-config", "--show_config", dest="show_config", action="store_true", default=False)
     parser.add_argument("--exclude_subjects", default=None)
     parser.add_argument("--interactive", "-i", dest="interactive", default=False, action="store_true", help="Placeholder argument (behaviour not yet implemented)")
     parser.add_argument("--test", default=False, action="store_true", help="If true, appends '-test' to MLflow experiment name, if not already included in the name.")
+    parser.add_argument("--compute_auc", "--compute-auc", "--auc", dest="compute_auc", default=False, action="store_true", help="If True, computes AUC on the test set at the end of training.")
+    parser.add_argument("--n_bootstrap", "--n-bootstrap", "--nbootstrap", dest="n_bootstrap", type=int, default=100, help="Number of bootstrap samples to use when computing AUC confidence intervals.")
+    
     args, manual_args = parser.parse_known_args()
     
     replacement_values, code_to_exec = parse_manual_args(manual_args)

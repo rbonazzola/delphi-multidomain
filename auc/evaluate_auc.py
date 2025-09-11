@@ -1,14 +1,21 @@
-import scipy.stats
+import os, sys
 import scipy
+import scipy.stats
+
 import warnings
 import torch
-from model import DelphiConfig, Delphi
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import argparse
-from utils import get_batch, get_p2i
 from pathlib import Path
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
+from model import DelphiConfig, Delphi
+from utils import get_batch, get_p2i
 
 
 def auc(x1, x2):
@@ -425,6 +432,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate AUC")
     parser.add_argument("--input_path", type=str, help="Path to the dataset")
     parser.add_argument("--data_filename", type=str, default="", help="Prefix in the file name, i.e. what comes before '_val.bin'.")
+    parser.add_argument("--keep_subjects", type=str, default="", help="Path to the file with the subjects to keep")
     parser.add_argument("--output_path", type=str, help="Path to the output")
     parser.add_argument("--delphi-labels", "--delphi_labels", type=str, help="Path to Delphi labels")
     parser.add_argument("--model_ckpt_path", type=str, help="Path to the model weights")
@@ -440,28 +448,46 @@ def main():
     args = parser.parse_args()
 
     input_path = args.input_path
-    output_path = args.output_path
+    
     no_event_token_rate = args.no_event_token_rate
     health_token_replacement_prob = args.health_token_replacement_prob
     dataset_subset_size = args.dataset_subset_size
+    
+
+    keep_subjects = args.keep_subjects
+    if keep_subjects:
+        keep_subjects = pd.read_csv(keep_subjects, header=None).iloc[:, 0].tolist()
+        print(f"Keeping {len(keep_subjects)} subjects")
+        print(keep_subjects)
 
     # Create output folder if it doesn't exist.
-    Path(output_path).mkdir(exist_ok=True, parents=True)
+    Path(output_path := args.output_path).mkdir(exist_ok=True, parents=True)
 
     device = "cuda"
     seed = 1337
 
     # Load model checkpoint and initialize model.
-    ckpt_path = args.model_ckpt_path
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    conf = DelphiConfig(**checkpoint["model_args"])
-    model = Delphi(conf)
-    state_dict = checkpoint["model"]
-    state_dict = { k.replace("_orig_mod.", ""): v for k, v in state_dict.items() }
-    model.load_state_dict(state_dict)
-    model.eval()
-    model = model.to(device)
 
+    model = Delphi.load_model(args.model_ckpt_path, device=device).eval()
+
+    # ckpt_path = args.model_ckpt_path
+    # checkpoint = torch.load(ckpt_path, map_location=device)
+    # conf = DelphiConfig(**checkpoint["model_args"])
+    # model = Delphi(conf)
+    # state_dict = checkpoint["model"]
+    # state_dict = { k.replace("_orig_mod.", ""): v for k, v in state_dict.items() }
+    # model.load_state_dict(state_dict)
+    # model.eval()
+
+    from utils import DelphiData
+    delphi_data = DelphiData(
+        data_dir=input_path,
+        val_fold=val_fold,
+        delphi_labels=args.delphi_labels,
+        labels=args.labels,
+        keep_subjects=keep_subjects,
+    )
+    
     # Load validation data.
     val = np.fromfile(f"{input_path}/{args.data_filename}", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
 
