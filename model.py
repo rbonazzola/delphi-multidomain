@@ -335,11 +335,11 @@ class Delphi(nn.Module):
         return loss_dt
     
 
-    def get_allowed_tokens_mask(self, targets, ignored_tokens):
+    def get_allowed_tokens_mask(self, targets, ignore_tokens):
 
         targets = targets.reshape(-1)
         pass_tokens = targets != -1 
-        for k in ignored_tokens: # and gender
+        for k in ignore_tokens: # and gender
             pass_tokens *= targets != k
 
         return pass_tokens
@@ -348,11 +348,11 @@ class Delphi(nn.Module):
         self.validation_loss_mode = validation_loss_mode
 
 
-    def blackout_ignored(self, logits, ignored_tokens):
+    def blackout_ignored(self, logits, ignore_tokens):
 
         if self.validation_loss_mode:
-            ignored_tokens += [1]
-            logits[..., ignored_tokens] = -torch.inf
+            ignore_tokens += [1]
+            logits[..., ignore_tokens] = -torch.inf
 
         return logits
 
@@ -366,7 +366,7 @@ class Delphi(nn.Module):
 
         device = token_stream.device
         b, t = token_stream.size()
-        ignored_tokens = self.config.ignore_tokens.copy()
+        ignore_tokens = self.config.ignore_tokens.copy()
         t_min = self.config.t_min
         
         self.set_valid_loss_mode(validation_loss_mode)
@@ -383,8 +383,9 @@ class Delphi(nn.Module):
         x = x + age_emb
         x = self.transformer.drop(x)
 
-        attn_mask = self.build_attention_mask(token_stream, age, targets, targets_age, self.config.mask_ties) 
+        mask_ties = self.config.mask_ties
 
+        attn_mask = self.build_attention_mask(token_stream, age, targets, targets_age, mask_ties) 
         x, att = self.transformer_block(x, attn_mask, return_attentions=return_attentions)
         embeddings = x if return_embeddings else None
         
@@ -398,7 +399,7 @@ class Delphi(nn.Module):
             logits = self.lm_head(x)
                 
             # mask for logits' rows containing predicted tokens (to be included in the loss)
-            pass_tokens = self.get_allowed_tokens_mask(targets, ignored_tokens)
+            pass_tokens = self.get_allowed_tokens_mask(targets, ignore_tokens)
 
             '''
             targets = targets.reshape(-1)
@@ -407,8 +408,10 @@ class Delphi(nn.Module):
                 pass_tokens *= targets != k
             '''
                
-            loss_ce = self.cross_entropy_loss(logits, targets, ignore_tokens)
-            loss_dt = self.time_to_event_loss(logits, targets_age-age, attn_mask, t_min, agg='mean')
+            logits_flat = logits.view(-1, logits.size(-1))
+            targets_flat = targets.view(-1)
+            loss_ce = self.cross_entropy_loss(logits_flat, targets_flat, ignore_tokens)
+            loss_dt = self.time_to_event_loss(logits, targets_age-age, pass_tokens, attn_mask, mask_ties, t_min, agg='mean')
 
             '''
             # time to next event loss, padding masked
