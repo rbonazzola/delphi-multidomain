@@ -328,6 +328,8 @@ def main(args, replacement_values, code_to_exec):
         unoptimized_model = model
         model = torch.compile(model)  # requires PyTorch 2.0
 
+    tmpdir = tempfile.mkdtemp(prefix=".tmp/artifacts_{}_".format(run_id))
+
     print("\n──────── TRAINING STARTS ──────────────────────────────────────────────────────────────────────────")
     # ─────────────────────────────── TRAINING LOOP ───────────────────────────────
     while True:
@@ -408,7 +410,7 @@ def main(args, replacement_values, code_to_exec):
                     # torch.save(checkpoint, ckpt_path)
                     # mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
 
-            if iter_num % 100_000 == 0:
+            if iter_num % 10_000 == 0:
                 checkpoint = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -473,40 +475,39 @@ def main(args, replacement_values, code_to_exec):
     local_client.log_metric(run_id, "best_val_loss", best_val_loss)
     local_client.log_artifact(run_id, best_ckpt_path, artifact_path="checkpoints")
     
-    with tempfile.TemporaryDirectory() as tmpdir:
 
-        if args.compute_auc:
+    if args.compute_auc:
 
-            print("Computing AUC on the test set...")
-            from evaluate import evaluate_auc_pipeline
+        print("Computing AUC on the test set...")
+        from evaluate import evaluate_auc_pipeline
 
-            auc_unpooled_df, auc_merged_df = evaluate_auc_pipeline( 
-                model, test_data, output_path, 
-                delphi_labels, diseases_of_interest=None, filter_min_total=args.filter_min_total,
-                disease_chunk_size=args.disease_chunk_size, device=device, seed=seed, n_bootstrap=args.n_bootstrap
-            )
-            
-            auc_unpooled_df.to_csv(os.path.join(tmpdir, "auc_unpooled.csv"), index=False)
-            auc_merged_df.to_csv(os.path.join(tmpdir, "auc_merged.csv"), index=False)
+        auc_unpooled_df, auc_merged_df = evaluate_auc_pipeline( 
+            model, test_data, output_path, 
+            delphi_labels, diseases_of_interest=None, filter_min_total=args.filter_min_total,
+            disease_chunk_size=args.disease_chunk_size, device=device, seed=seed, n_bootstrap=args.n_bootstrap
+        )
         
-            mlflow.log_artifact(os.path.join(tmpdir, "auc_unpooled.csv"))
-            mlflow.log_artifact(os.path.join(tmpdir, "auc_merged.csv"))
+        auc_unpooled_df.to_csv(os.path.join(tmpdir, "auc_unpooled.csv"), index=False)
+        auc_merged_df.to_csv(os.path.join(tmpdir, "auc_merged.csv"), index=False)
     
+        mlflow.log_artifact(os.path.join(tmpdir, "auc_unpooled.csv"))
+        mlflow.log_artifact(os.path.join(tmpdir, "auc_merged.csv"))
         # --- Splits ---
-        splits = {
-            "train_ids": train_ids.tolist(),
-            "val_ids":   val_ids.tolist(),
-            "test_ids":  test_ids.tolist()
-        }
+    splits = {
+        "train_ids": train_ids.tolist(),
+        "val_ids":   val_ids.tolist(),
+        "test_ids":  test_ids.tolist()
+    }
 
-        with open(os.path.join(tmpdir, "splits.json"), "w") as f:
-            for name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
-                open(os.path.join(tmpdir, f"{name}_ids.csv"), "w").write("\n".join(ids)).close()
-                # df = pd.DataFrame({"id": ids}, header=None)
-                # path = os.path.join(tmpdir, f"{name}_ids.csv")
-                # df.to_csv(path, index=False)
-                mlflow.log_artifact(path)
+    with open(os.path.join(tmpdir, "splits.json"), "w") as f:
+        for name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
+            open(os.path.join(tmpdir, f"{name}_ids.csv"), "w").write("\n".join(ids)).close()
+            # df = pd.DataFrame({"id": ids}, header=None)
+            # path = os.path.join(tmpdir, f"{name}_ids.csv")
+            # df.to_csv(path, index=False)
+            mlflow.log_artifact(path)
 
+    shutil.rmtree(tmpdir)
     mlflow.end_run()
 
 
