@@ -293,8 +293,8 @@ def get_calibration_auc(j, k, d, p, offset=365.25, age_groups=range(10, 80, 5), 
 def evaluate_auc_pipeline(
     model,
     d100k,
-    output_path,
     delphi_labels,
+    output_path=None,
     diseases_of_interest=None,
     filter_min_total=100,
     disease_chunk_size=200,
@@ -422,8 +422,8 @@ def evaluate_auc_pipeline(
     if output_path is not None:
         Path(output_path).mkdir(exist_ok=True, parents=True)
         print(f"Created this folder to store the parquet file: {output_path}")
-        df_auc_merged.to_parquet(f"{output_path}/df_both_onlywhite.parquet", index=False)
-        df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled_onlywhite.parquet", index=False)
+        df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
+        df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
 
     return df_auc_unpooled_merged, df_auc_merged
 
@@ -453,8 +453,8 @@ def main():
     health_token_replacement_prob = args.health_token_replacement_prob
     dataset_subset_size = args.dataset_subset_size
     
-
     keep_subjects = args.keep_subjects
+
     if keep_subjects:
         keep_subjects = pd.read_csv(keep_subjects, header=None).iloc[:, 0].tolist()
         print(f"Keeping {len(keep_subjects)} subjects")
@@ -482,25 +482,25 @@ def main():
     from utils import DelphiData
     delphi_data = DelphiData(
         data_dir=input_path,
-        val_fold=val_fold,
+        test_fold=test_fold,
         delphi_labels=args.delphi_labels,
         labels=args.labels,
         keep_subjects=keep_subjects,
     )
     
     # Load validation data.
-    val = np.fromfile(f"{input_path}/{args.data_filename}", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
+    test = np.fromfile(f"{input_path}/{args.data_filename}", dtype=np.uint32).reshape(-1, 3).astype(np.int64)
 
-    val_p2i = get_p2i(val)
+    test_p2i = get_p2i(test)
 
     if dataset_subset_size == -1:
-        dataset_subset_size = len(val_p2i)
+        dataset_subset_size = len(test_p2i)
 
     # Get a subset batch for evaluation.
     d100k = get_batch(
         range(dataset_subset_size),
-        val,
-        val_p2i,
+        test,
+        test_p2i,
         select="left",
         block_size=128,
         device=device,
