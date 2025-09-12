@@ -3,8 +3,9 @@ import time
 import math
 import pickle as pkl
 from contextlib import nullcontext
-
 import tempfile
+import shutil
+
 import numpy as np
 import pandas as pd
 import torch
@@ -21,13 +22,27 @@ from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
 
 import mlflow
-
 import random
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+logger = logging.getLogger("Training")
+
+os.environ["TMPDIR"] = os.getenv("TMPDIR", ".tmp") 
+
+section_separator = lambda title: print("\n" + "—" * (40 - len(title) // 2) + " " + title + " " + "—" * (40 - len(title) // 2) + "\n")
 
 MLFLOW_LOG_INTERVAL = 1000
 EVAL_INTERVAL = 1000
 
 def set_global_seed(seed=42):
+
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -113,10 +128,6 @@ def main(args, replacement_values, code_to_exec):
     if args.experiment_name is None:
         # args.experiment_name = "delphi" + ("" if args.no_hla else "-hla")
         args.experiment_name = "delphi"
-    # elif args.no_hla:
-    #     assert ("no-hla" in args.experiment_name) or ("nohla" in args.experiment_name) or ("hla" not in args.experiment_name), f'''
-    #        The experiment {args.experiment_name} name might be wrong considering you are not including HLA allele information.
-    #     '''
 
     if args.test and "test" not in args.experiment_name:
         args.experiment_name = experiment_name + "-test"
@@ -136,9 +147,9 @@ def main(args, replacement_values, code_to_exec):
         run_id = run.info.run_id
 
         mlflow.start_run(run_id=run_id)
+        logger.info(f"Creating run: {experiment_id}/{run_id}")
 
-    # ──────────────────────────────────────────────────────────────────────
-
+    # ───────────────────────────────────────────────────
 
     global seed, out_dir, log_interval, eval_iters, eval_only, always_save_checkpoint,\
         gradient_accumulation_steps, batch_size, block_size, init_from,\
@@ -207,12 +218,12 @@ def main(args, replacement_values, code_to_exec):
     # ──────────────────── OVERWRITE DEFAULT CONFIG ────────────────────
     code_to_exec = [code_to_exec] if isinstance(code_to_exec, str) else code_to_exec
     if code_to_exec[0]:
-        print("\n──────── REPLACING VARIABLE BASED ON FILE... ────────")
+        section_separator("REPLACING VARIABLE BASED ON FILE...")
 
     for code in code_to_exec:
-        print("."*100)        
+        # print("."*100)        
         exec(code, globals())
-        print("──────────────────────────────────────────────────────────────────────────────────")
+        section_separator("")
     del code, code_to_exec
             
     # _locals = 
@@ -241,26 +252,10 @@ def main(args, replacement_values, code_to_exec):
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
     
     # ───────────────────────── OPTIMIZER ─────────────────────────
+
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     
     # ────────────────────────── DATASET ──────────────────────────
-
-    '''    
-    if args.no_hla:
-        dataset, file_prefix, data_type = 'ukb_real_data', "ukb_real_", "real-no-hla"
-        dataset, file_prefix, data_type = 'ukb_real_5_folds_nohla', "", "real-nohla-5folds"
-    else:
-        filename_rules = [ 'ukb_real_5_folds_2digit', "", "real-hla-2digits-5folds"
-          'ukb_real_5_folds_4digit', "", "real-hla-4digits-5folds"
-          'ukb_real_5_folds_4digit', "", "real-hla-4digits"
-          'ukb_real_5_folds_4digit', "", "real-hla-4digits"
-          'ukb_real_data', "ukb_real_hla2d_", "real-hla-2digits"
-          'ukb_real_data', "ukb_real_hla4d_", "real-hla-4digits"
-        ]
-        dataset, file_prefix, data_type = filename_rules[0]
-
-    data_dir = os.path.join('data', dataset)
-    '''
 
     from cv_utils import load_fold_ids, generate_splits
 
@@ -318,7 +313,6 @@ def main(args, replacement_values, code_to_exec):
 
     for k, v in params.items():
         local_client.log_param(run_id, k, v)
-          
         metric_buffer = defaultdict(list)        
 
     print(f"{max_steps=}")
@@ -328,9 +322,12 @@ def main(args, replacement_values, code_to_exec):
         unoptimized_model = model
         model = torch.compile(model)  # requires PyTorch 2.0
 
-    tmpdir = tempfile.mkdtemp(prefix=".tmp/artifacts_{}_".format(run_id))
+    labels = pd.read_csv(os.path.join(os.path.dirname(args.data), "labels.csv")).assign(token=lambda df: df.token + 1).set_index("token").label
+    labels = [ labels.to_dict().get(i, None) for i in range(max(labels.to_dict().keys())) ]
+    tmpdir = tempfile.mkdtemp(prefix="artifacts_{}_".format(run_id))
 
-    print("\n──────── TRAINING STARTS ──────────────────────────────────────────────────────────────────────────")
+    section_separator("TRAINING STARTS")
+
     # ─────────────────────────────── TRAINING LOOP ───────────────────────────────
     while True:
 
@@ -365,7 +362,7 @@ def main(args, replacement_values, code_to_exec):
                 train_loss_unpooled = losses['train']
                 val_loss_unpooled   = losses['val']
                 
-            train_loss_unpooled = (gamma := 0.3) * losses['train'] + (1 - gamma) * train_loss_unpooled
+            train_loss_unpooled = (gamma := 0.8) * losses['train'] + (1 - gamma) * train_loss_unpooled
             val_loss_unpooled   = gamma * losses['val'] + (1 - gamma) * val_loss_unpooled
             
             train_loss = train_loss_unpooled.sum().item()
@@ -403,25 +400,25 @@ def main(args, replacement_values, code_to_exec):
                         'best_val_loss': val_loss,
                         'config': full_config,
                     }
-                    print(f"saving checkpoint to {out_dir}")
+                    logger.info(f"saving checkpoint to {tmpdir}")
                     best_iter_num = iter_num
-                    best_ckpt_path = os.path.join(out_dir, ckpt_file := f'best_ckpt__{run_id}__{iter_num}.pt')
+                    best_ckpt_path = os.path.join(tmpdir, ckpt_file := f'best_ckpt__{run_id}__{iter_num}.pt')
                     
                     # torch.save(checkpoint, ckpt_path)
                     # mlflow.log_artifact(ckpt_path, artifact_path="checkpoints")
 
-            if iter_num % 10_000 == 0:
+            if iter_num % 100_000 == 0:
                 checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': full_config,
-                    'labels': labels
+                  'model': model.state_dict(),
+                  'optimizer': optimizer.state_dict(),
+                  'model_args': model_args,
+                  'iter_num': iter_num,
+                  'best_val_loss': best_val_loss,
+                  'config': full_config,
+                  'labels': labels
                 }
-                print(f"saving checkpoint to {out_dir}")
-                ckpt_path = os.path.join(out_dir, ckpt_file := f'ckpt__{run_id}__{iter_num}.pt')
+                logger.info(f"saving checkpoint to {tmpdir}")
+                ckpt_path = os.path.join(tmpdir, ckpt_file := f'ckpt__{run_id}__{iter_num}.pt')
                 torch.save(checkpoint, ckpt_path)
                 local_client.log_artifact(run_id, ckpt_path, artifact_path="checkpoints")
 
@@ -464,9 +461,7 @@ def main(args, replacement_values, code_to_exec):
         t0 = t1
         if iter_num % log_interval == 0:
             lossf = loss.item()  # loss as float. note: this is a CPU-GPU sync point
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
-
-        print(f"{iter_num=}")    
+            logger.info(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
 
         if max_steps <= iter_num:
             break
@@ -475,16 +470,21 @@ def main(args, replacement_values, code_to_exec):
     local_client.log_metric(run_id, "best_val_loss", best_val_loss)
     local_client.log_artifact(run_id, best_ckpt_path, artifact_path="checkpoints")
     
-
+    test_data = get_batch(
+        range(len(test_p2i)), test_data, test_p2i, block_size=block_size, device=device,
+        padding='random', lifestyle_augmentations=True, select='left',
+        no_event_token_rate=no_event_token_rate)
+ 
     if args.compute_auc:
 
-        print("Computing AUC on the test set...")
-        from evaluate import evaluate_auc_pipeline
+        section_separator("Computing AUC on the test set...")
+        from auc.evaluate_auc import evaluate_auc_pipeline
 
+        disease_chunk_size = 200
         auc_unpooled_df, auc_merged_df = evaluate_auc_pipeline( 
-            model, test_data, output_path, 
-            delphi_labels, diseases_of_interest=None, filter_min_total=args.filter_min_total,
-            disease_chunk_size=args.disease_chunk_size, device=device, seed=seed, n_bootstrap=args.n_bootstrap
+            model, test_data, output_path=None, 
+            delphi_labels=pd.read_csv(args.delphi_labels), diseases_of_interest=None, filter_min_total=5,
+            disease_chunk_size=disease_chunk_size, device=device, seed=seed, n_bootstrap=100
         )
         
         auc_unpooled_df.to_csv(os.path.join(tmpdir, "auc_unpooled.csv"), index=False)
@@ -492,24 +492,23 @@ def main(args, replacement_values, code_to_exec):
     
         mlflow.log_artifact(os.path.join(tmpdir, "auc_unpooled.csv"))
         mlflow.log_artifact(os.path.join(tmpdir, "auc_merged.csv"))
-        # --- Splits ---
+       
+    # --- Splits ---
     splits = {
-        "train_ids": train_ids.tolist(),
-        "val_ids":   val_ids.tolist(),
-        "test_ids":  test_ids.tolist()
+        "train_ids": train_ids,
+        "val_ids":   val_ids,
+        "test_ids":  test_ids
     }
 
-    with open(os.path.join(tmpdir, "splits.json"), "w") as f:
-        for name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
-            open(os.path.join(tmpdir, f"{name}_ids.csv"), "w").write("\n".join(ids)).close()
-            # df = pd.DataFrame({"id": ids}, header=None)
-            # path = os.path.join(tmpdir, f"{name}_ids.csv")
-            # df.to_csv(path, index=False)
-            mlflow.log_artifact(path)
+    for name, ids in [("train", train_ids), ("val", val_ids), ("test", test_ids)]:
+        path = os.path.join(tmpdir, f"{name}_ids.csv")
+        with open(path, "w") as f:
+            f.write("\n".join(ids))
+        mlflow.log_artifact(path)
 
     shutil.rmtree(tmpdir)
     mlflow.end_run()
-
+    
 
 def parse_manual_args(manual_args):
     
@@ -523,11 +522,11 @@ def parse_manual_args(manual_args):
             continue
         if '=' not in arg:
             # assume it's the name of a config file
-            print(arg)
+            # print(arg)
             assert not arg.startswith('--'), "Arguments with -- should be of the form --x=y unless handled by argparse"
             assert os.path.exists(arg), f"{arg} should be a file but it does not exist"
             config_file = arg
-            print(config_file)
+            # print(config_file)
             with open(config_file) as f:
                 code_to_exec.append(open(config_file).read())
         else:
@@ -553,6 +552,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Delphi CLI")
     parser.add_argument("--dry-run", "--dry_run", "--dryrun", dest="dry_run", action="store_true", default=False)
     parser.add_argument("--data", dest="data", default=None)
+    parser.add_argument("--delphi_labels", default=None)
     parser.add_argument("--test_fold", type=int)
     parser.add_argument("--experiment-name", "--experiment_name", "-x", dest="experiment_name", default=None, help="Default: delphi-hla or delphi (if --no-hla is set)")
     parser.add_argument("--show-config", "--show_config", dest="show_config", action="store_true", default=False)
@@ -570,4 +570,3 @@ if __name__ == "__main__":
         raise NotImplementedError
     
     main(args, replacement_values, code_to_exec)
-    
