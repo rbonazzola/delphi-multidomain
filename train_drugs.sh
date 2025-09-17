@@ -1,6 +1,7 @@
 TEST_FOLD=${TEST_FOLD:=1}
 MAX_STEPS=${MAX_STEPS:=1000}
 EXPERIMENT_NAME=${EXPERIMENT_NAMEL="test-drugs"}
+DEVICE="cpu"
 
 python train.py \
   config/train_delphi-drugs.py \
@@ -9,7 +10,7 @@ python train.py \
   --test_fold $TEST_FOLD \
   --experiment-name ${EXPERIMENT_NAME} \
   --max_steps=${MAX_STEPS} \
+  --device=${DEVICE} \
   --eval_iters=100 \
-  --device="cuda:0" \
   --auc \
   "$@"
