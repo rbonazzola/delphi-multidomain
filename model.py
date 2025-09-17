@@ -282,7 +282,7 @@ class Delphi(nn.Module):
             return loss_ce_per_token
         if agg == "per_disease":
             loss_ce_per_token = self.cross_entropy_loss(logits, targets, pass_tokens, agg="per_token")
-            loss_ce_agg_per_disease = pd.DataFrame([loss_ce_per_token, targets.view(-1)[pass_tokens].numpy()]).T.\
+            loss_ce_agg_per_disease = pd.DataFrame([loss_ce_per_token, targets.view(-1)[pass_tokens].cpu().numpy()]).T.\
                 set_axis(["log_p", "token_id"], axis=1).\
                 astype({"token_id": int}).\
                 groupby("token_id").sum().\

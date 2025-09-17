@@ -3,6 +3,10 @@ import pandas as pd
 import torch
 import re
 import os
+import ast 
+
+PADDING_TOKEN = 0
+NO_EVENT_TOKEN_ID = 1
 
 # def get_p2i(data):
 #     """
@@ -290,3 +294,61 @@ class DelphiData:
         tokens = [i[0] for i in p]
         ages = [i[1] for i in p]
         return tokens, ages
+    
+
+def get_val_data(val_filename):
+    val_data = np.memmap(val_filename, dtype=np.int32).reshape(-1, 3)
+    val_p2i = get_p2i(val_data)
+    return val_data, val_p2i
+
+def fix_artifact_uri(artifact_uri):
+    artifact_uri = re.sub(pattern="^file://", repl="", string=artifact_uri)
+    artifact_uri = re.sub(pattern=".*/mlruns", repl="mlruns", string=artifact_uri)
+    import pathlib
+    artifact_uri = pathlib.Path(artifact_uri)
+    return artifact_uri
+
+
+def get_epoch_from_ckpt(ckpt_path):
+    return int(ckpt_path.split("_")[-1].split(".")[0])
+
+
+def get_ignored_tokens(runinfo, validation_loss_mode = True):
+    """
+    Get the list of ignored tokens from the runinfo.
+    """
+    ignored_tokens = ast.literal_eval(runinfo['ignore_tokens'])
+    if validation_loss_mode:
+        ignored_tokens += [NO_EVENT_TOKEN_ID]    
+    
+    if isinstance(ignored_tokens, int):
+        ignored_tokens = [ignored_tokens]
+    return ignored_tokens
+
+
+def get_top_counts(data, labels, top_n=200, ignored_tokens=[]):
+
+    id_to_token = dict(zip(labels.index-1, labels.name))
+
+    counts = pd.DataFrame(data, columns=["subject_id", "age", "token_id"]).\
+        query("token_id not in @ignored_tokens").\
+        assign(token=lambda df: df.token_id.apply(lambda x: id_to_token[x])).\
+        token.value_counts(ascending=False).\
+        head(top_n).\
+        sort_values()
+    
+    return counts
+
+
+def get_wte(model):
+   wte = model.transformer.wte.weight.detach().numpy()
+   return pd.DataFrame(wte, index=[ id_to_token[i] for i in range(-1, len(id_to_token)-1) ])
+
+
+def get_best_ckpt(runinfo):
+    """
+    Get the path to the best checkpoint from the runinfo.
+    """
+    ckpt_dir = fix_artifact_uri(runinfo.artifact_uri) / "checkpoints"
+    best_ckpt_path = ckpt_dir / sorted(os.listdir(ckpt_dir), key=get_epoch_from_ckpt)[-1]
+    return best_ckpt_path

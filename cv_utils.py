@@ -1,9 +1,11 @@
 import mlflow
 import re
 import os
+import numpy as np
+
+from utils import get_p2i
 
 from typing import List, Dict, Tuple, Optional, Union
-
 
 DATA_TYPE_CONFIGS = {
 
@@ -146,3 +148,34 @@ def generate_splits(
         splits.append(split)
 
     return splits
+
+
+def get_data_partitions(datafile, fold):
+
+    '''
+    datafile: numpy file containing three columns (subject_id, time, token_id)
+    '''
+
+    load_data_from_bin = lambda file: np.fromfile(file, dtype=np.uint32).reshape(-1, 3)
+
+    data = load_data_from_bin(datafile)
+    fold_ids = load_fold_ids("data/transforms/subject_lists", num_folds=10)
+
+    splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2, val_as_last=True)  
+    split_idx = fold - 1
+    
+    train_ids = splits[split_idx]["train"]
+    val_ids   = splits[split_idx]["valid"]
+    test_ids  = splits[split_idx]["test"]
+
+    train_data = data[np.isin(data[:,0], train_ids)]
+    val_data   = data[np.isin(data[:,0], val_ids)]
+    test_data  = data[np.isin(data[:,0], test_ids)]
+
+    train_p2i  = get_p2i(train_data)
+    val_p2i    = get_p2i(val_data)
+    test_p2i   = get_p2i(test_data)
+
+    return (train_data, train_p2i, train_ids), \
+           (val_data, val_p2i, val_ids), \
+           (test_data, test_p2i, test_ids)

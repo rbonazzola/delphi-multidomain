@@ -23,7 +23,6 @@ from mlflow.entities import Metric
 
 import mlflow
 import random
-
 import logging
 
 logging.basicConfig(
@@ -34,12 +33,19 @@ logging.basicConfig(
 
 logger = logging.getLogger("Training")
 
-os.environ["TMPDIR"] = os.getenv("TMPDIR", ".tmp") 
-
-section_separator = lambda title: print("\n" + "—" * (40 - len(title) // 2) + " " + title + " " + "—" * (40 - len(title) // 2) + "\n")
-
 MLFLOW_LOG_INTERVAL = 1000
 EVAL_INTERVAL = 1000
+
+os.environ["TMPDIR"] = os.getenv("TMPDIR", ".tmp") 
+
+from cv_utils import get_data_partitions
+
+def section_separator(title=""):
+    if title:
+        title = " " + title + " "
+
+    print("\n" + "—" * (40 - len(title) // 2) + title + "—" * (40 - len(title) // 2) + "\n")
+
 
 def set_global_seed(seed=42):
 
@@ -62,7 +68,7 @@ def estimate_loss(model, eval_iters, batch_size, block_size, train_data, val_dat
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters, 2)
         data = train_data if split == 'train' else val_data
-        p2i = train_p2i if split == 'train' else val_p2i
+        p2i  = train_p2i  if split == 'train' else val_p2i
         for k in range(eval_iters):
             ix = torch.randint(len(p2i), (batch_size,))
             X, A, Y, B = get_batch(ix, data, p2i, block_size=block_size,
@@ -118,7 +124,6 @@ def get_lr(it, learning_rate, warmup_iters, lr_decay_iters, min_lr):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
-
 
 
 def main(args, replacement_values, code_to_exec):
@@ -256,28 +261,10 @@ def main(args, replacement_values, code_to_exec):
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     
     # ────────────────────────── DATASET ──────────────────────────
-
-    from cv_utils import load_fold_ids, generate_splits
-
-    load_data_from_bin = lambda file: np.fromfile(file, dtype=np.uint32).reshape(-1, 3)
-
-    data = load_data_from_bin(args.data)
-    fold_ids = load_fold_ids("data/transforms/subject_lists", num_folds=10)
     
-    splits = generate_splits(fold_ids, n_train_folds=7, n_val_folds=1, n_test_folds=2, val_as_last=True)  
-    split_idx = args.test_fold - 1
-
-    train_ids = splits[split_idx]["train"]
-    val_ids   = splits[split_idx]["valid"]
-    test_ids  = splits[split_idx]["test"]
-    
-    train_data = data[np.isin(data[:,0], train_ids)]
-    val_data   = data[np.isin(data[:,0], val_ids)]
-    test_data  = data[np.isin(data[:,0], test_ids)]
-
-    train_p2i  = get_p2i(train_data)
-    val_p2i    = get_p2i(val_data)
-    test_p2i   = get_p2i(test_data)
+    train, valid, test = get_data_partitions(args.data, args.test_fold)
+    train_data, train_p2i, train_ids = train
+    val_data, val_p2i, val_ids = valid 
     
     # ─────────────────────────────────────────────────────────────
 
@@ -285,7 +272,7 @@ def main(args, replacement_values, code_to_exec):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
     
     torch.set_default_dtype(ptdtype)
-    
+
     ix = torch.randint(len(train_p2i), (batch_size,))
     X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                            padding='random', lifestyle_augmentations=True, select='left',
@@ -293,16 +280,12 @@ def main(args, replacement_values, code_to_exec):
     
     val_loss, step, iter_num, t0 = None, 0, 0, time.time()    
     
-    params = model_args |{
+    params = model_args | {
         "learning_rate": learning_rate,
         "batch_size": batch_size,
         "seed": seed,
-        # "hla": str(not args.no_hla),
         "num_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "dtype": dtype,
-        # "data_type": data_type,
-        # "val_filename": f"{data_dir}/{val_filename}",
-        # "train_filename": train_filename,
         "fold": args.test_fold,
         "n_folds": 5,
         "weight_decays": weight_decay,
@@ -382,6 +365,7 @@ def main(args, replacement_values, code_to_exec):
 
             if val_loss is not None and (val_loss < best_val_loss * (1 - eps)):
                 patience_counter = 0
+
             elif val_loss is not None:
                 patience_counter += 1
                 print(f"[early stopping] No improvement. Patience: {patience_counter}/{patience}")
@@ -470,10 +454,13 @@ def main(args, replacement_values, code_to_exec):
     local_client.log_metric(run_id, "best_val_loss", best_val_loss)
     local_client.log_artifact(run_id, best_ckpt_path, artifact_path="checkpoints")
     
+    test_data, test_p2i, test_ids = test
+
     test_data = get_batch(
         range(len(test_p2i)), test_data, test_p2i, block_size=block_size, device=device,
         padding='random', lifestyle_augmentations=True, select='left',
-        no_event_token_rate=no_event_token_rate)
+        no_event_token_rate=no_event_token_rate
+    )
  
     if args.compute_auc:
 
