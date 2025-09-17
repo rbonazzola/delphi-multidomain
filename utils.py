@@ -62,7 +62,7 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
     """
 
     MASKING_TOKEN, MASKING_AGE = -1, -10000
-    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3+359, 11+359
+    LIFESTYLE_MIN_INDEX, LIFESTYLE_MAX_INDEX = 3, 11
 
     # Define the columns of the data array    
     SUBJECT_ID_COLUMN = 0
