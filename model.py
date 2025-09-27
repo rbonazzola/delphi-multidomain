@@ -551,7 +551,7 @@ class Delphi(nn.Module):
             max_new_tokens = 128
 
         for _ in range(max_new_tokens):
-            logits, _, _ = self(idx, age)
+            logits, _, _, _ = self(idx, age)
             logits = logits[:, -1, :]
             logits[:,self.config.ignore_tokens] = -torch.inf
 
@@ -565,6 +565,8 @@ class Delphi(nn.Module):
             idx_next = t_next[1][:,None] # the index of the min sampled time
             age_next = age[...,[-1]] + t_next[0][:,None] # the value of the min sampled time
             
+            print(age_next)
+
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
             age = torch.cat((age, age_next), dim=1)
@@ -572,9 +574,17 @@ class Delphi(nn.Module):
             if torch.logical_or(torch.isin(idx, termination_tokens).any(-1), age_next > max_age).all():
                 break
         
-        pad = (torch.cumsum(torch.cumsum(torch.isin(idx, termination_tokens), 1).bool().int(), 1) > 1) + (age > max_age)
+        is_termination_token = (torch.cumsum(torch.cumsum(torch.isin(idx, termination_tokens), 1).bool().int(), 1) > 1)
+        print(f"{is_termination_token=}")
+        
+        overage = age > max_age
+        print(f"{overage=}")
+        
+        pad = is_termination_token + overage
+        
+        print(f"{pad=}")
 
-        logits, _, _ = self(idx, age)
+        logits, _, _, _ = self(idx, age)
         idx[pad] = 0
         age[pad] = mask_time
 
