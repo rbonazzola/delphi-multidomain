@@ -1,11 +1,7 @@
-import sys
 from pathlib import Path
 
 import pandas as pd
 import yaml
-
-DELPHI_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(DELPHI_DIR))
 
 from delphi.model import DomainConfig
 

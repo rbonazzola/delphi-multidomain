@@ -11,22 +11,17 @@ Usage:
 import argparse
 import logging
 import os
-import sys
-from pathlib import Path
 
 import mlflow
 import torch
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-
-if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
-    sys.path.insert(0, str(DELPHI_DIR))
-
 from auc.aucs import evaluate_aucs
 from utils.mlflow_utils import setup_mlflow
 from utils.run_loader import reconstruct_from_run
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 setup_mlflow()
 

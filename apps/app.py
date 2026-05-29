@@ -186,7 +186,7 @@ def load_runs(experiment_ids: str | list[str], val_loss_threshold: float = 1.0):
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
-        except:
+        except ValueError:
             continue
 
     df = df.loc[:, df.nunique(dropna=False) > 1]
@@ -199,7 +199,7 @@ def get_loss_curve(run_id, metric="val_loss"):
     try:
         history = client.get_metric_history(run_id, metric)
         return pd.DataFrame({"step": [m.step for m in history], "value": [m.value for m in history], "run_id": run_id})
-    except:
+    except Exception:
         return None
 
 

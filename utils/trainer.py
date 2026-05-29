@@ -1,8 +1,8 @@
 import os
 import shutil
-import sys
 import tempfile
 from collections.abc import Sequence
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -12,15 +12,8 @@ import mlflow
 import mlflow.artifacts
 import pandas as pd
 import torch
-from tqdm import tqdm
-
-if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
-    sys.path.insert(0, str(DELPHI_DIR))
-
-from contextlib import nullcontext
-from pathlib import Path
-
 import torch.amp
+from tqdm import tqdm
 
 
 def lod2dol(lod):

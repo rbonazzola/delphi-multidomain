@@ -1,5 +1,4 @@
 import ast
-import sys
 from pathlib import Path
 
 import mlflow
@@ -7,9 +6,6 @@ import pandas as pd
 import plotly.graph_objs as go
 import seaborn as sns
 import streamlit as st
-
-DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(DELPHI_DIR))
 
 # local modules
 from helpers import exponential_moving_average, load_labels

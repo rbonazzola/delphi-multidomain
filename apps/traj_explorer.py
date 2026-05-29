@@ -12,7 +12,6 @@ Run:
 Expects to be run from the Delphi project root.
 """
 
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,12 +21,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
-# ── Setup path ────────────────────────────────────────────────────────────
-
-DELPHI_DIR = Path(__file__).resolve().parent.parent
-if str(DELPHI_DIR) not in sys.path:
-    sys.path.insert(0, str(DELPHI_DIR))
 
 from data.dataset import (
     AgeSampler,
@@ -39,6 +32,7 @@ from delphi.model import AttentionMaskBuilder, Delphi
 from utils import load_domain_config
 from utils.cv_utils import get_data_partitions
 
+DELPHI_DIR = Path(__file__).resolve().parent.parent
 DAYS_PER_YEAR = 365.25
 
 # ── Domain colors ─────────────────────────────────────────────────────────

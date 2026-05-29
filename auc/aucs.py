@@ -17,14 +17,9 @@ Or with MLflow logging:
 from __future__ import annotations
 
 import gc
-import sys
 import warnings
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, cast
-
-if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
-    sys.path.insert(0, str(DELPHI_DIR))
 
 import numpy as np
 import pandas as pd
