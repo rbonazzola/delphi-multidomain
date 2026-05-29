@@ -1,0 +1,31 @@
+name: Lint & Type Check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install lint dependencies
+        run: uv sync --group lint
+
+      - name: ruff check
+        run: uv run ruff check
+
+      - name: ruff format
+        run: uv run ruff format --check
+
+      - name: mypy
+        run: uv run mypy .
+
+      - name: pyright
+        run: uv run pyright

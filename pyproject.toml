@@ -43,7 +43,8 @@ lint = [
   "mypy",
   "pyright",
   "pandas-stubs",
-  "types-PyYAML"
+  "types-PyYAML",
+  "pre-commit",
 ]
 test = [
   "pytest",
@@ -82,6 +83,7 @@ explicit = true
 [tool.ruff]
 line-length = 120
 extend-include = ["*.ipynb"]
+extend-exclude = ["deprecated"]
 target-version = "py311"
 
 [tool.ruff.lint]
@@ -104,12 +106,14 @@ ignore = [
 ]
 
 [tool.mypy]
+exclude = ["deprecated/"]
 ignore_missing_imports = true
 explicit_package_bases = true
 check_untyped_defs = true
 warn_unreachable = true
 
 [tool.pyright]
+exclude = ["deprecated"]
 reportPrivateImportUsage = "none"
 
 [tool.hatch.build.targets.wheel]
