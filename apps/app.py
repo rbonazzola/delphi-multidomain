@@ -282,11 +282,11 @@ if st.session_state.runs_loaded:
         runs_nohla, _ = load_runs([exp_id for exp_name, exp_id in experiments_nohla.items()], val_loss_threshold=11.95)
 
         runs_hla = sorted(
-            [f"{k} {v:.4f}" for k, v in zip(runs_hla["run_id"].tolist(), runs_hla["val_loss"].tolist())],
+            [f"{k} {v:.4f}" for k, v in zip(runs_hla["run_id"].tolist(), runs_hla["val_loss"].tolist(), strict=True)],
             key=lambda x: float(x.split()[1]),
         )
         runs_nohla = sorted(
-            [f"{k} {v:.4f}" for k, v in zip(runs_nohla["run_id"].tolist(), runs_nohla["val_loss"].tolist())],
+            [f"{k} {v:.4f}" for k, v in zip(runs_nohla["run_id"].tolist(), runs_nohla["val_loss"].tolist(), strict=True)],
             key=lambda x: float(x.split()[1]),
         )
 

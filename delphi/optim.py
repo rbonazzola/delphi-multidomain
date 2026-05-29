@@ -65,7 +65,7 @@ def configure_optimizers(
     blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
     for mn, m in model.named_modules():
         if len(list(m.children())) == 0:
-            for pn, p in m.named_parameters():
+            for pn, _ in m.named_parameters():
                 fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way

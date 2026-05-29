@@ -25,7 +25,7 @@ def filter_runs_with_loss_files(runs_df, min_files=10):
 
     counts = []
 
-    for idx, row in runs_df.iterrows():
+    for _, row in runs_df.iterrows():
         data_dir = Path(row["artifact_uri"]) / "val_loss_per_disease"
         found = list(data_dir.glob("losses_epoch*_*.csv"))
         counts.append((row["run_id"], len(found), str(data_dir)))

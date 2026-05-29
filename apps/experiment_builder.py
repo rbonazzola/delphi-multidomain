@@ -266,7 +266,7 @@ for i, cfg in enumerate(st.session_state.configs):
         cfg["_domains"] = resolve_at_birth(domains_str, at_birth_domains)
         cfg["_attn"] = resolve_at_birth(attn_str, at_birth_domains)
 
-col_add, _ = st.columns([1, 4])
+col_add, _spacer = st.columns([1, 4])
 with col_add:
     st.button("➕ Add configuration", on_click=add_config)
 
@@ -358,7 +358,7 @@ else:
                     st.text(f"  {col}: {vals}")
         with col2:
             st.markdown("**Configurations:**")
-            for i, cfg in enumerate(st.session_state.configs):
+            for _, cfg in enumerate(st.session_state.configs):
                 st.text(f"  {cfg['suffix']}: {cfg['_domains'][:40]}...")
         with col3:
             st.markdown("**Folds:**")

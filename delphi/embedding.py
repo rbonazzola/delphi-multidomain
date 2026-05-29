@@ -257,7 +257,7 @@ class MultiDomainEmbedding(nn.Module):
     @torch.no_grad()
     def _zero_placeholder_rows(self):
         """Set global embedding rows for projected domains to zero."""
-        for dname, (offset, n_slots) in self._projected_offsets.items():
+        for _, (offset, n_slots) in self._projected_offsets.items():
             self.global_embed.weight[offset : offset + n_slots] = 0.0
 
     # ── Properties ────────────────────────────────────────────────────────

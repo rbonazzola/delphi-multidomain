@@ -268,8 +268,8 @@ class Trainer(BaseTrainer):
         n_train_batches: int | None = None,
         n_val_batches: int | None = None,
         n_validations_per_epoch=1,
-        logger: NullLogger | MLFlowLogger = NullLogger(),
-        mlflow_params=dict(),
+        logger: NullLogger | MLFlowLogger | None = None,
+        mlflow_params: dict | None = None,
         start_epoch=0,
         log_loss_per_disease=False,
         use_tqdm=True,
@@ -306,11 +306,11 @@ class Trainer(BaseTrainer):
         self._validation_counter = 0
         self.n_validations_per_epoch = n_validations_per_epoch
 
-        self.logger = logger
+        self.logger = logger if logger is not None else NullLogger()
         self.val_loss: dict[str, torch.Tensor] | None = None
         self.ema_alpha = 0.02
 
-        self.additional_mlflow_params = mlflow_params | {"ema_alpha": self.ema_alpha}
+        self.additional_mlflow_params = (mlflow_params or {}) | {"ema_alpha": self.ema_alpha}
 
         self.use_tqdm = use_tqdm
         self.use_rich = use_rich
