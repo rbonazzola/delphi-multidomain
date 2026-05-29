@@ -66,7 +66,7 @@ def configure_optimizers(
     for mn, m in model.named_modules():
         if len(list(m.children())) == 0:
             for pn, _ in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
+                fpn = f"{mn}.{pn}" if mn else pn  # full param name
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
@@ -92,9 +92,9 @@ def configure_optimizers(
     param_dict = {pn: p for pn, p in model.named_parameters()}
     inter_params = decay & no_decay
     union_params = decay | no_decay
-    assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+    assert len(inter_params) == 0, f"parameters {inter_params} made it into both decay/no_decay sets!"
     assert len(param_dict.keys() - union_params) == 0, (
-        "parameters %s were not separated into either decay/no_decay set!" % (str(param_dict.keys() - union_params),)
+        f"parameters {param_dict.keys() - union_params} were not separated into either decay/no_decay set!"
     )
 
     trainable = set()
