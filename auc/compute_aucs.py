@@ -49,7 +49,7 @@ def main():
     parser.add_argument("--output_file", type=str, default="aucs.csv")
     args = parser.parse_args()
 
-    model, loaders, run_params = reconstruct_from_run(
+    model, loaders, _run_params = reconstruct_from_run(
         args.runid,
         split="test",
         block_size=args.block_size,

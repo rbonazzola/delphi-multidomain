@@ -97,7 +97,10 @@ select = [
     "PTH",  # flake8-use-pathlib — replace os.path.* and open() with pathlib equivalents
 ]
 ignore = [
-    "E501",  # line too long — formatter enforces line-length = 120, remaining cases are unfixable strings/comments
+    "E501",   # line too long — formatter enforces line-length = 120, remaining cases are unfixable strings/comments
+    "RUF001", # ambiguous unicode in strings — intentional (×, –, ➕ used in UI labels and math)
+    "RUF002", # ambiguous unicode in docstrings — same rationale
+    "RUF003", # ambiguous unicode in comments — same rationale
 ]
 
 [tool.mypy]

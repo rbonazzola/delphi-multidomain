@@ -51,7 +51,7 @@ with st.sidebar:
     attn_schemes = set([ast.literal_eval(v)[0] for v in raw_vals])
     selected_attn = st.multiselect(
         "attention_scheme",
-        options=list(attn_schemes) + ["(any)"],
+        options=[*list(attn_schemes), "(any)"],
     )
 
     selected_layers = st.multiselect(
@@ -89,7 +89,7 @@ with st.sidebar:
 # ---------------------------------------------------------
 labels_path = "tokenizer.yaml"
 labels = load_labels(labels_path)
-labels = labels + ["Death"]
+labels = [*labels, "Death"]
 
 token_display = [f"{i}: {labels[i]}" if i < len(labels) else str(i) for i in range(1257)]
 

@@ -1,3 +1,4 @@
+import itertools
 import os
 
 
@@ -33,9 +34,9 @@ def generate_splits(
         train_idx = [i for i in range(num_folds) if i not in test_idx and i not in val_idx]
 
         split = {
-            "train": sum([folds[i] for i in train_idx], []),
-            "valid": sum([folds[i] for i in val_idx], []),
-            "test": sum([folds[i] for i in test_idx], []),
+            "train": list(itertools.chain.from_iterable(folds[i] for i in train_idx)),
+            "valid": list(itertools.chain.from_iterable(folds[i] for i in val_idx)),
+            "test": list(itertools.chain.from_iterable(folds[i] for i in test_idx)),
         }
 
         splits.append(split)

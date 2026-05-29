@@ -118,7 +118,7 @@ def load_everything(
     }
 
     # Subject splits
-    train_ids, val_ids, test_ids = get_data_partitions("./data/transforms/subject_lists", fold=test_fold)
+    train_ids, _val_ids, _test_ids = get_data_partitions("./data/transforms/subject_lists", fold=test_fold)
 
     train_ids = train_ids[:100]
 
