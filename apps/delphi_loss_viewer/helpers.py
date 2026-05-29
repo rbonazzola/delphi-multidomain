@@ -44,7 +44,7 @@ def load_labels(path):
     if not path.exists():
         return []
 
-    with open(path, encoding="utf-8") as f:
+    with path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     if isinstance(data, dict):

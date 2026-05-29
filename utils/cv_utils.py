@@ -1,5 +1,5 @@
 import itertools
-import os
+from pathlib import Path
 
 
 def load_fold_ids(fold_dir: str, num_folds: int = 10) -> list[list[str]]:
@@ -9,8 +9,8 @@ def load_fold_ids(fold_dir: str, num_folds: int = 10) -> list[list[str]]:
     """
     folds = []
     for i in range(1, num_folds + 1):
-        fname = os.path.join(fold_dir, f"subset{i}of{num_folds}.csv")
-        with open(fname) as f:
+        fname = Path(fold_dir) / f"subset{i}of{num_folds}.csv"
+        with fname.open() as f:
             ids = [line.strip() for line in f if line.strip()]
             folds.append(ids)
     return folds

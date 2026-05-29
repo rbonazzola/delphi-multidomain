@@ -169,7 +169,7 @@ class MLFlowLogger:
 
     def log_df_as_artifact(self, df, filename="data.csv", artifact_path=None, relative_uri=True):
         tmp_dir = tempfile.mkdtemp()
-        tmp_path = os.path.join(tmp_dir, filename)
+        tmp_path = Path(tmp_dir) / filename
         df.to_csv(tmp_path, index=False)
         try:
             uri = self.log_artifact(tmp_path, artifact_path=artifact_path, relative_uri=relative_uri)

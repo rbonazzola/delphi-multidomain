@@ -412,7 +412,7 @@ class Delphi(nn.Module):
         if cfg.input_size is not None:
             return cfg.input_size
         tokenizer_path = Path(cfg.path) / "tokenizer.yaml"
-        with open(tokenizer_path) as f:
+        with tokenizer_path.open() as f:
             return len(yaml.safe_load(f))
 
     @staticmethod

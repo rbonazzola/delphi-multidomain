@@ -196,7 +196,7 @@ class MultiDomainEmbedding(nn.Module):
                 sizes[dname] = dcfg.input_size
             else:
                 tokenizer_path = Path(dcfg.path) / "tokenizer.yaml"
-                with open(tokenizer_path) as f:
+                with tokenizer_path.open() as f:
                     sizes[dname] = len(yaml.safe_load(f))
         return sizes
 

@@ -1,5 +1,5 @@
-import glob
 import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import mlflow
@@ -290,7 +290,7 @@ if st.session_state.runs_loaded:
             key=lambda x: float(x.split()[1]),
         )
 
-        parquet_files = glob.glob("mlruns/*/*/artifacts/auc/*parquet")
+        parquet_files = [str(p) for p in Path("mlruns").glob("*/*/artifacts/auc/*parquet")]
 
         runs_hla = [k for k in runs_hla if any([k.split(" ")[0] in f for f in parquet_files])]
         runs_nohla = [k for k in runs_nohla if any([k.split(" ")[0] in f for f in parquet_files])]

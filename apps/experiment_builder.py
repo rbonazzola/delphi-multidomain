@@ -28,7 +28,7 @@ _SCHEMES_YAML = Path(__file__).resolve().parent.parent / "config" / "attention_s
 def _load_attention_schemes():
     if not _SCHEMES_YAML.exists():
         return {"Custom (edit below)": ""}
-    with open(_SCHEMES_YAML) as f:
+    with _SCHEMES_YAML.open() as f:
         data = yaml.safe_load(f)
     schemes = {
         f"{name} — {entry['description']}": entry["scheme"]
@@ -53,7 +53,7 @@ def _get_at_birth_domains(domain_config_path: str) -> list[str]:
     path = Path(domain_config_path)
     if not path.exists():
         return []
-    with open(path) as f:
+    with path.open() as f:
         data = yaml.safe_load(f)
     return [name for name, cfg in data.items() if isinstance(cfg, dict) and cfg.get("at_birth")]
 
