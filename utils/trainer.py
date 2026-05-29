@@ -47,10 +47,7 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
     old_run_name = old_run.data.tags.get("mlflow.runName", "unnamed_run")
 
     exp = mlflow.get_experiment_by_name(new_experiment_name)
-    if exp is None:
-        exp_id = mlflow.create_experiment(new_experiment_name)
-    else:
-        exp_id = exp.experiment_id
+    exp_id = mlflow.create_experiment(new_experiment_name) if exp is None else exp.experiment_id
 
     new_run = mlflow.start_run(experiment_id=exp_id, run_name=new_run_name or f"{old_run_name}_resumed")
     new_run_id = new_run.info.run_id
@@ -601,7 +598,7 @@ class Trainer(BaseTrainer):
         out: dict[str, torch.Tensor] = {}
         if not outputs:
             return out
-        for k in outputs[0].keys():
+        for k in outputs[0]:
             try:
                 vals = [(v[k].detach() if torch.is_tensor(v[k]) else torch.as_tensor(v[k])) for v in outputs if k in v]
                 out[k] = torch.stack(vals).mean()

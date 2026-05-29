@@ -717,10 +717,7 @@ def main():
             st.info("Dropout active: " + " · ".join(parts))
 
     # Apply domain filter
-    if selected_domains:
-        df_filtered = df[df["domain"].isin(selected_domains)]
-    else:
-        df_filtered = df
+    df_filtered = df[df["domain"].isin(selected_domains)] if selected_domains else df
 
     # ── Tabs ──────────────────────────────────────────────────────────
     tab_timeline, tab_table, tab_attn = st.tabs(["📈 Timeline", "📋 Token Table", "🎯 Attention Mask"])

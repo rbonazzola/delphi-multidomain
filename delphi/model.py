@@ -212,10 +212,7 @@ class AttentionMaskBuilder(nn.Module):
             if cfg["type"] == "bidirectional":
                 mask[pair_mask] = 1
             elif cfg["type"] == "causal":
-                if cfg.get("mask_ties", False):
-                    causal = age_row > age_col
-                else:
-                    causal = age_row >= age_col
+                causal = age_row > age_col if cfg.get("mask_ties", False) else age_row >= age_col
                 final = pair_mask & causal
                 mask[final] = 1
             else:
