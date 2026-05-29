@@ -27,19 +27,23 @@ _SCHEMES_YAML = Path(__file__).resolve().parent.parent / "config" / "attention_s
 
 def _load_attention_schemes():
     if not _SCHEMES_YAML.exists():
-        return {"Custom (edit below)": ""}
+        return {"Custom (edit below)": {"scheme": "", "domains": ""}}
     with _SCHEMES_YAML.open() as f:
         data = yaml.safe_load(f)
-    schemes = {
-        f"{name} — {entry['description']}": entry["scheme"]
-        for name, entry in data.items()
-        if isinstance(entry, dict) and "scheme" in entry
-    }
-    schemes["Custom (edit below)"] = ""
+    schemes = {}
+    for name, entry in data.items():
+        if isinstance(entry, dict) and "scheme" in entry:
+            label = f"{name} — {entry['description']}"
+            schemes[label] = {
+                "scheme": entry["scheme"],
+                "domains": entry.get("domains", ""),
+            }
+    schemes["Custom (edit below)"] = {"scheme": "", "domains": ""}
     return schemes
 
 
 PREDEFINED_ATTENTION_SCHEMES = _load_attention_schemes()
+_FIRST_ATTN_PRESET = next(iter(PREDEFINED_ATTENTION_SCHEMES))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  at_birth alias
@@ -99,6 +103,103 @@ PREDEFINED_DOMAIN_SETS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Load params from TSV
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _load_params_from_tsv(path: str) -> str | None:
+    """Parse a params TSV and populate session state for sidebar widgets and configs."""
+    p = Path(path)
+    if not p.exists():
+        return f"File not found: `{path}`"
+
+    try:
+        df = pd.read_csv(p, sep="\t")
+    except Exception as e:
+        return f"Could not read file: {e}"
+
+    def _unique_ints(col):
+        return sorted(df[col].dropna().astype(int).unique().tolist())
+
+    def _unique_floats(col):
+        return sorted(df[col].dropna().astype(float).unique().tolist())
+
+    if "experiment_name" in df.columns:
+        st.session_state["ti_experiment_name"] = str(df["experiment_name"].iloc[0])
+
+    if "n_layer" in df.columns:
+        st.session_state["ms_n_layers"] = _unique_ints("n_layer")
+    if "n_embd" in df.columns:
+        st.session_state["ms_n_embds"] = _unique_ints("n_embd")
+    if "n_head" in df.columns:
+        st.session_state["ms_n_heads"] = _unique_ints("n_head")
+    if "test_fold" in df.columns:
+        st.session_state["ms_test_folds"] = _unique_ints("test_fold")
+    if "block_size" in df.columns:
+        raw = df["block_size"].dropna().unique().tolist()
+        parsed = []
+        for v in raw:
+            try:
+                parsed.append(int(v))
+            except (ValueError, TypeError):
+                parsed.append(str(v))
+        st.session_state["ms_block_sizes"] = parsed
+    if "learning_rate" in df.columns:
+        st.session_state["ms_learning_rates"] = _unique_floats("learning_rate")
+    if "batch_size_schedule" in df.columns:
+        schedules = df["batch_size_schedule"].dropna().unique().tolist()
+        st.session_state["radio_batch_mode"] = "Schedule"
+        st.session_state["ta_schedules"] = "\n".join(str(s) for s in schedules)
+    elif "batch_size" in df.columns:
+        st.session_state["radio_batch_mode"] = "Fixed"
+        st.session_state["ms_batch_sizes"] = _unique_ints("batch_size")
+    if "num_workers" in df.columns:
+        st.session_state["ni_num_workers"] = int(df["num_workers"].iloc[0])
+    if "seed" in df.columns:
+        seeds = _unique_ints("seed")
+        st.session_state["ti_seeds"] = ",".join(str(s) for s in seeds)
+    if "subjects" in df.columns and df["subjects"].notna().any():
+        st.session_state["ti_subjects"] = str(df["subjects"].dropna().iloc[0])
+    if "use_amp" in df.columns:
+        st.session_state["cb_use_amp"] = bool(df["use_amp"].iloc[0])
+    if "compute_aucs" in df.columns:
+        st.session_state["cb_compute_aucs"] = bool(df["compute_aucs"].iloc[0])
+
+    # Rebuild configs from unique (domains, attention_scheme) pairs
+    pair_cols = [c for c in ["domains", "attention_scheme"] if c in df.columns]
+    if len(pair_cols) == 2:
+        pairs = df[pair_cols].drop_duplicates()
+        new_configs = []
+        for idx, (_, row) in enumerate(pairs.iterrows()):
+            domains_str = str(row["domains"])
+            attn_str = str(row["attention_scheme"])
+
+            domains_preset = next(
+                (label for label, v in PREDEFINED_DOMAIN_SETS.items() if v == domains_str),
+                "Custom (edit below)",
+            )
+            attn_preset = next(
+                (label for label, info in PREDEFINED_ATTENTION_SCHEMES.items() if info["scheme"] == attn_str),
+                "Custom (edit below)",
+            )
+            suffix = f"_config{idx + 1}" if idx > 0 else "_base"
+            new_configs.append(
+                {
+                    "domains_preset": domains_preset,
+                    "domains_custom": domains_str if domains_preset == "Custom (edit below)" else "",
+                    "attn_preset": attn_preset,
+                    "attn_custom": attn_str if attn_preset == "Custom (edit below)" else "",
+                    "suffix": suffix,
+                    "_domains": domains_str,
+                    "_attn": attn_str,
+                }
+            )
+        st.session_state.configs = new_configs
+
+    return None  # success
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Page config
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -117,24 +218,56 @@ st.title("⚗️ Delphi Experiment Grid Builder")
 with st.sidebar:
     st.header("Experiment configurations")
 
+    # ── Load from previous params ─────────────────────────────────────────────
+    with st.expander("📂 Load from params TSV", expanded=False):
+        prev_tsv = st.text_input("Path to params TSV", value="", key="ti_prev_tsv")
+        if st.button("Load params"):
+            if prev_tsv.strip():
+                err = _load_params_from_tsv(prev_tsv.strip())
+                if err:
+                    st.error(err)
+                else:
+                    st.success("Params loaded — reloading...")
+                    st.rerun()
+            else:
+                st.warning("Enter a file path first.")
+
     st.subheader("Experiment name")
-    experiment_name = st.text_input("MLflow experiment name", value="Delphi-experiment")
+    experiment_name = st.text_input("MLflow experiment name", value="Delphi-experiment", key="ti_experiment_name")
 
     st.subheader("Architecture grid")
-    n_layers = st.multiselect("n_layer", [1, 2, 4, 6, 8, 12, 16, 24], default=[12])
-    n_embds = st.multiselect("n_embd", [60, 120, 180, 240, 360, 480], default=[240])
-    n_heads = st.multiselect("n_head", [1, 2, 3, 4, 6, 8, 12, 16], default=[12])
+    n_layers = st.multiselect("n_layer", [1, 2, 4, 6, 8, 12, 16, 24], default=[12], key="ms_n_layers")
+    n_embds = st.multiselect("n_embd", [60, 120, 180, 240, 360, 480], default=[240], key="ms_n_embds")
+    n_heads = st.multiselect("n_head", [1, 2, 3, 4, 6, 8, 12, 16], default=[12], key="ms_n_heads")
 
     st.subheader("Training grid")
-    batch_sizes = st.multiselect("batch_size", [32, 64, 128, 256, 512], default=[128])
-    block_sizes = st.multiselect("block_size", ["auto", 32, 64, 96, 128, 192, 256], default=[128])
+    batch_size_mode = st.radio("Batch size mode", ["Fixed", "Schedule"], horizontal=True, key="radio_batch_mode")
+    if batch_size_mode == "Fixed":
+        batch_sizes = st.multiselect("batch_size", [32, 64, 128, 256, 512], default=[128], key="ms_batch_sizes")
+        batch_size_schedules = []
+    else:
+        batch_sizes = []
+        _schedules_raw = st.text_area(
+            "batch_size_schedule(s) — one per line",
+            value="10:32,10:64,10:128,*:256x4",
+            key="ta_schedules",
+            help=(
+                "Format: n_epochs:batch_size or n_epochs:batch_sizexgrad_accum. "
+                "Use * for the last (open-ended) stage. "
+                "Example: 10:32,10:64,*:256x4"
+            ),
+        )
+        batch_size_schedules = [s.strip() for s in _schedules_raw.splitlines() if s.strip()]
+
+    block_sizes = st.multiselect("block_size", ["auto", 32, 64, 96, 128, 192, 256], default=[128], key="ms_block_sizes")
     learning_rates = st.multiselect(
         "learning_rate",
         [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
         default=[3e-4],
+        key="ms_learning_rates",
         format_func=lambda x: f"{x:.0e}",
     )
-    test_folds = st.multiselect("test_fold", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5])
+    test_folds = st.multiselect("test_fold", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5], key="ms_test_folds")
 
     st.subheader("Domain config")
     _available_configs = sorted(_CONFIG_DIR.glob("domain_config*.yaml"))
@@ -146,9 +279,9 @@ with st.sidebar:
         st.caption(f"at_birth → {', '.join(at_birth_domains)}")
 
     st.subheader("Other")
-    num_workers = st.number_input("num_workers", min_value=0, max_value=16, value=4)
-    subjects_path = st.text_input("subjects (path, leave empty for all)", value="")
-    seeds_input = st.text_input("seed(s) (comma-separated)", value="142")
+    num_workers = st.number_input("num_workers", min_value=0, max_value=16, value=4, key="ni_num_workers")
+    subjects_path = st.text_input("subjects (path, leave empty for all)", value="", key="ti_subjects")
+    seeds_input = st.text_input("seed(s) (comma-separated)", value="142", key="ti_seeds")
     seeds = [int(s.strip()) for s in seeds_input.split(",") if s.strip().isdigit()]
 
     st.subheader("Date cutoff (longitudinal)")
@@ -163,8 +296,8 @@ with st.sidebar:
         )
 
     st.subheader("Boolean flags")
-    use_amp = st.checkbox("use_amp (mixed precision)", value=True)
-    compute_aucs = st.checkbox("compute_aucs (evaluate after training)", value=True)
+    use_amp = st.checkbox("use_amp (mixed precision)", value=True, key="cb_use_amp")
+    compute_aucs = st.checkbox("compute_aucs (evaluate after training)", value=True, key="cb_compute_aucs")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -184,7 +317,7 @@ if "configs" not in st.session_state:
         {
             "domains_preset": "Base (no HLA, no PCs)",
             "domains_custom": "",
-            "attn_preset": "Full causal (mask ties)",
+            "attn_preset": _FIRST_ATTN_PRESET,
             "attn_custom": "",
             "suffix": "_base",
         }
@@ -196,7 +329,7 @@ def add_config():
         {
             "domains_preset": "Base (no HLA, no PCs)",
             "domains_custom": "",
-            "attn_preset": "Full causal (mask ties)",
+            "attn_preset": _FIRST_ATTN_PRESET,
             "attn_custom": "",
             "suffix": f"_config{len(st.session_state.configs) + 1}",
         }
@@ -245,6 +378,7 @@ for i, cfg in enumerate(st.session_state.configs):
             )
             cfg["attn_preset"] = attn_preset
 
+            scheme_info = PREDEFINED_ATTENTION_SCHEMES[attn_preset]
             if attn_preset == "Custom (edit below)":
                 cfg["attn_custom"] = st.text_area(
                     "Custom attention scheme",
@@ -254,8 +388,23 @@ for i, cfg in enumerate(st.session_state.configs):
                 )
                 attn_str = cfg["attn_custom"]
             else:
-                attn_str = PREDEFINED_ATTENTION_SCHEMES[attn_preset]
+                attn_str = scheme_info["scheme"]
                 st.code(attn_str, language=None)
+
+            # Suggest domains from YAML if available and different from current
+            suggested_domains = scheme_info.get("domains", "")
+            if suggested_domains and attn_preset != "Custom (edit below)":
+                current_domains = PREDEFINED_DOMAIN_SETS.get(domain_preset, cfg.get("domains_custom", ""))
+                if suggested_domains != current_domains:
+                    st.caption(f"Suggested domains: `{suggested_domains}`")
+                    if st.button("↑ Use these domains", key=f"use_scheme_domains_{i}"):
+                        preset_match = next(
+                            (label for label, v in PREDEFINED_DOMAIN_SETS.items() if v == suggested_domains),
+                            "Custom (edit below)",
+                        )
+                        cfg["domains_preset"] = preset_match
+                        cfg["domains_custom"] = suggested_domains if preset_match == "Custom (edit below)" else ""
+                        st.rerun()
 
         with col3:
             cfg["suffix"] = st.text_input("Suffix", value=cfg["suffix"], key=f"suffix_{i}")
@@ -281,9 +430,10 @@ st.subheader("Generated parameter grid")
 
 def generate_grid():
     rows = []
+    batch_dim = batch_size_schedules if batch_size_mode == "Schedule" else batch_sizes
     for fold in test_folds:
-        for n_layer, n_embd, n_head, batch_size, block_size, lr, seed in itertools.product(
-            n_layers, n_embds, n_heads, batch_sizes, block_sizes, learning_rates, seeds
+        for n_layer, n_embd, n_head, batch_val, block_size, lr, seed in itertools.product(
+            n_layers, n_embds, n_heads, batch_dim, block_sizes, learning_rates, seeds
         ):
             for cfg in st.session_state.configs:
                 domains = cfg["_domains"]
@@ -300,7 +450,6 @@ def generate_grid():
                     "n_embd": n_embd,
                     "n_head": n_head,
                     "test_fold": fold,
-                    "batch_size": batch_size,
                     "block_size": block_size,
                     "learning_rate": lr,
                     "domains": domains,
@@ -311,6 +460,11 @@ def generate_grid():
                     "use_amp": use_amp,
                     "compute_aucs": compute_aucs,
                 }
+
+                if batch_size_mode == "Schedule":
+                    row["batch_size_schedule"] = batch_val
+                else:
+                    row["batch_size"] = batch_val
 
                 if subjects_path:
                     row["subjects"] = subjects_path
@@ -330,11 +484,13 @@ df = generate_grid()
 if df.empty:
     st.warning("No experiments generated. Check your configuration.")
 else:
+    _batch_dim_vals = batch_size_schedules if batch_size_mode == "Schedule" else batch_sizes
+    _batch_label = "schedules" if batch_size_mode == "Schedule" else "batch_sizes"
     st.info(
         f"**{len(df)} experiments** = "
         f"{len(test_folds)} folds × "
         f"{len(n_layers)}×{len(n_embds)}×{len(n_heads)} arch × "
-        f"{len(batch_sizes)}×{len(block_sizes)}×{len(learning_rates)} training × "
+        f"{len(_batch_dim_vals)} {_batch_label}×{len(block_sizes)}×{len(learning_rates)} training × "
         f"{len(seeds)} seeds × "
         f"{len(st.session_state.configs)} configs"
     )
@@ -352,7 +508,8 @@ else:
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("**Unique values per parameter:**")
-            for col in ["n_layer", "n_embd", "n_head", "batch_size", "block_size", "learning_rate"]:
+            batch_col = "batch_size_schedule" if batch_size_mode == "Schedule" else "batch_size"
+            for col in ["n_layer", "n_embd", "n_head", batch_col, "block_size", "learning_rate"]:
                 if col in edited_df.columns:
                     vals = sorted(edited_df[col].unique())
                     st.text(f"  {col}: {vals}")

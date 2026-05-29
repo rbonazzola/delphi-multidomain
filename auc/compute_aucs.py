@@ -69,19 +69,19 @@ def main():
         autostart=False,
     )
     logger.start(resume_run_id=args.runid)
-
-    auc_df = evaluate_aucs(
-        model,
-        test_loader,
-        block_size=model.block_size,
-        run_id=args.runid,
-        n_jobs=args.n_jobs,
-        logger=logger,
-        output_file=args.output_file,
-    )
-
-    logger.end()
-    logging.info(f"Done. {len(auc_df)} AUC rows computed.")
+    try:
+        auc_df = evaluate_aucs(
+            model,
+            test_loader,
+            block_size=model.block_size,
+            run_id=args.runid,
+            n_jobs=args.n_jobs,
+            logger=logger,
+            output_file=args.output_file,
+        )
+        logging.info(f"Done. {len(auc_df)} AUC rows computed.")
+    finally:
+        logger.end()
 
 
 if __name__ == "__main__":

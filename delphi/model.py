@@ -37,6 +37,31 @@ from delphi.embedding import MultiDomainEmbedding
 logger = logging.getLogger(__name__)
 
 DAYS_PER_YEAR = 365.25
+_DAYS_PER_MONTH = 365.25 / 12
+
+
+def parse_duration(s) -> float:
+    """Parse a duration string to days.
+
+    Accepted formats: ``-20y`` (years), ``6m`` (months), ``1000d`` (days).
+    A unit suffix is always required. Numeric values (int/float) are returned
+    as-is (assumed to already be in days).
+
+    Examples::
+        parse_duration("-20y")  →  -7305.0
+        parse_duration("6m")    →   182.625
+        parse_duration("365d")  →   365.0
+    """
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s).strip()
+    _units = {"d": 1.0, "m": _DAYS_PER_MONTH, "y": DAYS_PER_YEAR}
+    if not s or s[-1] not in _units:
+        raise ValueError(
+            f"Duration {s!r} requires a unit suffix: d (days), m (months), y (years). Examples: '-20y', '6m', '1000d'."
+        )
+    return float(s[:-1]) * _units[s[-1]]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Config
@@ -54,13 +79,47 @@ class DomainConfig:
     path: str | None = None
     predict: bool = False
     age_jitter: bool = False
+    age_jitter_min: float = -20 * 365.25  # days
+    age_jitter_max: float = 40 * 365.25  # days
     type: str = "categorical"
     at_birth: bool = False
     n_latent_tokens: int | None = None
     subdomain: str | None = None  # filter tokens by metadata (e.g. "hla_a")
+    subdomain_column: str = "locus"  # metadata column used for subdomain filtering
+    token_value_column: str | None = None  # collapse tokens by this metadata column (e.g. "allele_1field")
+    parent: str | None = None  # inherit config from this domain (resolved at load time)
+    abstract: bool = False  # template-only domain; excluded from the active config
     group: str | None = None  # alias for attention mask (e.g. "hla_alleles")
     dropout_mode: str | None = None  # "token" (random tokens) | "block" (entire domain per subject)
     dropout_rate: float = 0.0  # probability of dropping; 0 = disabled
+    no_repeat: bool = (
+        False  # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
+    )
+
+    def __post_init__(self):
+        if self.at_birth and self.age_jitter:
+            raise ValueError("DomainConfig: at_birth and age_jitter are mutually exclusive — set only one.")
+        object.__setattr__(self, "_initialized", True)
+
+    _DURATION_FIELDS = frozenset({"age_jitter_min", "age_jitter_max"})
+
+    def __setattr__(self, name, value):
+        if name in DomainConfig._DURATION_FIELDS and isinstance(value, str):
+            value = parse_duration(value)
+        if getattr(self, "_initialized", False):
+            if name == "at_birth" and value:
+                object.__setattr__(self, "age_jitter", False)
+            elif name == "age_jitter" and value:
+                object.__setattr__(self, "at_birth", False)
+        object.__setattr__(self, name, value)
+
+    def set_age_jitter(self, value: bool, min: float | None = None, max: float | None = None):
+        self.age_jitter = value
+        if min is not None:
+            self.age_jitter_min = min
+        if max is not None:
+            self.age_jitter_max = max
+        return self
 
     def set_freeze(self, freeze: bool):
         self.freeze = freeze
@@ -135,10 +194,11 @@ class AttentionRule(TypedDict):
 
 
 class AttentionMaskBuilder(nn.Module):
-    def __init__(self, scheme_str: str, domain2id: dict):
+    def __init__(self, scheme_str: str, domain2id: dict, group_to_ints: dict[str, list[int]] | None = None):
         super().__init__()
         self.scheme = AttentionMaskBuilder._parse_scheme(scheme_str)
         self.domain2id = domain2id
+        self.group_to_ints = group_to_ints or {}
 
     @staticmethod
     def _split_top_level(s: str, sep: str = ",") -> list[str]:
@@ -205,7 +265,13 @@ class AttentionMaskBuilder(nn.Module):
             if dom_names == ("all",):
                 dom_ids = all_domain_ids
             else:
-                dom_ids = torch.tensor([self.domain2id[d] for d in dom_names], device=device)
+                ids = []
+                for d in dom_names:
+                    if d in self.group_to_ints:
+                        ids.extend(self.group_to_ints[d])
+                    else:
+                        ids.append(self.domain2id[d])
+                dom_ids = torch.tensor(ids, device=device)
             dom_mask = torch.isin(domains, dom_ids)
             pair_mask = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)
 
@@ -290,7 +356,7 @@ class LayerNorm(nn.Module):
 class MaskedSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_head == 0, f"{config.n_embd} is not divisible by {config.n_head}"
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -405,9 +471,11 @@ class Delphi(nn.Module):
 
     @staticmethod
     def _resolve_vocab_size(cfg) -> int:
-        """Get vocab size, reading tokenizer.yaml if input_size is None."""
+        """Get vocab size from input_size, pretrained .pt shape, or tokenizer.yaml."""
         if cfg.input_size is not None:
             return cfg.input_size
+        if cfg.projector == "pretrained" and cfg.pretrained_path is not None:
+            return torch.load(cfg.pretrained_path, weights_only=True).shape[0]
         tokenizer_path = Path(cfg.path) / "tokenizer.yaml"
         with tokenizer_path.open() as f:
             return len(yaml.safe_load(f))
@@ -429,7 +497,7 @@ class Delphi(nn.Module):
                 running += 2  # PADDING_TOKEN=0, NO_EVENT_TOKEN=1
             elif cfg is None:
                 offsets[d_int] = running
-            elif cfg.type == "categorical" and cfg.projector in ("embed", "Embed"):
+            elif cfg.type == "categorical" and cfg.projector in ("embed", "Embed", "pretrained"):
                 offsets[d_int] = running
                 running += Delphi._resolve_vocab_size(cfg)
             else:
@@ -448,7 +516,8 @@ class Delphi(nn.Module):
         if len(attention_scheme) == 1:
             attention_scheme = self.config.n_layer * attention_scheme
         if any("at_birth" in s for s in attention_scheme):
-            at_birth = ",".join(name for name, cfg in self.config.domains.items() if cfg.at_birth)
+            at_birth_names = [name for name, cfg in self.config.domains.items() if cfg.at_birth]
+            at_birth = at_birth_names[0] if len(at_birth_names) == 1 else "[" + ",".join(at_birth_names) + "]"
             attention_scheme = [s.replace("at_birth", at_birth) for s in attention_scheme]
         return attention_scheme
 
@@ -461,6 +530,12 @@ class Delphi(nn.Module):
             domain_to_int=self.domain_to_int,
         )
 
+        group_to_ints: dict[str, list[int]] = {}
+        for dname, dcfg in config.domains.items():
+            alias = dcfg.group or dcfg.parent
+            if alias:
+                group_to_ints.setdefault(alias, []).append(self.domain_to_int[dname])
+
         self.transformer = nn.ModuleDict(
             dict(
                 age_embedding=AgeEncoding(n_embd=config.n_embd),
@@ -469,7 +544,7 @@ class Delphi(nn.Module):
                     [
                         nn.ModuleList(
                             [
-                                AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int)
+                                AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int, group_to_ints)
                                 for i in range(config.n_layer)
                             ]
                         )
@@ -713,3 +788,53 @@ class Delphi(nn.Module):
         model = model.to(device)
 
         return model
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Post-forward utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def mask_seen_token_logits(
+    model: Delphi,
+    batch: DelphiBatch,
+    logits_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """
+    For domains with no_repeat=True, set logits of already-seen tokens to -inf.
+
+    At each prediction position t, any token that appeared in the input context
+    (positions 0..t) is masked out before the loss is computed. This prevents
+    the model from learning to suppress tokens that cannot recur by construction
+    of the dataset (e.g. diseases recorded only at first diagnosis).
+    """
+    no_repeat_domains = [dname for dname, cfg in model.config.domains.items() if cfg.no_repeat and dname in logits_dict]
+    if not no_repeat_domains:
+        return logits_dict
+
+    B, T = batch.domain_ids.shape
+    logits_dict = dict(logits_dict)  # shallow copy
+
+    for dname in no_repeat_domains:
+        d_int = model.domain_to_int[dname]
+        d_offset = model.domain_offsets[d_int]
+        domain_logits = logits_dict[dname]  # [B, T, D_vocab]
+        D_vocab = domain_logits.shape[-1]
+
+        # Use domain_ids to identify positions
+        is_domain = batch.domain_ids == d_int  # [B, T]
+        b_idx, t_idx = is_domain.nonzero(as_tuple=True)
+        local_ids = batch.global_token_ids[b_idx, t_idx] - d_offset  # guaranteed in [0, D_vocab-1]
+
+        # one_hot[b, t, d] = True iff position t in sequence b is local token d
+        one_hot = torch.zeros(B, T, D_vocab, device=batch.domain_ids.device, dtype=torch.bool)
+        one_hot[b_idx, t_idx, local_ids] = True
+
+        # seen_up_to[b, t, d] = True iff token d appeared in positions 0..t
+        seen_up_to = one_hot.cumsum(dim=1).bool()  # [B, T, D_vocab]
+
+        # logits[:, t, :] predicts the next token after position t;
+        # the context available at that step is exactly positions 0..t.
+        logits_dict[dname] = domain_logits.masked_fill(seen_up_to, float("-inf"))
+
+    return logits_dict

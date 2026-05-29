@@ -172,8 +172,9 @@ class MultiDomainEmbedding(nn.Module):
         # ── Global embedding table ────────────────────────────────────────
         self.global_embed = nn.Embedding(global_vocab_size, config.n_embd)
 
-        # Zero out placeholder rows for projected domains
-        self._projected_domain_names: list[str] = []
+        # Zero out placeholder rows for projected/pretrained domains
+        self._projected_domain_names: list[str] = []  # continuous: injected via continuous_data
+        self._pretrained_domain_names: list[str] = []  # categorical pretrained: injected via domain_ids mask
         self._projected_offsets: dict[str, tuple[int, int]] = {}  # domain_name -> (offset, n_slots)
         self._init_projectors(config)
 
@@ -237,13 +238,19 @@ class MultiDomainEmbedding(nn.Module):
                     raise ValueError(f"Unknown projector '{dcfg.projector}' for continuous domain '{dname}'")
 
             elif dcfg.projector.lower() == "pretrained":
-                is_projected = True
-                n_latent = dcfg.input_size  # one output token per input token
-                self.projectors[dname] = PretrainedProjector(
+                assert dcfg.pretrained_path is not None, (
+                    f"Domain '{dname}' has projector='pretrained' but pretrained_path is not set."
+                )
+                projector = PretrainedProjector(
                     pretrained_path=dcfg.pretrained_path,
                     n_embd=n_embd,
                     freeze=dcfg.freeze,
                 )
+                self.projectors[dname] = projector
+                self._pretrained_domain_names.append(dname)
+                offset = self.domain_offsets[d_int]
+                self._projected_offsets[dname] = (offset, projector.vocab_size)
+                is_projected = False  # handled separately, not via continuous_data
 
             if is_projected:
                 self._projected_domain_names.append(dname)
@@ -292,7 +299,7 @@ class MultiDomainEmbedding(nn.Module):
         # Step 1: global lookup (projected slots give zeros)
         emb = self.global_embed(batch.global_token_ids)  # [B, T, n_embd]
 
-        # Step 2: inject projected domain embeddings via scatter_add
+        # Step 2: inject continuous projected domain embeddings via scatter_add
         for dname in self._projected_domain_names:
             if dname not in batch.continuous_data:
                 continue
@@ -307,6 +314,18 @@ class MultiDomainEmbedding(nn.Module):
             # Expand positions to [B, n_latent, n_embd] for scatter_add
             idx = positions.unsqueeze(-1).expand(B, n_latent, E)  # [B, n_latent, n_embd]
             emb.scatter_add_(1, idx, proj_emb)
+
+        # Step 3: inject pretrained categorical domain embeddings
+        for dname in self._pretrained_domain_names:
+            domain_int = self.domain_to_int[dname]
+            offset = self.domain_offsets[domain_int]
+            mask = batch.domain_ids == domain_int  # [B, T]
+            if not mask.any():
+                continue
+            local_ids = batch.global_token_ids[mask] - offset  # [N]
+            h = self.projectors[dname].embed(local_ids)  # [N, d_ext]
+            proj = self.projectors[dname].linear(h).to(emb.dtype)  # [N, n_embd]
+            emb[mask] = proj
 
         return emb
 
@@ -380,13 +399,15 @@ class MultiDomainEmbedding(nn.Module):
         if domain_config.predict:
             self._predicted_domains.append(domain_name)
 
-        # If it's a projected domain, add its projector
-        if domain_config.type == "continuous" or domain_config.projector == "pretrained":
-            # Re-init just this projector
-            # (caller is responsible for updating the config and offsets
-            #  in the rest of the model)
+        # If it's a projected or pretrained domain, register accordingly
+        if domain_config.type == "continuous":
             self._projected_domain_names.append(domain_name)
             n_slots = domain_config.n_latent_tokens or 1
+            self._projected_offsets[domain_name] = (offset, n_slots)
+            self._zero_placeholder_rows()
+        elif domain_config.projector == "pretrained":
+            self._pretrained_domain_names.append(domain_name)
+            n_slots = vocab_size
             self._projected_offsets[domain_name] = (offset, n_slots)
             self._zero_placeholder_rows()
 

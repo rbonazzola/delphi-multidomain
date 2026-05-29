@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -60,6 +62,29 @@ DOMAIN_COLORS = {
 }
 
 DEFAULT_COLOR = "#CCCCCC"
+
+# Okabe-Ito palette as [0,1] RGB arrays for the blended attention mask view
+_DOMAIN_COLORS_RGB: dict[str, np.ndarray] = {
+    "diseases": np.array([0.00, 0.45, 0.70]),
+    "death": np.array([0.84, 0.37, 0.00]),
+    "cv_drugs": np.array([0.80, 0.47, 0.74]),
+    "ns_drugs": np.array([0.94, 0.89, 0.26]),
+    "lifestyle": np.array([0.00, 0.62, 0.45]),
+    "hla_alleles": np.array([0.34, 0.71, 0.91]),
+    "sex": np.array([0.94, 0.89, 0.26]),
+    "rare_variants": np.array([0.36, 0.15, 0.49]),
+    "genetic_pcs": np.array([0.50, 0.80, 0.20]),
+    "padding": np.array([0.40, 0.40, 0.40]),
+    "hla_a": np.array([0.34, 0.71, 0.91]),
+    "hla_b": np.array([0.94, 0.55, 0.55]),
+    "hla_c": np.array([0.34, 0.81, 0.88]),
+    "hla_dpa": np.array([0.07, 0.54, 0.70]),
+    "hla_dpb": np.array([0.03, 0.23, 0.30]),
+    "hla_dqa": np.array([1.00, 0.62, 0.11]),
+    "hla_dqb": np.array([0.50, 0.72, 0.09]),
+    "hla_drb": np.array([1.00, 0.35, 0.37]),
+}
+_DEFAULT_DOMAIN_COLOR_RGB = np.array([0.60, 0.60, 0.60])
 
 
 def get_color(domain_name):
@@ -150,6 +175,12 @@ def load_everything(
         seed=seed,
     )
 
+    age_jitter_config = {
+        domain_to_int[dname]: (cfg.age_jitter_min, cfg.age_jitter_max)
+        for dname, cfg in domain_cfg.items()
+        if getattr(cfg, "age_jitter", False) and dname in domain_to_int
+    }
+
     collate = DelphiCollateFn(
         age_sampler=age_sampler,
         block_size=block_size,
@@ -158,6 +189,7 @@ def load_everything(
         padding_domain_id=domain_to_int["padding"],
         no_event_token_id=1,
         continuous_domains=continuous_domains,
+        age_jitter=age_jitter_config,
     )
 
     return SimpleNamespace(
@@ -551,6 +583,58 @@ def plot_attention_mask_compact(mask, df, domain_colors):
     return fig
 
 
+def plot_attention_mask_blended(mask, domain_ids, ages, int_to_domain, exclude_padding=True):
+    """
+    Domain-blended attention mask (style from debug_18vs12.py).
+
+    Each cell's color = average of its row-domain color and column-domain color,
+    then multiplied by the mask (black = blocked). Tokens are sorted by age on
+    both axes; white lines mark domain-group boundaries.
+    Returns a matplotlib Figure.
+    """
+    d_arr = domain_ids.cpu().numpy()
+    a_arr = ages.cpu().numpy()
+
+    if exclude_padding:
+        keep = a_arr >= 0
+        idx = np.where(keep)[0]
+        d_arr = d_arr[keep]
+        a_arr = a_arr[keep]
+        mask_np = mask.cpu().float().numpy()[np.ix_(idx, idx)]
+    else:
+        mask_np = mask.cpu().float().numpy()
+
+    order = np.argsort(a_arr, kind="stable")
+    m = mask_np[np.ix_(order, order)]
+    d_ord = d_arr[order]
+
+    row_colors = np.array(
+        [_DOMAIN_COLORS_RGB.get(int_to_domain.get(int(d), "padding"), _DEFAULT_DOMAIN_COLOR_RGB) for d in d_ord]
+    )
+    img = (row_colors[:, None, :] + row_colors[None, :, :]) / 2
+    img = img * m[:, :, None]
+    boundaries = np.where(np.diff(d_ord))[0] + 1
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.imshow(img, aspect="auto", origin="upper", interpolation="nearest")
+    for b in boundaries:
+        ax.axhline(b - 0.5, color="white", lw=0.5)
+        ax.axvline(b - 0.5, color="white", lw=0.5)
+    ax.set_xlabel("Key (sorted by age)")
+    ax.set_ylabel("Query (sorted by age)")
+    ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+    present_domains = list(dict.fromkeys(int_to_domain.get(int(d), "padding") for d in d_ord))
+    legend_handles = [
+        mpatches.Patch(color=_DOMAIN_COLORS_RGB.get(d, _DEFAULT_DOMAIN_COLOR_RGB), label=d)
+        for d in present_domains
+        if d != "padding"
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=len(legend_handles), fontsize=8, framealpha=0.85)
+    plt.tight_layout()
+    return fig
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Main app
 # ══════════════════════════════════════════════════════════════════════════
@@ -650,6 +734,20 @@ def main():
         if dname in data.domain_to_int
     }
 
+    # Age-jitter toggle — only shown when at least one domain has jitter configured
+    apply_age_jitter = False
+    if data.collate.age_jitter:
+        with st.sidebar:
+            st.markdown("---")
+            apply_age_jitter = st.checkbox(
+                "Apply age jitter",
+                value=True,
+                help=", ".join(
+                    f"{data.int_to_domain.get(d, d)}: [{lo:.0f}, {hi:.0f}] days"
+                    for d, (lo, hi) in data.collate.age_jitter.items()
+                ),
+            )
+
     def make_live_collate(training: bool) -> DelphiCollateFn:
         return DelphiCollateFn(
             age_sampler=data.collate.age_sampler,
@@ -660,6 +758,7 @@ def main():
             no_event_token_id=1,
             continuous_domains=data.continuous_domains,
             domain_dropout=dropout_config,
+            age_jitter=data.collate.age_jitter if apply_age_jitter else {},
             training=training,
         )
 
@@ -706,7 +805,7 @@ def main():
         batch: DelphiBatch | None = None
     else:
         item = data.dataset[subject_idx]
-        batch = make_live_collate(training=bool(dropout_config))([item])
+        batch: DelphiBatch = make_live_collate(training=True)([item])
         df = batch_subject_to_df(data, batch, 0)
 
         if dropout_config:
@@ -792,18 +891,27 @@ def main():
 
                 mask_style = st.radio(
                     "Visualization style",
-                    ["Compact (domain-colored axes)", "Detailed (labeled axes)"],
+                    ["Domain-blended (age-sorted)", "Compact (domain-colored axes)", "Detailed (labeled axes)"],
                     horizontal=True,
                 )
 
-                if mask_style.startswith("Compact"):
+                if mask_style.startswith("Domain-blended"):
+                    fig_mask = plot_attention_mask_blended(
+                        mask,
+                        batch.domain_ids[0],
+                        batch.ages[0],
+                        data.int_to_domain,
+                    )
+                    st.pyplot(fig_mask)
+                    plt.close(fig_mask)
+                elif mask_style.startswith("Compact"):
                     fig_mask = plot_attention_mask_compact(mask, df, DOMAIN_COLORS)
+                    st.plotly_chart(fig_mask, use_container_width=True)
                 else:
                     fig_mask = plot_attention_mask(
                         mask, df, title=f"Attention Mask — Subject {subject_list[subject_idx]}"
                     )
-
-                st.plotly_chart(fig_mask, use_container_width=True)
+                    st.plotly_chart(fig_mask, use_container_width=True)
 
                 # Stats
                 T = mask.shape[0]

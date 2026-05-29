@@ -1,0 +1,84 @@
+diseases:
+  projector: embed
+  path: diseases
+  predict: true
+  no_repeat: true
+
+sex:
+  projector: embed
+  path: sex
+  at_birth: true
+
+death:
+  projector: embed
+  path: death
+  predict: true
+
+lifestyle:
+  projector: embed
+  path: lifestyle
+  age_jitter: true
+
+genetic_pcs:
+  type: continuous
+  projector: linear
+  path: genetic_pcs
+  at_birth: true
+  input_size: 40
+  n_latent_tokens: 5
+
+# Abstract parent — defines shared config for all HLA loci.
+# Not included as an active domain; use hla_alleles from domain_config_default.yaml
+# if you want the full unsplit domain.
+hla_alleles:
+  abstract: true
+  projector: embed
+  path: hla_alleles
+  at_birth: true
+  subdomain_column: locus
+
+hla_a:
+  parent: hla_alleles
+  subdomain: hla_a
+
+hla_b:
+  parent: hla_alleles
+  subdomain: hla_b
+
+hla_c:
+  parent: hla_alleles
+  subdomain: hla_c
+
+hla_dpa:
+  parent: hla_alleles
+  subdomain: hla_dpa
+
+hla_dpb:
+  parent: hla_alleles
+  subdomain: hla_dpb
+
+hla_dqa:
+  parent: hla_alleles
+  subdomain: hla_dqa
+
+hla_dqb:
+  parent: hla_alleles
+  subdomain: hla_dqb
+
+hla_drb:
+  parent: hla_alleles
+  subdomain: hla_drb
+
+# Group-level domains (DPA+DPB, DQA+DQB merged by locus_group column)
+hla_dp:
+  parent: hla_alleles
+  subdomain: hla_dp
+  subdomain_column: locus_group
+
+hla_dq:
+  parent: hla_alleles
+  subdomain: hla_dq
+  subdomain_column: locus_group
+
+padding:
+  projector: embed

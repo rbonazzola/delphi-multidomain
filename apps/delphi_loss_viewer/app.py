@@ -15,6 +15,8 @@ from styling import _normalize_value, build_map
 
 from utils import setup_mlflow
 
+DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
+
 setup_mlflow()
 
 print(mlflow.get_tracking_uri())
@@ -24,14 +26,30 @@ print(mlflow.get_tracking_uri())
 st.set_page_config(page_title="Delphi Loss Evolution Viewer", layout="wide")
 st.title("Delphi Loss Evolution Viewer")
 
+
 # ---------------------------------------------------------
 # SIDEBAR — EXPERIMENTS
 # ---------------------------------------------------------
+def _valid_experiments():
+    from mlflow_loader import _tracking_root
+
+    tracking_root = _tracking_root()
+    valid = []
+    for exp in mlflow.search_experiments():
+        exp_dir = tracking_root / exp.experiment_id
+        if exp_dir.is_dir() and any(exp_dir.glob("*/artifacts/val_loss_per_disease")):
+            valid.append(exp)
+    valid.sort(key=lambda e: (tracking_root / e.experiment_id).stat().st_mtime, reverse=True)
+    return valid
+
+
 with st.sidebar:
     st.header("Controls")
 
-    experiment_names = [(exp.experiment_id, exp.name) for exp in mlflow.search_experiments()]
-    exp_ids = st.multiselect("Experiment", [x[0] for x in experiment_names])
+    _exps = _valid_experiments()
+    _exp_options = {f"{e.name} ({e.experiment_id})": e.experiment_id for e in _exps}
+    _selected_labels = st.multiselect("Experiment", list(_exp_options.keys()))
+    exp_ids = [_exp_options[label] for label in _selected_labels]
 
     # Load runs
     runs_df = load_runs(exp_ids)
@@ -47,8 +65,15 @@ with st.sidebar:
     # Parameter-based filtering
     st.subheader("Run selection by parameter grid")
 
+    def _parse_attn(v):
+        try:
+            parsed = ast.literal_eval(v)
+            return parsed[0] if isinstance(parsed, (list, tuple)) else str(parsed)
+        except Exception:
+            return v
+
     raw_vals = sorted(runs_df["params.attention_scheme"].dropna().unique())
-    attn_schemes = set([ast.literal_eval(v)[0] for v in raw_vals])
+    attn_schemes = set([_parse_attn(v) for v in raw_vals])
     selected_attn = st.multiselect(
         "attention_scheme",
         options=[*list(attn_schemes), "(any)"],
@@ -59,7 +84,7 @@ with st.sidebar:
     )
 
     filtered = runs_df.copy()
-    filtered["params.attention_scheme"] = filtered["params.attention_scheme"].apply(lambda x: ast.literal_eval(x)[0])
+    filtered["params.attention_scheme"] = filtered["params.attention_scheme"].apply(lambda x: _parse_attn(x))
 
     if selected_attn and "(any)" not in selected_attn:
         filtered = filtered[filtered["params.attention_scheme"].isin(selected_attn)]
@@ -87,14 +112,9 @@ with st.sidebar:
 # ---------------------------------------------------------
 # TOKEN SELECTOR
 # ---------------------------------------------------------
-labels_path = "tokenizer.yaml"
-labels = load_labels(labels_path)
-labels = [*labels, "Death"]
-
-token_display = [f"{i}: {labels[i]}" if i < len(labels) else str(i) for i in range(1257)]
-
-selected_token = st.sidebar.selectbox("Select token:", token_display)
-token_id = int(selected_token.split(":")[0])
+labels_list = [*load_labels(DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml"), "Death"]
+id_to_name = {i: name for i, name in enumerate(labels_list)}
+name_to_id = {name: i for i, name in enumerate(labels_list)}
 
 loss_metric = st.sidebar.radio(
     "Loss metric",
@@ -104,6 +124,35 @@ loss_metric = st.sidebar.radio(
         "log_p_mean:  mean of per-batch mean log-p (difficulty, frequency-independent)"
     ),
 )
+
+sort_by_loss = st.sidebar.checkbox("Sort by loss contribution", value=False)
+
+
+def _names_sorted_by_loss(run_row, metric):
+    data_dir = Path(run_row["artifact_uri"]) / "val_loss_per_disease"
+    files = sorted(data_dir.glob("losses_epoch*_*.csv"))
+    if not files:
+        return None
+    try:
+        df = pd.read_csv(files[-1])
+        df = df.rename(columns={df.columns[0]: "token_id"})
+        col = metric if metric in df.columns else df.columns[1]
+        df = df.sort_values(col)  # ascending: most negative = highest loss
+        ordered = [id_to_name[int(tid)] for tid in df["token_id"] if int(tid) in id_to_name]
+        missing = [n for n in name_to_id if n not in ordered]
+        return ordered + sorted(missing)
+    except Exception:
+        return None
+
+
+if sort_by_loss and selected_runs:
+    first_run = runs_df[runs_df["run_id"] == selected_runs[0]].iloc[0]
+    token_names = _names_sorted_by_loss(first_run, loss_metric) or sorted(name_to_id)
+else:
+    token_names = sorted(name_to_id)
+
+selected_name = st.sidebar.selectbox("Select token:", token_names)
+token_id = name_to_id[selected_name]
 
 
 # ---------------------------------------------------------
@@ -171,7 +220,8 @@ for runid in selected_runs:
     # TOKEN LOSS
     df_sel = load_token_loss_for_run(runinfo, token_id)
 
-    runinfo[attr_color] = _normalize_value(attr_color, runinfo[attr_color])
+    if attr_color is not None:
+        runinfo[attr_color] = _normalize_value(attr_color, runinfo[attr_color])
 
     if df_sel is not None:
         add_run_trace_plotly(
@@ -217,7 +267,7 @@ fig_total.update_layout(
     template="plotly_white",
 )
 
-label_name = labels[token_id + 1] if token_id < len(labels) else f"Token {token_id}"
+label_name = id_to_name.get(token_id, f"Token {token_id}")
 
 fig_token.update_layout(
     title=f"Loss evolution for {label_name}  [{loss_metric}]",

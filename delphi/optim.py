@@ -11,7 +11,8 @@ from delphi.model import LayerNorm
 @dataclass
 class OptimConfig:
     # adamw optimizer
-    learning_rate: float = 6e-4  # max learning rate
+    learning_rate: float  # peak LR — must be set by caller (no sensible universal default)
+    min_lr: float  # floor LR — must be set by caller (typically learning_rate / 10)
     max_iters: int = 10000  # total number of training iterations
     weight_decay: float = 1e-1
     beta1: float = 0.9
@@ -19,10 +20,9 @@ class OptimConfig:
     grad_clip: float = 1.0  # clip gradients at this value, or disable if == 0.0
 
     # learning rate decay settings
-    schedule: str = "cosine"  # consine, constant
-    warmup_iters: int = 2000  # how many steps to warm up for
+    schedule: str = "cosine"  # cosine, constant
+    warmup_iters: int = 2000
     lr_decay_iters: int = 10000  # should be ~= max_iters per Chinchilla
-    min_lr: float = 6e-5  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 
 # learning rate decay scheduler (cosine with warmup)

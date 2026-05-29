@@ -16,6 +16,8 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
+from data.dataset import BatchSizeScheduler, DataModule, FlexibleDataLoader
+
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 
 AUTO_BLOCK_SIZE = 512  # used when a run was trained with block_size="auto"
@@ -36,6 +38,7 @@ def reconstruct_from_run(
     date_cutoff: str | None = None,
     birth_dates_file: str | None = None,
     device: str | None = None,
+    tokens_path: str | Path | None = None,
 ) -> tuple:
     """
     Reconstruct a trained Delphi model and dataloaders from an MLflow run.
@@ -83,6 +86,13 @@ def reconstruct_from_run(
             raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
 
     domain_cfg = parse_domains_param(params["domains"])
+
+    if tokens_path is not None:
+        tokens_root = Path(tokens_path)
+        for dname, dcfg in domain_cfg.items():
+            if dname == "padding" or not getattr(dcfg, "path", None):
+                continue
+            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
 
     stored_block_size = params.get("block_size", "96")
     if block_size is not None:
@@ -189,6 +199,7 @@ def reconstruct_model(run_id: str):
         infer_delphi_config_from_state_dict,
         migrate_domain_embed_to_global_embed,
         migrate_legacy_state_dict,
+        strip_compiled_prefix,
     )
     from utils.mlflow_utils import load_checkpoint, load_run_params, parse_domains_param
 
@@ -196,7 +207,8 @@ def reconstruct_model(run_id: str):
     attn_scheme = params["attention_scheme"]
 
     ckpt, ckpt_path = load_checkpoint(run_id)
-    weights = migrate_legacy_state_dict(ckpt["state_dict"])
+    weights = strip_compiled_prefix(ckpt["state_dict"])
+    weights = migrate_legacy_state_dict(weights)
     test_ids = ckpt["metadata"]["test_ids"]
 
     cfg = infer_delphi_config_from_state_dict(weights)
@@ -208,12 +220,14 @@ def reconstruct_model(run_id: str):
             continue
         dcfg.path = str(tokens_dir / Path(str(dcfg.path)).name)
 
+    block_size = int(params.get("block_size") or cfg.get("block_size") or 64)  # type: ignore
     delphi_cfg = DelphiConfig(
         n_embd=cfg["n_embd"],
         n_layer=cfg["n_layer"],
         token_dropout=0.1,
         domains=domain_cfg,
         attention_scheme=attn_scheme,
+        block_size=block_size,
     )
 
     model = Delphi(delphi_cfg)
@@ -248,6 +262,11 @@ def config_from_runid(runid: str):
     test_fold = runinfo.data.params.pop("test_fold", 0)
     runinfo.data.params.pop("learning_rate", None)
     runinfo.data.params.pop("ema_alpha", None)
+
+    bs_schedule_str = runinfo.data.params.pop("batch_size_schedule", None)
+    bs_scheduler = (
+        BatchSizeScheduler.from_string(bs_schedule_str) if bs_schedule_str and bs_schedule_str != "None" else None
+    )
 
     try:
         runinfo.data.params["attention_scheme"] = ast.literal_eval(runinfo.data.params["attention_scheme"])
@@ -334,14 +353,17 @@ def config_from_runid(runid: str):
         continuous_domains=continuous_domains,
     )
 
-    dataloaders = [
-        DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, collate_fn=collate),
+    train_batch_size = bs_scheduler.step(start_epoch).batch_size if bs_scheduler is not None else batch_size
+    dataloaders = DataModule(
+        FlexibleDataLoader(
+            train_dataset, batch_size=train_batch_size, shuffle=True, pin_memory=True, collate_fn=collate
+        ),
         DataLoader(valid_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
         DataLoader(test_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
-    ]
+    )
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
-    logged_params = {"test_fold": test_fold, "batch_size": batch_size}
+    logged_params = {"test_fold": test_fold, "batch_size": batch_size, "batch_size_scheduler": bs_scheduler}
 
     optimizer_state = ckpt.get("optimizer_state", None)
     scheduler_state = ckpt.get("scheduler_state", None)

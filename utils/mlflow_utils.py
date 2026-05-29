@@ -2,6 +2,7 @@ import ast
 import os
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import mlflow
 import torch
@@ -47,7 +48,7 @@ def get_checkpoint_path(run_id: str) -> Path:
     """
     artifact_uri = mlflow.get_run(run_id).info.artifact_uri
     assert artifact_uri is not None, "MLflow returned a None artifact_uri"
-    ckpt_dir = Path(re.sub(r"^file://", "", artifact_uri)) / "checkpoints"
+    ckpt_dir = Path(unquote(urlparse(unquote(artifact_uri)).path)) / "checkpoints"
 
     best = ckpt_dir / "best_model.pt"
     if best.exists():
@@ -95,9 +96,7 @@ def _get_last_epoch_checkpoint(run_dir: Path | str) -> tuple[Path, int]:
 
 
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:
-    """Load checkpoint from the last-epoch file for a run."""
-    mlflow_uri = Path(mlflow.get_tracking_uri().replace("file:", ""))
-    experiment_id = _get_experiment_id_from_runid(run_id)
-    ckpt_path, _ = _get_last_epoch_checkpoint(mlflow_uri / experiment_id / run_id)
+    """Load best_model.pt, falling back to the highest-epoch checkpoint."""
+    ckpt_path = get_checkpoint_path(run_id)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     return ckpt, ckpt_path

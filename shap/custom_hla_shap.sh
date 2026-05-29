@@ -10,8 +10,6 @@ ALLELE_ID=${SLURM_ARRAY_TASK_ID}
 
 cd /nfs/research/birney/users/bonazzola/repos/delphi
 
-DISEASE="essential primary hypertension"
-
 python shap/custom_hla_shap.py \
     --allele_id ${ALLELE_ID} \
-    --disease $DISEASE
+    --disease "${DISEASE}"

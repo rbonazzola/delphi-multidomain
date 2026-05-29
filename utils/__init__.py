@@ -6,6 +6,7 @@ Import from here rather than from individual submodules or from utils.utils.
 
 __all__ = [
     "AUTO_BLOCK_SIZE",
+    "apply_domain_overrides",
     "config_from_runid",
     "get_checkpoint_path",
     "load_checkpoint",
@@ -36,6 +37,7 @@ from utils.run_loader import (
     reconstruct_model,
 )
 from utils.utils import (
+    apply_domain_overrides,
     load_domain_config,
     read_ids,
 )

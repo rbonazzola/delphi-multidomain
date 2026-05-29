@@ -1,6 +1,8 @@
+import copy
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Sequence
 from contextlib import nullcontext
 from datetime import datetime
@@ -14,6 +16,8 @@ import pandas as pd
 import torch
 import torch.amp
 from tqdm import tqdm
+
+from delphi.model import mask_seen_token_logits
 
 
 def lod2dol(lod):
@@ -55,13 +59,25 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
     for k, v in old_run.data.tags.items():
         mlflow.set_tag(k, v)
     mlflow.set_tag("resumed_from", old_run_id)
+    mlflow.set_tag("parent_run", old_run_id)
 
     src_dir = mlflow.artifacts.download_artifacts(run_id=old_run_id)
     _dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
     dst_dir = Path(_dst_dir)
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
-    print(f"Cloned run {old_run_id} → {new_run_id} (experiment: {new_experiment_name})")
+    import logging as _logging
+
+    _logging.info(
+        "Resuming: new run created.\n"
+        "  Original run : %s\n"
+        "  New run ID   : %s\n"
+        "  Experiment   : %s\n"
+        "  parent_run tag set to original run ID.",
+        old_run_id,
+        new_run_id,
+        new_experiment_name,
+    )
     mlflow.end_run()
     return new_run_id
 
@@ -107,10 +123,16 @@ class NullLogger:
     def log_params(self, params):
         pass
 
+    def log_tags(self, tags):
+        pass
+
     def log_metrics(self, metrics, step=None):
         pass
 
     def log_artifact(self, path, artifact_path=None):
+        pass
+
+    def log_df_as_artifact(self, df, filename="data.csv", artifact_path=None, relative_uri=True):
         pass
 
     def log_model(self, model, artifact_path="model"):
@@ -151,6 +173,9 @@ class MLFlowLogger:
 
     def log_params(self, params):
         mlflow.log_params(params)
+
+    def log_tags(self, tags):
+        mlflow.set_tags(tags)
 
     def log_metrics(self, metrics, step=None):
         mlflow.log_metrics(metrics, step=step)
@@ -193,9 +218,25 @@ class MLFlowLogger:
 
         try:
             git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd).decode().strip()
-            git_dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=cwd).decode().strip())
+            porcelain = subprocess.check_output(["git", "status", "--porcelain"], cwd=cwd).decode().strip()
+            # "??" prefix = untracked file; skip those, only show tracked changes
+            dirty_files = "\n".join(line for line in porcelain.splitlines() if not line.startswith("??"))
+            git_dirty = bool(dirty_files)
         except Exception:
-            git_commit, git_dirty = "unknown", False
+            git_commit, git_dirty, dirty_files = "unknown", False, ""
+
+        if git_dirty:
+            import logging
+
+            logging.warning("Git worktree is dirty — results may not be reproducible.\n%s", dirty_files)
+            try:
+                diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=cwd).decode(errors="replace")
+                tmp_dir = tempfile.mkdtemp()
+                diff_path = Path(tmp_dir) / "git_diff.patch"
+                diff_path.write_text(diff)
+                mlflow.log_artifact(str(diff_path))
+            except Exception:
+                pass
 
         mlflow.set_tags(
             {
@@ -232,7 +273,7 @@ class MLFlowLogger:
         shutil.rmtree(tmp_dir)
 
         uri = mlflow.get_artifact_uri("checkpoints")
-        return Path(uri) / filename
+        return Path(self._strip_file_prefix(uri)) / filename
 
 
 # ———————————————————————————————————————————————————————————————————————————————
@@ -277,6 +318,8 @@ class Trainer(BaseTrainer):
         use_rich=True,
         checkpoint_every=None,
         optim_config=None,
+        batch_size_scheduler=None,
+        baseline_incidence_path=None,
     ):
 
         self.model = model
@@ -284,16 +327,18 @@ class Trainer(BaseTrainer):
         self.scheduler = scheduler
         self.early_stopper = EarlyStopping(patience=patience, min_delta=0.001, mode="min")
 
-        assert isinstance(dataloaders, list), (
-            "Argument 'dataloaders' should be a list of either 2 or 3 dataloaders (train/val[/test])"
-        )
+        from data.dataset import DataModule
 
-        if len(dataloaders) == 2:
+        if isinstance(dataloaders, DataModule):
+            self.train_loader = dataloaders.train
+            self.valid_loader = dataloaders.val
+            self.test_loader = dataloaders.test
+        elif isinstance(dataloaders, list) and len(dataloaders) == 2:
             self.train_loader, self.valid_loader = dataloaders
-        elif len(dataloaders) == 3:
+        elif isinstance(dataloaders, list) and len(dataloaders) == 3:
             self.train_loader, self.valid_loader, self.test_loader = dataloaders
         else:
-            raise ValueError(f"{len(dataloaders)=} ")
+            raise ValueError("dataloaders must be a DataModule or a list of 2 or 3 DataLoaders")
 
         self.n_train_batches: Literal["all"] | int = n_train_batches if n_train_batches is not None else "all"
         self.n_val_batches: Literal["all"] | int = n_val_batches if n_val_batches is not None else "all"
@@ -304,6 +349,7 @@ class Trainer(BaseTrainer):
 
         self.current_epoch = start_epoch
         self._validation_counter = 0
+        self._best_state_dict: dict[str, Any] | None = None
         self.n_validations_per_epoch = n_validations_per_epoch
 
         self.logger = logger if logger is not None else NullLogger()
@@ -316,6 +362,13 @@ class Trainer(BaseTrainer):
         self.use_rich = use_rich
         self.checkpoint_every = checkpoint_every  # None = only save on improvement
         self.optim_config = optim_config
+        self.batch_size_scheduler = batch_size_scheduler
+
+        if batch_size_scheduler is not None:
+            stage0 = batch_size_scheduler.step(start_epoch)
+            self.grad_accum_steps = stage0.grad_accum_steps
+        else:
+            self.grad_accum_steps = 1
 
         self.ce_ema: torch.Tensor | None = None
         self.time_ema: torch.Tensor | None = None
@@ -332,6 +385,27 @@ class Trainer(BaseTrainer):
 
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.allow_tf32 = True
+
+        # Relative CCE baseline
+        self.baseline_cce_calc = None  # type: ignore[name-defined]
+        self._baseline_records_buffer: list[dict] = []
+        if baseline_incidence_path is not None:
+            self._setup_baseline_cce(model, baseline_incidence_path)
+
+    def _setup_baseline_cce(self, model, incidence_path: str):
+        from delphi.model import Delphi
+        from utils.baseline_cce import BaselineCCECalculator
+
+        if "diseases" not in model.domain_to_int or "sex" not in model.domain_to_int:
+            print("[Trainer] Skipping baseline CCE: requires 'diseases' and 'sex' domains.")
+            return
+        disease_int = model.domain_to_int["diseases"]
+        disease_vocab_size = Delphi._resolve_vocab_size(model.config.domains["diseases"])
+        self._disease_domain_int = disease_int
+        self._disease_domain_offset = model.domain_offsets[disease_int]
+        self._sex_domain_int = model.domain_to_int["sex"]
+        self._sex_domain_offset = model.domain_offsets[self._sex_domain_int]
+        self.baseline_cce_calc = BaselineCCECalculator(incidence_path, disease_vocab_size)  # type: ignore[assignment]
 
     # ——————————————————————————————————————————————————————————————————————
 
@@ -372,9 +446,12 @@ class Trainer(BaseTrainer):
             t.add_column("Val CE", justify="right", width=9)
             t.add_column("Val dt", justify="right", width=10)
             t.add_column("Val tot", justify="right", width=10)
+            if self.baseline_cce_calc is not None:
+                t.add_column("Val relCCE", justify="right", width=11)  # type: ignore[unreachable]
             t.add_column("LR", justify="right", width=9)
+            t.add_column("Time", justify="right", width=8)
             t.add_column("Improved?", justify="center", width=10)
-            for row in epoch_rows:
+            for row in reversed(epoch_rows):
                 t.add_row(*row)
             return t
 
@@ -388,7 +465,7 @@ class Trainer(BaseTrainer):
         live = Live(Group(build_table(), progress), refresh_per_second=4)
         return progress, live, lambda: live.update(Group(build_table(), progress))
 
-    def train(self, max_epochs=1000, patience=None):
+    def train(self, max_epochs=1000, min_epochs=0, patience=None):
 
         if patience is not None:
             self.early_stopper.set_patience(patience)
@@ -402,6 +479,16 @@ class Trainer(BaseTrainer):
         self.logger.log_params(self.model.config)
         self.logger.log_params(self.additional_mlflow_params)
 
+        if self.batch_size_scheduler is not None:
+            import logging as _logging
+
+            sched = self.batch_size_scheduler
+            lines = [
+                f"  epoch {start:>4} – {end:>4}  batch_size={bs:<6}  grad_accum={ga}  effective={bs * ga}"
+                for start, end, bs, ga in sched._describe_stages(self.current_epoch, max_epochs)
+            ]
+            _logging.info("Batch size schedule:\n%s", "\n".join(lines))
+
         epoch_rows: list[tuple[str, ...]] = []
         progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
         if self.use_rich and progress and not isinstance(live_ctx, nullcontext):
@@ -413,6 +500,8 @@ class Trainer(BaseTrainer):
             for epoch in range(self.current_epoch, max_epochs):
                 self.current_epoch = epoch
                 self.model.train()
+
+                t0 = time.perf_counter()
 
                 train_task = (
                     progress.add_task(f"[green]Ep {epoch:>4d}  train", total=len(self.train_loader))
@@ -433,6 +522,11 @@ class Trainer(BaseTrainer):
                 if progress and val_task:
                     progress.remove_task(val_task)
 
+                epoch_secs = time.perf_counter() - t0
+                epoch_time_str = (
+                    f"{int(epoch_secs // 60)}m{int(epoch_secs % 60):02d}s" if epoch_secs >= 60 else f"{epoch_secs:.1f}s"
+                )
+
                 metrics = {"train_loss": train_loss}
                 if self.val_loss is not None:
                     metrics["val_loss"] = self.val_loss
@@ -441,6 +535,14 @@ class Trainer(BaseTrainer):
 
                 self.logger.log_metrics(metrics["val_loss"], step=epoch)
                 self.logger.log_metrics(metrics["train_loss"], step=epoch)
+                self.logger.log_metrics(
+                    {
+                        "learning_rate": self.optimizer.param_groups[0]["lr"],
+                        "batch_size": self.train_loader.batch_size,
+                        "epoch_secs": epoch_secs,
+                    },
+                    step=epoch,
+                )
 
                 should_stop, improved = self.early_stopper.step(self.mean_val_loss)
 
@@ -455,6 +557,8 @@ class Trainer(BaseTrainer):
                     "date_cutoff": None,
                 } | self.get_subject_ids_per_partition()
 
+                if improved:
+                    self._best_state_dict = copy.deepcopy(self.model.state_dict())
                 if improved and not isinstance(self.logger, NullLogger):
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     ckpt_filepath = f"epoch{epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
@@ -486,26 +590,31 @@ class Trainer(BaseTrainer):
 
                 # Add row to epoch table
                 lr = self.optimizer.param_groups[0]["lr"]
-                epoch_rows.append(
-                    (
-                        str(epoch),
-                        f"{train_loss['train_ce_loss'].item():.4f}",
-                        f"{train_loss['train_time_loss'].item():.4f}",
-                        f"{train_loss['train_total'].item():.4f}",
-                        f"{self.val_loss['val_ce_loss'].item():.4f}",
-                        f"{self.val_loss['val_time_loss'].item():.4f}",
-                        f"{self.val_loss['val_total'].item():.4f}",
-                        f"{lr:.2e}",
-                        "[yellow]★[/]" if improved else "",
-                    )
-                )
+                row = [
+                    str(epoch),
+                    f"{train_loss['train_ce_loss'].item():.4f}",
+                    f"{train_loss['train_time_loss'].item():.4f}",
+                    f"{train_loss['train_total'].item():.4f}",
+                    f"{self.val_loss['val_ce_loss'].item():.4f}",
+                    f"{self.val_loss['val_time_loss'].item():.4f}",
+                    f"{self.val_loss['val_total'].item():.4f}",
+                ]
+                if self.baseline_cce_calc is not None:
+                    rcc = self.val_loss.get("val_relative_cce")  # type: ignore[unreachable]
+                    row.append(f"{rcc.item():.4f}" if rcc is not None and not rcc.isnan() else "-")
+                row += [f"{lr:.2e}", epoch_time_str, "[yellow]★[/]" if improved else ""]
+                epoch_rows.append(tuple(row))
                 refresh_display()
 
-                if should_stop:
+                if should_stop and epoch >= min_epochs:
                     _print(f"Early stopping at epoch {epoch}")
                     break
 
                 self.epoch_end()
+
+        if self._best_state_dict is not None:
+            self.model.load_state_dict(self._best_state_dict)
+            _print("Restored best model weights into model.")
 
     def shared_step(
         self, batch, batch_idx, epoch, return_logits=False, return_att=False, stage="training", add_prefix=None
@@ -523,6 +632,7 @@ class Trainer(BaseTrainer):
         with torch.amp.autocast_mode.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
             # Forward pass
             logits_dict, att = model(batch, return_attention=return_att)
+            logits_dict = mask_seen_token_logits(model, batch, logits_dict)
 
             # ── Build targets from the batch ──────────────────────────────
             target_global_ids = batch.global_token_ids[:, 1:]  # [B, T-1]
@@ -541,11 +651,28 @@ class Trainer(BaseTrainer):
             predicted_ints = self._predicted_domain_ints.to(self.device)
             predict_mask = torch.isin(target_domain_ids, predicted_ints)  # [B, T-1]
 
+            # Exclude post-cutoff tokens from loss when eval_mask is present
+            if batch.eval_mask is not None:
+                predict_mask = predict_mask & ~batch.eval_mask[:, 1:]
+
             f_logits = logits_cat[predict_mask]  # [N_pred, V_total]
             f_global_ids = target_global_ids[predict_mask]  # [N_pred]
+            f_domain_ids = target_domain_ids[predict_mask]  # [N_pred]
+            f_ages = target_ages[predict_mask]  # [N_pred]
+
+            # Remap global IDs → indices within logits_cat.
+            # logits_cat = concat([logits_dict[dname] for dname in predicted_domains]),
+            # so each domain's slice starts at cumulative vocab offset, not global offset.
+            f_targets = f_global_ids.clone()
+            cum = 0
+            for dname in model.predicted_domains:
+                d_int = model.domain_to_int[dname]
+                mask = f_domain_ids == d_int
+                f_targets[mask] = f_global_ids[mask] - model.domain_offsets[d_int] + cum
+                cum += logits_dict[dname].shape[-1]
 
             # ── Cross-entropy loss ────────────────────────────────────────
-            loss_ce = model.cross_entropy_loss(f_logits, f_global_ids)
+            loss_ce = model.cross_entropy_loss(f_logits, f_targets)
 
             # ── Time-to-event loss ────────────────────────────────────────
             age_diff = (target_ages - input_ages)[predict_mask]
@@ -562,8 +689,13 @@ class Trainer(BaseTrainer):
 
         if self.log_loss_per_disease and stage == "validation":
             loss[f"{prefix}ce_loss_per_disease"] = model.cross_entropy_loss(
-                f_logits.float(), f_global_ids, agg="per_disease"
-            )  # pd.Series indexed by token_id
+                f_logits.float(), f_targets, agg="per_disease"
+            )  # pd.Series indexed by local token_id within logits_cat
+
+        if self.baseline_cce_calc is not None and stage == "validation":  # type: ignore[unreachable]
+            self._accumulate_baseline_records(  # type: ignore[unreachable]
+                model, batch, f_logits, f_targets, f_domain_ids, f_ages
+            )
 
         if return_att and return_logits:
             return loss, logits_cat, att
@@ -573,6 +705,50 @@ class Trainer(BaseTrainer):
             return loss, att
         else:
             return loss
+
+    def _accumulate_baseline_records(self, model, batch, f_logits, f_targets, f_domain_ids, f_ages):
+        """Collect per-token (model NLL, baseline NLL, sex, age_bin) for disease predictions."""
+        assert self.baseline_cce_calc is not None
+        import numpy as np  # type: ignore[unreachable]
+
+        disease_mask = f_domain_ids == self._disease_domain_int
+        if not disease_mask.any():
+            return
+
+        f_d_local = f_targets[disease_mask]  # already local (logits_cat) IDs
+        f_d_ages = f_ages[disease_mask]
+
+        # Extract sex per subject from the batch, then broadcast to disease positions
+        sex_token_mask = batch.domain_ids == self._sex_domain_int  # [B, T]
+        sex_global = (batch.global_token_ids * sex_token_mask.long()).sum(1)  # [B]
+        sex_local = (sex_global - self._sex_domain_offset).clamp(0, 1)  # [B]
+
+        # Recover the batch-row index for each disease prediction.
+        # Replicate the predict_mask logic from shared_step to find which [B, T-1] positions
+        # are both (a) in a predicted domain and (b) a disease token.
+        target_domain_ids_full = batch.domain_ids[:, 1:]
+        predicted_ints = self._predicted_domain_ints.to(batch.domain_ids.device)
+        predict_mask_full = torch.isin(target_domain_ids_full, predicted_ints)
+        if batch.eval_mask is not None:
+            predict_mask_full = predict_mask_full & ~batch.eval_mask[:, 1:]
+        disease_in_pred = (target_domain_ids_full == self._disease_domain_int) & predict_mask_full
+        subj_indices = disease_in_pred.nonzero(as_tuple=False)[:, 0]  # [N_disease]
+
+        f_d_sex = sex_local[subj_indices]
+
+        _, baseline_nll, age_bins = self.baseline_cce_calc.compute(f_d_local, f_d_ages, f_d_sex)
+        model_log_p = model.cross_entropy_loss(f_logits[disease_mask].float(), f_d_local, agg="per_token")
+        model_nll = -model_log_p  # positive NLL
+
+        self._baseline_records_buffer.append(
+            {
+                "token_id": f_d_local.cpu().numpy().astype(np.int32),
+                "sex": f_d_sex.cpu().numpy().astype(np.int8),
+                "age_bin": age_bins.cpu().numpy().astype(np.int8),
+                "model_nll": model_nll.detach().cpu().float().numpy(),
+                "baseline_nll": baseline_nll.cpu().float().numpy(),
+            }
+        )
 
     def valid_epoch_end(self, loss_outputs):
         self._validation_counter += 1
@@ -591,6 +767,31 @@ class Trainer(BaseTrainer):
                 .sort_values("log_p_total")
                 .reset_index()
             )
+
+        if self._baseline_records_buffer:
+            import numpy as np
+
+            from utils.baseline_cce import AGE_BIN_LABELS, SEX_LABELS
+
+            keys = self._baseline_records_buffer[0].keys()
+            all_data = {k: np.concatenate([r[k] for r in self._baseline_records_buffer]) for k in keys}
+            self._baseline_records_buffer.clear()
+
+            df = pd.DataFrame(all_data)
+
+            # Scalar metric: ratio of epoch-level means (ratio of sums = ratio of means)
+            self._val_relative_cce = float(df["model_nll"].mean() / df["baseline_nll"].mean())
+
+            # Per-(disease, sex, age_bin) artifact
+            agg = (
+                df.groupby(["token_id", "sex", "age_bin"])
+                .agg(model_cce=("model_nll", "mean"), baseline_cce=("baseline_nll", "mean"))
+                .reset_index()
+            )
+            agg["relative_cce"] = agg["model_cce"] / agg["baseline_cce"]
+            agg["sex_label"] = agg["sex"].map(dict(enumerate(SEX_LABELS)))
+            agg["age_bin_label"] = agg["age_bin"].map(dict(enumerate(AGE_BIN_LABELS)))
+            self._val_relative_cce_df = agg
 
         return 1
 
@@ -622,18 +823,31 @@ class Trainer(BaseTrainer):
             else None
         )
 
+        total_batches = len(self.train_loader) if n_batches == "all" else n_batches
+        self.optimizer.zero_grad()
         for i, batch in enumerate(self.train_loader):
-            self.optimizer.zero_grad()
-            loss = self.shared_step(batch, batch_idx=i, epoch=self.current_epoch, stage="training", add_prefix="train")
+            is_last_batch = i + 1 >= total_batches
+            is_optim_step = ((i + 1) % self.grad_accum_steps == 0) or is_last_batch
+
+            loss = self.shared_step(
+                batch,
+                batch_idx=i,
+                epoch=self.current_epoch,
+                stage="training",
+                add_prefix="train",
+            )
             assert isinstance(loss, dict)
 
-            self.scaler.scale(loss["train_total"]).backward()
-            if self.optim_config is not None and self.optim_config.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.optim_config.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
+            self.scaler.scale(loss["train_total"] / self.grad_accum_steps).backward()
+
+            if is_optim_step:
+                if self.optim_config is not None and self.optim_config.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.optim_config.grad_clip)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
             with torch.no_grad():
                 ce_val = loss["train_ce_loss"].detach()
@@ -666,21 +880,25 @@ class Trainer(BaseTrainer):
                 self.val_step += 1
 
             current_loss = self.train_outputs[-1]
+            accum_pos = (i % self.grad_accum_steps) + 1
             if pbar:
-                pbar.set_postfix(
-                    {
-                        "ce": f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
-                        "dt": f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
-                    }
-                )
+                postfix = {
+                    "ce": f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
+                    "dt": f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
+                }
+                if self.grad_accum_steps > 1:
+                    postfix["accum"] = f"{accum_pos}/{self.grad_accum_steps}"
+                pbar.set_postfix(postfix)
                 pbar.update(self.train_loader.batch_size)
 
             if _progress is not None and _task_id is not None:
                 _progress.advance(_task_id)
+                accum_str = f" [{accum_pos}/{self.grad_accum_steps}]" if self.grad_accum_steps > 1 else ""
                 _progress.update(
                     _task_id,
                     description=(
-                        f"[green]Ep {self.current_epoch:>4d}  train  ce={current_loss['train_ce_ema_loss'].item():.3f}"
+                        f"[green]Ep {self.current_epoch:>4d}  train  "
+                        f"ce={current_loss['train_ce_ema_loss'].item():.3f}{accum_str}"
                     ),
                 )
 
@@ -752,7 +970,21 @@ class Trainer(BaseTrainer):
                     artifact_path="val_loss_per_disease",
                 )
 
+        if hasattr(self, "_val_relative_cce_df"):
+            relative_cce_file = self.LOSSES_PER_EPOCH_FILEPATTERN.format(
+                current_epoch=self.current_epoch, val_step=self.val_step
+            )
+            self.logger.log_df_as_artifact(
+                df=self._val_relative_cce_df,
+                filename=relative_cce_file,
+                artifact_path="val_relative_cce",
+            )
+
         mean_val = self.compute_mean(loss_outputs)
+
+        if hasattr(self, "_val_relative_cce"):
+            mean_val["val_relative_cce"] = torch.tensor(self._val_relative_cce)
+            del self._val_relative_cce
 
         self.model.train()
 
@@ -760,7 +992,11 @@ class Trainer(BaseTrainer):
 
     def on_train_epoch_end(self, epoch):
         """Hook called after each train_epoch(). Override in subclasses."""
-        pass
+        if self.batch_size_scheduler is not None:
+            stage = self.batch_size_scheduler.step(epoch + 1)
+            if stage.batch_size != self.train_loader.batch_size:
+                self.train_loader.set_batch_size(stage.batch_size)
+            self.grad_accum_steps = stage.grad_accum_steps
 
     def epoch_end(self):
         self.train_outputs = []

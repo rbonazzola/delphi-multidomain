@@ -2,35 +2,44 @@ diseases:
   projector: embed
   path: diseases
   predict: true
+  no_repeat: true
   dropout_mode: token
   dropout_rate: 0.1
+  group: core
 
 death:
   projector: embed
   path: death
   predict: true
+  group: core
 
 cv_drugs:
   projector: embed
   path: cv_drugs
   predict: true
+  group: drugs
 
 ns_drugs:
   projector: embed
   path: ns_drugs
   predict: true
+  group: drugs
 
 lifestyle:
   projector: embed
   path: lifestyle
-  at_birth: true
   dropout_mode: token
   dropout_rate: 0.1
+  age_jitter: true
+  age_jitter_min: -14610   # -40 years in days
+  age_jitter_max: 7300   # +20 years in days
+  group: core
 
 hla_alleles:
   projector: embed
   path: hla_alleles
   at_birth: true
+  # group: hla
   # dropout_mode: block   # drop the entire HLA block with probability dropout_rate
   # dropout_rate: 0.1
 
@@ -38,6 +47,7 @@ sex:
   projector: embed
   path: sex
   at_birth: true
+  group: core
 
 rare_variants:
   projector: embed
