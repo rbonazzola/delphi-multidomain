@@ -61,7 +61,7 @@ def main():
     output_path = Path(args.output_path)
 
     # Load tokenizer
-    with open(tokenizer_path) as f:
+    with tokenizer_path.open() as f:
         tokenizer = yaml.safe_load(f)
 
     print(f"Loaded {len(tokenizer)} tokens from {tokenizer_path}")
@@ -91,7 +91,7 @@ def main():
     print(f"\nSaved to {output_path}")
     print(f"\nTotal tokens: {len(df)}")
     print(f"Tokens with no subjects: {(df['n_subjects'] == 0).sum()}")
-    print(f"\nTop 10 by n_subjects:")
+    print("\nTop 10 by n_subjects:")
     print(df.nlargest(10, "n_subjects")[["icd_code", "icd_description", "n_subjects"]].to_string(index=False))
 
 

@@ -286,7 +286,10 @@ if st.session_state.runs_loaded:
             key=lambda x: float(x.split()[1]),
         )
         runs_nohla = sorted(
-            [f"{k} {v:.4f}" for k, v in zip(runs_nohla["run_id"].tolist(), runs_nohla["val_loss"].tolist(), strict=True)],
+            [
+                f"{k} {v:.4f}"
+                for k, v in zip(runs_nohla["run_id"].tolist(), runs_nohla["val_loss"].tolist(), strict=True)
+            ],
             key=lambda x: float(x.split()[1]),
         )
 

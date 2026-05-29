@@ -17,23 +17,19 @@ Key changes vs. the original dataset.py
 
 from __future__ import annotations
 
-import os
-import warnings
 import logging
-from pathlib import Path
-from copy import deepcopy
-from typing import (
-    Any, Callable, Dict, List, Optional, Set, Tuple, Union, TypedDict, NotRequired
-)
-from collections import defaultdict
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import NotRequired, TypedDict
 
 import numpy as np
 import pandas as pd
-import yaml
 import torch
-from torch.utils.data import Dataset, DataLoader
+import yaml
 from easydict import EasyDict
+from torch.utils.data import DataLoader, Dataset
 
 DAYS_PER_YEAR = 365.25
 logger = logging.getLogger(__name__)
@@ -43,32 +39,30 @@ logger = logging.getLogger(__name__)
 #  DelphiBatch
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class DelphiBatch:
     """
     Everything the model needs for a single forward pass.
     Produced by DelphiCollateFn, consumed by Delphi.forward.
     """
-    global_token_ids: torch.Tensor                    # [B, T]  int
-    domain_ids: torch.Tensor                          # [B, T]  int
-    ages: torch.Tensor                                # [B, T]  float
-    subject_ids: torch.Tensor                         # [B]     int
-    continuous_data: Dict[str, torch.Tensor]           # {name: [B, dim]}
-    continuous_positions: Dict[str, torch.Tensor]      # {name: [B, n_latent]}
 
-    def to(self, device: Union[str, torch.device]) -> "DelphiBatch":
+    global_token_ids: torch.Tensor  # [B, T]  int
+    domain_ids: torch.Tensor  # [B, T]  int
+    ages: torch.Tensor  # [B, T]  float
+    subject_ids: torch.Tensor  # [B]     int
+    continuous_data: dict[str, torch.Tensor]  # {name: [B, dim]}
+    continuous_positions: dict[str, torch.Tensor]  # {name: [B, n_latent]}
+
+    def to(self, device: str | torch.device) -> DelphiBatch:
         """Move all tensors to device."""
         return DelphiBatch(
             global_token_ids=self.global_token_ids.to(device),
             domain_ids=self.domain_ids.to(device),
             ages=self.ages.to(device),
             subject_ids=self.subject_ids.to(device),
-            continuous_data={
-                k: v.to(device) for k, v in self.continuous_data.items()
-            },
-            continuous_positions={
-                k: v.to(device) for k, v in self.continuous_positions.items()
-            },
+            continuous_data={k: v.to(device) for k, v in self.continuous_data.items()},
+            continuous_positions={k: v.to(device) for k, v in self.continuous_positions.items()},
         )
 
     @property
@@ -80,20 +74,18 @@ class DelphiBatch:
         return self.global_token_ids.shape[1]
 
     def __repr__(self) -> str:
-        return (
-            f"DelphiBatch(B={self.batch_size}, T={self.seq_len}, "
-            f"continuous={list(self.continuous_data.keys())})"
-        )
+        return f"DelphiBatch(B={self.batch_size}, T={self.seq_len}, continuous={list(self.continuous_data.keys())})"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TokenDomain  (unchanged from original, kept here for self-containedness)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class TokenDomain:
     """
     Single token domain: loads tokenizer.yaml + tokens.csv.
-    
+
     If `subdomain` is specified, loads token_metadata.csv from the same
     directory to filter tokens by a metadata column (e.g. locus) and
     remaps token IDs to a contiguous sub-vocabulary.
@@ -102,14 +94,14 @@ class TokenDomain:
     def __init__(
         self,
         name: str,
-        path: Union[str, Path],
+        path: str | Path,
         predict: bool,
         age_jitter: bool,
         type: str,
-        subjects: Optional[set] = None,
+        subjects: set | None = None,
         at_birth: bool = False,
-        aggregation_strategy: Optional[Callable] = None,
-        subdomain: Optional[str] = None,
+        aggregation_strategy: Callable | None = None,
+        subdomain: str | None = None,
         subdomain_column: str = "locus",
         metadata_file: str = "token_metadata.csv",
     ):
@@ -120,11 +112,9 @@ class TokenDomain:
         self.at_birth = at_birth
         self.type = type
         self.subdomain = subdomain
-        self._old_to_new: Optional[Dict[int, int]]
+        self._old_to_new: dict[int, int] | None
 
-        assert type in ("categorical", "continuous"), (
-            f"Domain type must be 'categorical' or 'continuous', got {type}"
-        )
+        assert type in ("categorical", "continuous"), f"Domain type must be 'categorical' or 'continuous', got {type}"
 
         # Load full tokenizer first
         full_tokenizer = self._load_tokenizer(self.path / "tokenizer.yaml")
@@ -133,13 +123,11 @@ class TokenDomain:
         if subdomain is not None:
             metadata_path = self.path / metadata_file
             assert metadata_path.exists(), (
-                f"subdomain='{subdomain}' requires {metadata_path} to exist. "
-                f"Generate it with generate_hla_metadata.py."
+                f"subdomain='{subdomain}' requires {metadata_path} to exist. Generate it with generate_hla_metadata.py."
             )
             meta_df = pd.read_csv(metadata_path)
             assert subdomain_column in meta_df.columns, (
-                f"Column '{subdomain_column}' not found in {metadata_path}. "
-                f"Available: {meta_df.columns.tolist()}"
+                f"Column '{subdomain_column}' not found in {metadata_path}. Available: {meta_df.columns.tolist()}"
             )
 
             # Filter metadata to this subdomain
@@ -155,14 +143,14 @@ class TokenDomain:
             self._new_to_old = {new: old for old, new in self._old_to_new.items()}
 
             # Filter tokenizer
-            self.tokenizer = {
-                self._old_to_new[old_id]: full_tokenizer[old_id]
-                for old_id in old_ids
-            }
+            self.tokenizer = {self._old_to_new[old_id]: full_tokenizer[old_id] for old_id in old_ids}
 
             logger.info(
                 "TokenDomain '%s': subdomain '%s' → %d/%d tokens",
-                name, subdomain, len(self.tokenizer), len(full_tokenizer),
+                name,
+                subdomain,
+                len(self.tokenizer),
+                len(full_tokenizer),
             )
         else:
             self._old_to_new = None
@@ -188,12 +176,12 @@ class TokenDomain:
 
     # ---- loaders -------------------------------------------------------------
 
-    def _load_tokenizer(self, path: Path) -> Dict[int, str]:
-        with open(path, "r") as f:
+    def _load_tokenizer(self, path: Path) -> dict[int, str]:
+        with path.open() as f:
             tokenizer = yaml.safe_load(f)
         return {idx: token for idx, token in enumerate(tokenizer)}
 
-    def _load_tokens(self, path: Path, subjects: Optional[set]) -> torch.Tensor:
+    def _load_tokens(self, path: Path, subjects: set | None) -> torch.Tensor:
         assert path.exists(), f"Tokens file {path} does not exist"
 
         df = pd.read_csv(path)
@@ -220,6 +208,7 @@ class TokenDomain:
                 warnings.warn(
                     "at_birth=True but non-zero ages found. All ages set to 0.",
                     UserWarning,
+                    stacklevel=2,
                 )
             df["age"] = 0
 
@@ -232,7 +221,7 @@ class TokenDomain:
 
     # ---- filtering -----------------------------------------------------------
 
-    def filter_subjects(self, subjects: set) -> "TokenDomain":
+    def filter_subjects(self, subjects: set) -> TokenDomain:
         isin = self._as_dataframe.subject_id.isin(subjects).to_numpy(dtype=bool)
         self.tokens = self.tokens[isin]
         self._as_dataframe = self._as_dataframe[isin]
@@ -249,6 +238,7 @@ class TokenDomain:
 #  AgeSampler  (standalone, no model dependency)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class AgeSampler:
     """
     Vectorized no-event-token age sampler.
@@ -260,8 +250,8 @@ class AgeSampler:
         self,
         insertion_mode: str = "regular",
         token_rate: float = 1.0,
-        seed: Optional[int] = None,
-        jitter_sigma: Optional[float] = None,
+        seed: int | None = None,
+        jitter_sigma: float | None = None,
     ):
         self.insertion_mode = insertion_mode
         self.no_event_token_rate = float(token_rate)
@@ -308,9 +298,7 @@ class AgeSampler:
         if total == 0:
             return None, None
 
-        subj_idx = torch.repeat_interleave(
-            torch.arange(max_ages.numel()), counts
-        )
+        subj_idx = torch.repeat_interleave(torch.arange(max_ages.numel()), counts)
         max_rep = torch.repeat_interleave(max_ages, counts)
 
         mode = self.insertion_mode
@@ -321,7 +309,8 @@ class AgeSampler:
 
         if mode == "regular":
             offsets = torch.cumsum(
-                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]), dim=0,
+                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]),
+                dim=0,
             )
             within = torch.arange(total) - torch.repeat_interleave(offsets, counts)
             ages = (within + 1).to(max_ages.dtype) * step
@@ -331,7 +320,8 @@ class AgeSampler:
         if mode == "grid_jitter":
             sigma = self.jitter_sigma if self.jitter_sigma is not None else step / 5.0
             offsets = torch.cumsum(
-                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]), dim=0,
+                torch.cat([torch.zeros(1, dtype=counts.dtype), counts[:-1]]),
+                dim=0,
             )
             within = torch.arange(total) - torch.repeat_interleave(offsets, counts)
             base = (within + 1).to(max_ages.dtype) * step
@@ -347,19 +337,22 @@ class AgeSampler:
 #  DelphiDataset
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 class DelphiDatasetItem(TypedDict):
     """
     Uncollated cached tensors for a single subject.
     Produced by the Dataset, consumed by DelphiCollateFn.
     """
+
     domain_ids: torch.Tensor
     local_token_ids: torch.Tensor
     ages: torch.Tensor
     real_count: torch.Tensor
     max_age: torch.Tensor
     subject_id: torch.Tensor
-    continuous: Dict[str, torch.Tensor]
+    continuous: dict[str, torch.Tensor]
     eval_mask: NotRequired[torch.Tensor]  # Marks this key as optional
+
 
 class DelphiDataset(Dataset):
     """
@@ -388,23 +381,26 @@ class DelphiDataset(Dataset):
         self,
         root: str,
         domains_cfg: dict,
-        domain_to_int: Dict[str, int],
+        domain_to_int: dict[str, int],
         block_size: int,
-        subjects: Optional[Union[str, List[str]]] = None,
-        exclusions: List[str] = [],
-        n_samples: Optional[int] = None,
-        required_domains: List[str] = ["sex", "diseases"],
+        subjects: str | list[str] | None = None,
+        exclusions: list[str] | None = None,
+        n_samples: int | None = None,
+        required_domains: list[str] | None = None,
         # no-event token config (for validation at setup time)
         no_event_token_rate: float = 5.0,
         no_event_insertion_mode: str = "random",
         # continuous domain metadata
-        continuous_domains: Optional[Dict[str, int]] = None,  # {name: n_latent_tokens}
-        age_domains: Optional[List[str]] = None,  # domains to consider for max_age
+        continuous_domains: dict[str, int] | None = None,  # {name: n_latent_tokens}
+        age_domains: list[str] | None = None,  # domains to consider for max_age
         # date cutoff for longitudinal evaluation
-        date_cutoff: Optional[str] = None,        # "YYYY-MM-DD"; None = no cutoff
-        birth_dates_file: Optional[str] = None,   # path to year_and_month_of_birth.txt
+        date_cutoff: str | None = None,  # "YYYY-MM-DD"; None = no cutoff
+        birth_dates_file: str | None = None,  # path to year_and_month_of_birth.txt
     ):
         super().__init__()
+
+        exclusions = exclusions or []
+        required_domains = required_domains or ["sex", "diseases"]
 
         self.root = Path(root)
         self.block_size = block_size
@@ -434,7 +430,9 @@ class DelphiDataset(Dataset):
 
         logger.info(
             "DelphiDataset | root=%s | domains=%s | required=%s",
-            self.root, list(domains_cfg.keys()), required_domains,
+            self.root,
+            list(domains_cfg.keys()),
+            required_domains,
         )
 
         # ── Resolve subject set ───────────────────────────────────────────
@@ -444,10 +442,8 @@ class DelphiDataset(Dataset):
         if isinstance(subjects, (str, Path)):
             subjects = [subjects]
 
-        if all(isinstance(s, (str, Path)) and os.path.exists(s) for s in subjects):
-            included = pd.concat([
-                pd.read_csv(self.root / f, names=["subject_id"]) for f in subjects
-            ])
+        if all(isinstance(s, (str, Path)) and Path(s).exists() for s in subjects):
+            included = pd.concat([pd.read_csv(self.root / f, names=["subject_id"]) for f in subjects])
         else:
             included = pd.DataFrame({"subject_id": subjects})
 
@@ -474,26 +470,23 @@ class DelphiDataset(Dataset):
         self._subject_indices = self._precompute_subject_indices()
 
         # ── Collect tokenizers for friendly view ──────────────────────────
-        self.tokenizers = {
-            dname: dom.tokenizer for dname, dom in self.domains.items()
-        }
+        self.tokenizers = {dname: dom.tokenizer for dname, dom in self.domains.items()}
 
         # ── Build cache ───────────────────────────────────────────────────
         self._build_cache(subject_set, block_size, no_event_token_rate)
 
         # ── Date cutoff (longitudinal eval mask) ──────────────────────────
-        self._eval_mask: Optional[torch.Tensor] = None
-        self._cutoff_ages: Optional[torch.Tensor] = None
-        self._cutoff_date: Optional[pd.Timestamp] = None
+        self._eval_mask: torch.Tensor | None = None
+        self._cutoff_ages: torch.Tensor | None = None
+        self._cutoff_date: pd.Timestamp | None = None
         if date_cutoff is not None and birth_dates_file is not None:
             self._build_eval_mask(date_cutoff, birth_dates_file)
 
-        print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, "
-              f"domains={list(self.domains.keys())}")
+        print(f"DelphiDataset: {len(self)} subjects, block_size={block_size}, domains={list(self.domains.keys())}")
 
     # ── Private helpers ───────────────────────────────────────────────────
 
-    def _get_excluded_subjects(self, exclusion_files: List[str]) -> set:
+    def _get_excluded_subjects(self, exclusion_files: list[str]) -> set:
         excluded = set()
         for excl in exclusion_files:
             excl_path = self.root / excl
@@ -502,9 +495,7 @@ class DelphiDataset(Dataset):
                 excluded |= set(map(str, ids))
         return excluded
 
-    def _filter_for_required_domains(
-        self, subjects: pd.DataFrame, required: List[str]
-    ) -> pd.DataFrame:
+    def _filter_for_required_domains(self, subjects: pd.DataFrame, required: list[str]) -> pd.DataFrame:
         for dname in required:
             if dname not in self.domains:
                 logger.debug("Required domain '%s' not in self.domains", dname)
@@ -513,7 +504,7 @@ class DelphiDataset(Dataset):
             subjects = subjects[subjects["subject_id"].astype(str).isin(domain_sids)]
         return subjects
 
-    def _precompute_subject_indices(self) -> Dict[str, Dict[int, Tuple[int, int]]]:
+    def _precompute_subject_indices(self) -> dict[str, dict[int, tuple[int, int]]]:
         """
         {domain: {subject_id: (start_idx, count)}}
         """
@@ -521,13 +512,10 @@ class DelphiDataset(Dataset):
         for dname, dom in self.domains.items():
             ids, counts = np.unique(dom.subject_ids, return_counts=True)
             cumcounts = np.concatenate([[0], np.cumsum(counts)])
-            indices[dname] = {
-                int(sid): (int(cumcounts[i]), int(counts[i]))
-                for i, sid in enumerate(ids)
-            }
+            indices[dname] = {int(sid): (int(cumcounts[i]), int(counts[i])) for i, sid in enumerate(ids)}
         return indices
 
-    def _get_subject_events(self, subject_id: int) -> Dict[str, torch.Tensor]:
+    def _get_subject_events(self, subject_id: int) -> dict[str, torch.Tensor]:
         """
         Return per-domain tensors for one subject.
         Each tensor has columns matching the raw tokens.csv layout.
@@ -561,7 +549,7 @@ class DelphiDataset(Dataset):
 
         # For continuous domains: store raw values separately
         continuous_cache = {}
-        for cd_name, n_latent in self.continuous_domains.items():
+        for cd_name, _n_latent in self.continuous_domains.items():
             continuous_cache[cd_name] = torch.zeros(N, self.domain_configs[cd_name].input_size, dtype=torch.float32)
 
         step = no_event_token_rate * DAYS_PER_YEAR
@@ -600,7 +588,7 @@ class DelphiDataset(Dataset):
                         continuous_cache[dname][i] = ev[:, cidx["value"]]
                         age_val = float(ev[0, cidx["age"]])
                         n_latent = self.continuous_domains.get(dname, 1)
-                        for lt in range(n_latent):
+                        for _ in range(n_latent):
                             tokens_list.append((d_id, 0, age_val))
                 else:
                     for row_idx in range(ev.shape[0]):
@@ -650,6 +638,7 @@ class DelphiDataset(Dataset):
                 f"(block_size={block_size}, real tokens range: "
                 f"{min_real_tokens}–{max_real_tokens}).",
                 UserWarning,
+                stacklevel=2,
             )
 
         # Store everything
@@ -685,14 +674,14 @@ class DelphiDataset(Dataset):
         Continuous domains are still handled per-subject (same as _build_cache_slow)
         because they are typically absent or very small.
         """
-        sorted_subjects    = sorted(subject_set)
-        N                  = len(sorted_subjects)
+        sorted_subjects = sorted(subject_set)
+        N = len(sorted_subjects)
         sorted_subjects_np = np.array(sorted_subjects, dtype=np.int64)
 
         # ── Pre-filled padding tensors ────────────────────────────────────────
-        domain_ids_out      = torch.full((N, block_size), self.padding_domain_id, dtype=torch.long)
-        local_token_ids_out = torch.full((N, block_size), self.PADDING_TOKEN,     dtype=torch.long)
-        ages_out            = torch.full((N, block_size), self.PADDING_AGE,        dtype=torch.float32)
+        domain_ids_out = torch.full((N, block_size), self.padding_domain_id, dtype=torch.long)
+        local_token_ids_out = torch.full((N, block_size), self.PADDING_TOKEN, dtype=torch.long)
+        ages_out = torch.full((N, block_size), self.PADDING_AGE, dtype=torch.float32)
 
         # Continuous cache (filled per-subject below, same as original)
         continuous_cache = {
@@ -705,9 +694,9 @@ class DelphiDataset(Dataset):
         for dname, dom in self.domains.items():
             cols = dom._as_dataframe.columns.tolist()
             domain_col_idx[dname] = {
-                "age":      cols.index("age"),
+                "age": cols.index("age"),
                 "token_id": cols.index("token_id") if "token_id" in cols else None,
-                "value":    cols.index("value")    if "value"    in cols else None,
+                "value": cols.index("value") if "value" in cols else None,
             }
 
         # ── Build global token table for categorical domains ──────────────────
@@ -730,7 +719,7 @@ class DelphiDataset(Dataset):
             ages_t = dom.tokens[:, cidx["age"]].float()
             tids_t = dom.tokens[:, cidx["token_id"]].long()
 
-            valid  = ages_t >= 0
+            valid = ages_t >= 0
             if valid.sum() == 0:
                 continue
 
@@ -747,19 +736,19 @@ class DelphiDataset(Dataset):
         for cd_name in self.continuous_domains:
             if cd_name not in self.domains:
                 continue
-            dom   = self.domains[cd_name]
-            cidx  = domain_col_idx[cd_name]
-            d_id  = self.domain_to_int[cd_name]
+            dom = self.domains[cd_name]
+            cidx = domain_col_idx[cd_name]
+            d_id = self.domain_to_int[cd_name]
             n_lat = self.continuous_domains[cd_name]
 
             for sid, (start, count) in self._subject_indices[cd_name].items():
                 if sid not in subject_set:
                     continue
                 idx = int(np.searchsorted(sorted_subjects_np, np.int64(sid)))
-                ev  = dom.tokens[start : start + count]
+                ev = dom.tokens[start : start + count]
                 continuous_cache[cd_name][idx] = ev[:, cidx["value"]]
                 age_val = float(ev[0, cidx["age"]])
-                cont_sids.extend([sid]  * n_lat)
+                cont_sids.extend([sid] * n_lat)
                 cont_dids.extend([d_id] * n_lat)
                 cont_ages.extend([age_val] * n_lat)
 
@@ -777,14 +766,14 @@ class DelphiDataset(Dataset):
 
         if not all_sids_parts:
             # No tokens at all — store empty cache
-            self._domain_ids       = domain_ids_out
-            self._local_token_ids  = local_token_ids_out
-            self._ages             = ages_out
-            self._real_counts      = torch.zeros(N, dtype=torch.long)
-            self._max_ages         = torch.zeros(N, dtype=torch.float32)
-            self._subject_ids      = torch.tensor(sorted_subjects, dtype=torch.long)
+            self._domain_ids = domain_ids_out
+            self._local_token_ids = local_token_ids_out
+            self._ages = ages_out
+            self._real_counts = torch.zeros(N, dtype=torch.long)
+            self._max_ages = torch.zeros(N, dtype=torch.float32)
+            self._subject_ids = torch.tensor(sorted_subjects, dtype=torch.long)
             self._continuous_cache = continuous_cache
-            self._sid_to_idx       = {int(s): i for i, s in enumerate(sorted_subjects)}
+            self._sid_to_idx = {int(s): i for i, s in enumerate(sorted_subjects)}
             return
 
         all_sids = np.concatenate(all_sids_parts)
@@ -797,7 +786,7 @@ class DelphiDataset(Dataset):
 
         # ── Sort by (subject_idx, age, domain_id) ─────────────────────────────
         # np.lexsort: last key = primary sort key
-        order    = np.lexsort((all_dids, all_ages, all_sidx))
+        order = np.lexsort((all_dids, all_ages, all_sidx))
         all_sidx = all_sidx[order]
         all_dids = all_dids[order]
         all_tids = all_tids[order]
@@ -805,20 +794,20 @@ class DelphiDataset(Dataset):
 
         # ── Compute position of each token within its subject ─────────────────
         subject_starts = np.searchsorted(all_sidx, np.arange(N, dtype=np.int64))
-        pos_within     = np.arange(len(all_sidx), dtype=np.int64) - subject_starts[all_sidx]
+        pos_within = np.arange(len(all_sidx), dtype=np.int64) - subject_starts[all_sidx]
 
         # ── Scatter into result tensors ───────────────────────────────────────
         mask = pos_within < block_size
-        row  = all_sidx[mask]
-        col  = pos_within[mask]
+        row = all_sidx[mask]
+        col = pos_within[mask]
 
-        domain_ids_out[row, col]      = torch.from_numpy(all_dids[mask])
+        domain_ids_out[row, col] = torch.from_numpy(all_dids[mask])
         local_token_ids_out[row, col] = torch.from_numpy(all_tids[mask])
-        ages_out[row, col]            = torch.from_numpy(all_ages[mask])
+        ages_out[row, col] = torch.from_numpy(all_ages[mask])
 
         # ── real_counts = min(tokens_per_subject, block_size) ─────────────────
         tokens_per_subject = np.bincount(all_sidx, minlength=N).astype(np.int64)
-        real_counts        = torch.from_numpy(np.minimum(tokens_per_subject, block_size))
+        real_counts = torch.from_numpy(np.minimum(tokens_per_subject, block_size))
 
         # ── max_age per subject from age_domains ──────────────────────────────
         max_ages_np = np.full(N, -np.inf, dtype=np.float32)
@@ -833,7 +822,7 @@ class DelphiDataset(Dataset):
             ages_ad = dom.tokens[:, age_col].numpy().astype(np.float32)
             sidx_ad = np.searchsorted(sorted_subjects_np, sids_ad)
             in_range = sidx_ad < N
-            matches  = in_range & (sorted_subjects_np[np.minimum(sidx_ad, N - 1)] == sids_ad)
+            matches = in_range & (sorted_subjects_np[np.minimum(sidx_ad, N - 1)] == sids_ad)
             np.maximum.at(max_ages_np, sidx_ad[matches], ages_ad[matches])
 
         max_ages_np = np.where(np.isneginf(max_ages_np), 0.0, max_ages_np)
@@ -841,8 +830,8 @@ class DelphiDataset(Dataset):
         # ── Truncation warning ────────────────────────────────────────────────
         step = no_event_token_rate * DAYS_PER_YEAR
         if step > 0:
-            max_noevents     = (max_ages_np // step).astype(np.int64)
-            total_needed     = tokens_per_subject + max_noevents
+            max_noevents = (max_ages_np // step).astype(np.int64)
+            total_needed = tokens_per_subject + max_noevents
             truncation_count = int((total_needed > block_size).sum())
             if truncation_count > 0:
                 trunc_real = tokens_per_subject[total_needed > block_size]
@@ -851,17 +840,18 @@ class DelphiDataset(Dataset):
                     f"(block_size={block_size}, real tokens range: "
                     f"{trunc_real.min()}–{trunc_real.max()}).",
                     UserWarning,
+                    stacklevel=2,
                 )
 
         # ── Store ─────────────────────────────────────────────────────────────
-        self._domain_ids       = domain_ids_out
-        self._local_token_ids  = local_token_ids_out
-        self._ages             = ages_out
-        self._real_counts      = real_counts
-        self._max_ages         = torch.from_numpy(max_ages_np)
-        self._subject_ids      = torch.tensor(sorted_subjects, dtype=torch.long)
+        self._domain_ids = domain_ids_out
+        self._local_token_ids = local_token_ids_out
+        self._ages = ages_out
+        self._real_counts = real_counts
+        self._max_ages = torch.from_numpy(max_ages_np)
+        self._subject_ids = torch.tensor(sorted_subjects, dtype=torch.long)
         self._continuous_cache = continuous_cache
-        self._sid_to_idx       = {int(s): i for i, s in enumerate(sorted_subjects)}
+        self._sid_to_idx = {int(s): i for i, s in enumerate(sorted_subjects)}
 
     def _build_eval_mask(self, date_cutoff: str, birth_dates_file: str) -> None:
         """
@@ -874,6 +864,7 @@ class DelphiDataset(Dataset):
         tokens (mask is all False).
         """
         from datetime import datetime
+
         cutoff = datetime.strptime(date_cutoff, "%Y-%m-%d")
 
         birth_df = pd.read_csv(birth_dates_file, sep="\t").set_index("eid")
@@ -886,35 +877,34 @@ class DelphiDataset(Dataset):
 
         if valid.any():
             bi_valid = birth_info[valid]
-            birth_dates = pd.to_datetime({
-                "year":  bi_valid["year"].astype(int),
-                "month": bi_valid["month"].astype(int),
-                "day":   1,
-            })
-            cutoff_ages[valid] = (
-                (pd.Timestamp(cutoff) - birth_dates).dt.days.values.astype(np.float32)
+            birth_dates = pd.to_datetime(
+                {
+                    "year": bi_valid["year"].astype(int),
+                    "month": bi_valid["month"].astype(int),
+                    "day": 1,
+                }
             )
+            cutoff_ages[valid] = (pd.Timestamp(cutoff) - birth_dates).dt.days.values.astype(np.float32)
 
-        self._cutoff_date = pd.Timestamp(cutoff)                    # stored for date reconstruction
-        self._cutoff_ages = torch.from_numpy(cutoff_ages)          # [N]
-        cutoff_ages_t = self._cutoff_ages.unsqueeze(1)             # [N, 1]
+        self._cutoff_date = pd.Timestamp(cutoff)  # stored for date reconstruction
+        self._cutoff_ages = torch.from_numpy(cutoff_ages)  # [N]
+        cutoff_ages_t = self._cutoff_ages.unsqueeze(1)  # [N, 1]
 
-        self._eval_mask = (
-            (self._ages > cutoff_ages_t) &
-            (self._ages > self.PADDING_AGE)
-        )
+        self._eval_mask = (self._ages > cutoff_ages_t) & (self._ages > self.PADDING_AGE)
 
         n_post = int(self._eval_mask.sum().item())
         n_real = int((self._ages > self.PADDING_AGE).sum().item())
         logger.info(
             "date_cutoff=%s: %d/%d tokens are post-cutoff (longitudinal targets)",
-            date_cutoff, n_post, n_real,
+            date_cutoff,
+            n_post,
+            n_real,
         )
 
     # ── Public interface ──────────────────────────────────────────────────
 
     @property
-    def subject_list(self) -> List[int]:
+    def subject_list(self) -> list[int]:
         return self._subject_ids.tolist()
 
     def __len__(self):
@@ -933,10 +923,7 @@ class DelphiDataset(Dataset):
             "max_age": self._max_ages[index].clone(),
             "subject_id": self._subject_ids[index].clone(),
             # continuous data
-            "continuous": {
-                dname: self._continuous_cache[dname][index].clone()
-                for dname in self._continuous_cache
-            },
+            "continuous": {dname: self._continuous_cache[dname][index].clone() for dname in self._continuous_cache},
         }
         if self._eval_mask is not None:
             item["eval_mask"] = self._eval_mask[index].clone()
@@ -946,6 +933,7 @@ class DelphiDataset(Dataset):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CollateFn
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class DelphiCollateFn:
     """
@@ -978,13 +966,13 @@ class DelphiCollateFn:
     def __init__(
         self,
         age_sampler: AgeSampler,
-        block_size: Union[int, str],
-        domain_to_int: Dict[str, int],
-        domain_offsets: Dict[int, int],   # domain_int -> global offset
+        block_size: int | str,
+        domain_to_int: dict[str, int],
+        domain_offsets: dict[int, int],  # domain_int -> global offset
         padding_domain_id: int,
         no_event_token_id: int = 1,
-        continuous_domains: Optional[Dict[str, int]] = None,
-        domain_dropout: Optional[Dict[int, tuple]] = None,
+        continuous_domains: dict[str, int] | None = None,
+        domain_dropout: dict[int, tuple] | None = None,
         training: bool = True,
     ):
         self.age_sampler = age_sampler
@@ -1006,25 +994,23 @@ class DelphiCollateFn:
         self.training = False
         return self
 
-    def __call__(self, batch: List[DelphiDatasetItem]) -> DelphiBatch:
+    def __call__(self, batch: list[DelphiDatasetItem]) -> DelphiBatch:
 
         B = len(batch)
 
         # ── 1. Stack ──────────────────────────────────────────────────────
-        domain_ids = torch.stack([item["domain_ids"] for item in batch])        # [B, T_cache]
+        domain_ids = torch.stack([item["domain_ids"] for item in batch])  # [B, T_cache]
         local_token_ids = torch.stack([item["local_token_ids"] for item in batch])  # [B, T_cache]
-        ages = torch.stack([item["ages"] for item in batch])                    # [B, T_cache]
+        ages = torch.stack([item["ages"] for item in batch])  # [B, T_cache]
         T = domain_ids.shape[1]
-        real_counts = torch.stack([item["real_count"] for item in batch])       # [B]
-        max_ages = torch.stack([item["max_age"] for item in batch])             # [B]
-        subject_ids = torch.stack([item["subject_id"] for item in batch])       # [B]
+        real_counts = torch.stack([item["real_count"] for item in batch])  # [B]
+        max_ages = torch.stack([item["max_age"] for item in batch])  # [B]
+        subject_ids = torch.stack([item["subject_id"] for item in batch])  # [B]
 
         # Stack continuous data
         continuous_data = {}
         for dname in self.continuous_domains:
-            continuous_data[dname] = torch.stack([
-                item["continuous"][dname] for item in batch
-            ])  # [B, dim]
+            continuous_data[dname] = torch.stack([item["continuous"][dname] for item in batch])  # [B, dim]
 
         # ── 2. Insert no-event tokens ─────────────────────────────────────
         noev_ages, noev_subj_idx = self.age_sampler.sample(max_ages)
@@ -1043,9 +1029,7 @@ class DelphiCollateFn:
                     _, keep_idx = subj_ages.topk(available, largest=False)
                     # Zero out the ones we're dropping
                     all_indices = mask.nonzero(as_tuple=True)[0]
-                    drop_indices = all_indices[~torch.isin(
-                        torch.arange(all_indices.numel()), keep_idx
-                    )]
+                    drop_indices = all_indices[~torch.isin(torch.arange(all_indices.numel()), keep_idx)]
                     noev_ages[drop_indices] = -1  # sentinel, will be skipped
                     count = available
 
@@ -1076,9 +1060,7 @@ class DelphiCollateFn:
                     drop = torch.bernoulli(torch.full((B, T), rate, dtype=torch.float)) > 0
                     drop_mask = d_mask & drop
                 elif mode == "block":
-                    block_drop = torch.bernoulli(
-                        torch.full((B,), rate, dtype=torch.float)
-                    ).bool()
+                    block_drop = torch.bernoulli(torch.full((B,), rate, dtype=torch.float)).bool()
                     drop_mask = d_mask & block_drop.unsqueeze(1)
                 else:
                     continue
@@ -1122,12 +1104,12 @@ class DelphiCollateFn:
         # block_size="auto": trim to the longest real sequence in this batch.
         # block_size=N (int): keep the full [B, N] — padding stays at the front.
         if self.block_size == "auto":
-            n_real = (ages > self.PADDING_AGE).sum(dim=1)   # [B]
+            n_real = (ages > self.PADDING_AGE).sum(dim=1)  # [B]
             trim_start = int((T - n_real.max()).item())
             if trim_start > 0:
                 global_token_ids = global_token_ids[:, trim_start:]
-                domain_ids       = domain_ids[:, trim_start:]
-                ages             = ages[:, trim_start:]
+                domain_ids = domain_ids[:, trim_start:]
+                ages = ages[:, trim_start:]
                 for k in continuous_positions:
                     continuous_positions[k] = (continuous_positions[k] - trim_start).clamp(min=0)
 
@@ -1145,12 +1127,13 @@ class DelphiCollateFn:
 #  Friendly view
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def create_friendly_view(
     batch: DelphiBatch,
     *,
-    int_to_domain_name: Dict[int, str],
-    tokenizers: Dict[str, Dict[int, str]],
-    domain_offsets: Dict[int, int],
+    int_to_domain_name: dict[int, str],
+    tokenizers: dict[str, dict[int, str]],
+    domain_offsets: dict[int, int],
 ):
     """
     Human-readable DataFrame for inspecting trajectories.
@@ -1165,8 +1148,6 @@ def create_friendly_view(
 
     # Invert offsets: build (domain_int, offset) sorted by offset descending
     # to recover local IDs from global IDs
-    offset_list = sorted(domain_offsets.items(), key=lambda x: -x[1])
-
     rows = []
     for b in range(B):
         subject_id = int(subject_ids[b])
@@ -1181,20 +1162,18 @@ def create_friendly_view(
             local_id = g_id - offset
 
             tokenizer = tokenizers.get(dname, {})
-            rows.append({
-                "subject_id": subject_id,
-                "age": round(age_days / DAYS_PER_YEAR, 2),
-                "domain_id": d_id,
-                "domain_name": dname,
-                "token_id": local_id,
-                "token_name": tokenizer.get(local_id, f"unknown_{local_id}"),
-            })
+            rows.append(
+                {
+                    "subject_id": subject_id,
+                    "age": round(age_days / DAYS_PER_YEAR, 2),
+                    "domain_id": d_id,
+                    "domain_name": dname,
+                    "token_id": local_id,
+                    "token_name": tokenizer.get(local_id, f"unknown_{local_id}"),
+                }
+            )
 
-    df = (
-        pd.DataFrame(rows)
-        .sort_values(["subject_id", "age", "domain_id", "token_id"])
-        .reset_index(drop=True)
-    )
+    df = pd.DataFrame(rows).sort_values(["subject_id", "age", "domain_id", "token_id"]).reset_index(drop=True)
     return df
 
 
@@ -1214,13 +1193,14 @@ def color_by_domain(row):
 #  DataLoader convenience
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def create_dataloader(
     dataset: DelphiDataset,
     batch_size: int,
     shuffle: bool = True,
     num_workers: int = 0,
     pin_memory: bool = True,
-    collate_fn: Optional[DelphiCollateFn] = None,
+    collate_fn: DelphiCollateFn | None = None,
     **kwargs,
 ) -> DataLoader:
     """
