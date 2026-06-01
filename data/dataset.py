@@ -1374,6 +1374,54 @@ class BatchSizeScheduler:
         return cls(schedule)
 
 
+class TokenLossAlphaScheduler:
+    """Resolves token_loss_alpha for a given epoch.
+
+    Schedule format: comma-separated "n_epochs:alpha" pairs.
+    Use "*" as n_epochs for the last open-ended stage.
+
+    Example:
+        scheduler = TokenLossAlphaScheduler.from_string("10:0.0,*:1.0")
+        # epochs 0-9  → alpha=0.0 (uniform loss)
+        # epoch 10+   → alpha=1.0 (full inverse-frequency)
+    """
+
+    def __init__(self, schedule: List[Tuple[Optional[int], float]]):
+        if not schedule:
+            raise ValueError("schedule must have at least one entry")
+        for i, (n, _) in enumerate(schedule):
+            if n is None and i != len(schedule) - 1:
+                raise ValueError("Only the last schedule entry may have n_epochs=None")
+        self._schedule = list(schedule)
+
+    def step(self, epoch: int) -> float:
+        """Return the alpha value for the given epoch."""
+        elapsed = 0
+        for n_epochs, alpha in self._schedule:
+            if n_epochs is None or epoch < elapsed + n_epochs:
+                return alpha
+            elapsed += n_epochs
+        return self._schedule[-1][1]
+
+    def __str__(self) -> str:
+        parts = []
+        for n_epochs, alpha in self._schedule:
+            n_str = "*" if n_epochs is None else str(n_epochs)
+            parts.append(f"{n_str}:{alpha}")
+        return ",".join(parts)
+
+    @classmethod
+    def from_string(cls, s: str) -> "TokenLossAlphaScheduler":
+        """Parse a schedule string like "10:0.0,*:1.0"."""
+        schedule = []
+        for part in s.split(","):
+            part = part.strip()
+            n_str, alpha_str = part.split(":")
+            n = None if n_str.strip() == "*" else int(n_str.strip())
+            schedule.append((n, float(alpha_str.strip())))
+        return cls(schedule)
+
+
 class DataModule:
     """Lightweight container for train/val/test dataloaders with rich logging.
 

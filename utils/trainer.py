@@ -288,6 +288,8 @@ class Trainer(BaseTrainer):
           checkpoint_every=None, optim_config=None,
           batch_size_scheduler=None,
           baseline_incidence_path=None,
+          token_loss_alpha=0.0,
+          token_loss_alpha_scheduler=None,
         ):
 
         self.model           = model
@@ -336,6 +338,12 @@ class Trainer(BaseTrainer):
         else:
             self.grad_accum_steps = 1
 
+        self.token_loss_alpha_scheduler = token_loss_alpha_scheduler
+        if token_loss_alpha_scheduler is not None:
+            self._current_alpha = token_loss_alpha_scheduler.step(start_epoch)
+        else:
+            self._current_alpha = token_loss_alpha
+
         self.ce_ema = None
         self.time_ema = None
         self.log_loss_per_disease = log_loss_per_disease
@@ -360,6 +368,9 @@ class Trainer(BaseTrainer):
         if baseline_incidence_path is not None:
             self._setup_baseline_cce(model, baseline_incidence_path)
 
+        # Inverse-frequency token weights for loss reweighting
+        self._token_weights = self._build_token_weights(self._current_alpha)
+
     def _setup_baseline_cce(self, model, incidence_path: str):
         from delphi.model import Delphi
         from utils.baseline_cce import BaselineCCECalculator
@@ -373,6 +384,45 @@ class Trainer(BaseTrainer):
         self._sex_domain_int = model.domain_to_int["sex"]
         self._sex_domain_offset = model.domain_offsets[self._sex_domain_int]
         self.baseline_cce_calc = BaselineCCECalculator(incidence_path, disease_vocab_size)
+
+    def _build_token_weights(self, alpha: float):
+        """
+        Build a [V_total] float32 weight tensor for predicted domains, where
+        V_total = sum of vocab sizes in logits_cat order (model.predicted_domains).
+
+        For each token, weight = 1 / count^alpha, normalized so mean weight = 1.
+        Returns None when alpha == 0 (no reweighting).
+        """
+        if alpha == 0.0:
+            return None
+
+        import logging as _logging
+        model = self.model
+        dataset = self.train_loader.dataset
+
+        weight_parts = []
+        for dname in model.predicted_domains:
+            vocab_size = model.embed._domain_vocab_sizes[dname]
+            counts = torch.ones(vocab_size, dtype=torch.float32)
+
+            if dname in dataset.domains:
+                dom = dataset.domains[dname]
+                if dom.type == "categorical" and hasattr(dom, "_as_dataframe"):
+                    vc = dom._as_dataframe["token_id"].value_counts()
+                    for tid, cnt in vc.items():
+                        idx = int(tid)
+                        if 0 <= idx < vocab_size:
+                            counts[idx] = float(cnt)
+
+            w = counts.pow(-alpha)
+            w = w / w.mean()
+            weight_parts.append(w)
+            _logging.info(
+                "token_weights domain=%s alpha=%.2f min=%.3f max=%.3f mean=%.3f",
+                dname, alpha, w.min().item(), w.max().item(), w.mean().item(),
+            )
+
+        return torch.cat(weight_parts).to(self.device)
 
     # ——————————————————————————————————————————————————————————————————————
 
@@ -452,6 +502,12 @@ class Trainer(BaseTrainer):
             lines = [f"  epoch {start:>4} – {end:>4}  batch_size={bs:<6}  grad_accum={ga}  effective={bs*ga}"
                      for start, end, bs, ga in sched._describe_stages(self.current_epoch, max_epochs)]
             _logging.info("Batch size schedule:\n%s", "\n".join(lines))
+
+        if self.token_loss_alpha_scheduler is not None:
+            import logging as _logging
+            sched = self.token_loss_alpha_scheduler
+            _logging.info("Token loss alpha schedule: %s (alpha at epoch %d: %g)",
+                          sched, self.current_epoch, self._current_alpha)
 
         epoch_rows = []
         progress, live_ctx, refresh_display = self._setup_display(epoch_rows)
@@ -621,11 +677,16 @@ class Trainer(BaseTrainer):
                 cum += logits_dict[dname].shape[-1]
 
             # ── Cross-entropy loss ────────────────────────────────────────
-            loss_ce = model.cross_entropy_loss(f_logits, f_targets)
+            loss_ce = model.cross_entropy_loss(
+                f_logits, f_targets, token_weights=self._token_weights
+            )
 
             # ── Time-to-event loss ────────────────────────────────────────
             age_diff = (target_ages - input_ages)[predict_mask]
-            time_loss = model.time_to_event_loss(f_logits, age_diff, t_min=1e-1, agg='mean')
+            pos_weights = self._token_weights[f_targets] if self._token_weights is not None else None
+            time_loss = model.time_to_event_loss(
+                f_logits, age_diff, t_min=1e-1, agg='mean', pos_weights=pos_weights
+            )
 
         # ── Package losses (outside autocast, already float32 scalars) ──
         prefix = "" if add_prefix is None else add_prefix + "_"
@@ -928,6 +989,14 @@ class Trainer(BaseTrainer):
             if stage.batch_size != self.train_loader.batch_size:
                 self.train_loader.set_batch_size(stage.batch_size)
             self.grad_accum_steps = stage.grad_accum_steps
+
+        if self.token_loss_alpha_scheduler is not None:
+            import logging as _logging
+            new_alpha = self.token_loss_alpha_scheduler.step(epoch + 1)
+            if new_alpha != self._current_alpha:
+                _logging.info("token_loss_alpha: %g → %g at epoch %d", self._current_alpha, new_alpha, epoch + 1)
+                self._current_alpha = new_alpha
+                self._token_weights = self._build_token_weights(new_alpha)
 
     def epoch_end(self):
         self.train_outputs = []

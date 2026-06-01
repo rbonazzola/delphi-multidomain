@@ -11,7 +11,7 @@ from auc.aucs import evaluate_aucs
 import torch
 import torch._inductor.config as _inductor_config
 _inductor_config.fx_graph_cache = True  # persist compiled Triton kernels across runs (set TORCHINDUCTOR_CACHE_DIR to a non-/tmp path)
-from data.dataset import FlexibleDataLoader, BatchSizeScheduler, DataModule
+from data.dataset import FlexibleDataLoader, BatchSizeScheduler, TokenLossAlphaScheduler, DataModule
 from torch.utils.data import DataLoader
 import mlflow
 
@@ -260,6 +260,15 @@ def get_cli_args():
     parser.add_argument("--log_loss_per_disease", "--log-loss-per-disease", dest="log_loss_per_disease",
                         default=False, action="store_true",
                         help="Log per-disease CE loss breakdown as a CSV artifact each validation epoch")
+    parser.add_argument("--token_loss_alpha", "--token-loss-alpha", dest="token_loss_alpha",
+                        default=0.0, type=float,
+                        help="Exponent for inverse-frequency token loss weighting: "
+                             "weight = 1/freq^alpha (0=uniform, 0.5=sqrt, 1=full inverse). Default: 0.0")
+    parser.add_argument("--token_loss_alpha_schedule", "--token-loss-alpha-schedule",
+                        dest="token_loss_alpha_schedule",
+                        default=None, type=TokenLossAlphaScheduler.from_string,
+                        help="Staged alpha schedule, e.g. '10:0.0,*:1.0'. "
+                             "Overrides --token_loss_alpha when provided.")
     parser.add_argument("--baseline_incidence_path", "--baseline-incidence-path", dest="baseline_incidence_path",
                         default=None, type=str,
                         help="Path to age-sex stratified disease incidence parquet "
@@ -725,6 +734,8 @@ if __name__ == "__main__":
         optim_config=optim_config,
         batch_size_scheduler=bs_scheduler,
         start_epoch=start_epoch,
+        token_loss_alpha=args.token_loss_alpha,
+        token_loss_alpha_scheduler=args.token_loss_alpha_schedule,
     )
 
     trainer.train(max_epochs=args.max_epochs, min_epochs=args.min_epochs, patience=args.patience)

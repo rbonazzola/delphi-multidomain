@@ -658,7 +658,7 @@ class Delphi(nn.Module):
 
     # ── Loss functions ────────────────────────────────────────────────────
 
-    def cross_entropy_loss(self, logits, targets, agg=None):
+    def cross_entropy_loss(self, logits, targets, agg=None, token_weights=None):
         import pandas as pd
         n_classes = logits.size(-1)
         if agg == "per_token":
@@ -688,16 +688,18 @@ class Delphi(nn.Module):
             result.index.name = "token_id"
             return result
         elif agg is None:
+            w = token_weights.to(dtype=logits.dtype, device=logits.device) if token_weights is not None else None
             loss_ce = F.cross_entropy(
                 logits.reshape(-1, n_classes),
                 targets.reshape(-1),
                 ignore_index=-1,
+                weight=w,
             )
         else:
             raise ValueError(f"agg should be in [None, 'per_token', 'per_disease']")
         return loss_ce
 
-    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
+    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None, pos_weights=None):
         lse = torch.logsumexp(logits, -1)
         lse = -torch.log(torch.exp(-lse) + t_min)
         dt = torch.clamp(time_to_next, min=1.0)
@@ -707,7 +709,11 @@ class Delphi(nn.Module):
         if agg is None:
             pass
         elif agg == "mean":
-            loss_dt = loss_dt.mean()
+            if pos_weights is not None:
+                w = pos_weights.to(dtype=loss_dt.dtype, device=loss_dt.device)
+                loss_dt = (loss_dt * w).sum() / w.sum()
+            else:
+                loss_dt = loss_dt.mean()
         elif agg == "sum":
             loss_dt = loss_dt.sum()
         else:
