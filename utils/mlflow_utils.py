@@ -2,7 +2,7 @@ import ast
 import os
 import re
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 
 import mlflow
 import torch
@@ -35,6 +35,7 @@ def load_run_params(run_id: str) -> dict:
 def parse_domains_param(domains_str: str) -> dict:
     """Parse the domains MLflow param (handles embedded PosixPath reprs)."""
     from delphi.model import DomainConfig
+
     s_clean = re.sub(r"PosixPath\(([^)]+)\)", r"\1", domains_str)
     domains_dict = ast.literal_eval(s_clean)
     return {k: DomainConfig(**v) for k, v in domains_dict.items()}
@@ -46,6 +47,7 @@ def get_checkpoint_path(run_id: str) -> Path:
     Prefers best_model.pt (lowest validation loss) over the latest epoch.
     """
     artifact_uri = mlflow.get_run(run_id).info.artifact_uri
+    assert artifact_uri is not None, "MLflow returned a None artifact_uri"
     ckpt_dir = Path(unquote(urlparse(unquote(artifact_uri)).path)) / "checkpoints"
 
     best = ckpt_dir / "best_model.pt"
@@ -68,7 +70,7 @@ def get_checkpoint_path(run_id: str) -> Path:
     return best_ckpt or ckpts[-1]
 
 
-def _get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
+def _get_last_epoch_checkpoint(run_dir: Path | str) -> tuple[Path, int]:
     """Return (path, epoch) of the highest-epoch checkpoint under run_dir/artifacts/checkpoints."""
     ckpt_dir = Path(run_dir) / "artifacts" / "checkpoints"
     if not ckpt_dir.exists():
@@ -91,7 +93,6 @@ def _get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
         raise RuntimeError("No checkpoint contained an epoch number.")
 
     return best, best_epoch
-
 
 
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:

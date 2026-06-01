@@ -1,12 +1,8 @@
-import sys
 from dataclasses import fields as dc_fields
 from pathlib import Path
 
 import pandas as pd
 import yaml
-
-DELPHI_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(DELPHI_DIR))
 
 from delphi.model import DomainConfig
 
@@ -65,11 +61,11 @@ def load_domain_config(cfg_path, tokens_path):
             continue
         if parent_name not in raw_configs:
             raise ValueError(
-                f"Domain '{domain}' references unknown parent '{parent_name}'. "
-                f"Available domains: {sorted(raw_configs)}"
+                f"Domain '{domain}' references unknown parent '{parent_name}'. Available domains: {sorted(raw_configs)}"
             )
         parent_params = {
-            k: v for k, v in raw_configs[parent_name].items()
+            k: v
+            for k, v in raw_configs[parent_name].items()
             if k not in ("parent", "subdomain", "subdomain_column", "predict", "group", "abstract")
         }
         raw_configs[domain] = {**parent_params, **params}
@@ -83,7 +79,6 @@ def load_domain_config(cfg_path, tokens_path):
         if "path" in p:
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
-
     cfg["padding"] = DomainConfig(projector="embed")
     return _normalize_domain_cfg(cfg)
 
@@ -100,20 +95,15 @@ def apply_domain_overrides(domain_cfg: dict, overrides: list[str]) -> dict:
     """
     for override in overrides:
         if "=" not in override or "." not in override.split("=", 1)[0]:
-            raise ValueError(
-                f"Invalid override {override!r}: expected 'domain.field=value'"
-            )
+            raise ValueError(f"Invalid override {override!r}: expected 'domain.field=value'")
         lhs, value_str = override.split("=", 1)
         domain, field = lhs.split(".", 1)
 
         if domain not in domain_cfg:
-            raise ValueError(
-                f"Domain {domain!r} not in config. Available: {sorted(domain_cfg)}"
-            )
+            raise ValueError(f"Domain {domain!r} not in config. Available: {sorted(domain_cfg)}")
         if field not in _DOMAIN_CONFIG_FIELDS:
             raise ValueError(
-                f"Field {field!r} is not a valid DomainConfig field. "
-                f"Valid fields: {sorted(_DOMAIN_CONFIG_FIELDS)}"
+                f"Field {field!r} is not a valid DomainConfig field. Valid fields: {sorted(_DOMAIN_CONFIG_FIELDS)}"
             )
 
         value = yaml.safe_load(value_str)
@@ -128,12 +118,4 @@ def read_ids(path, type=int):
     Handles files with or without header; uses first column only.
     """
     s = pd.read_csv(path, dtype=str, comment="#").iloc[:, 0]
-    return set(
-        s.str.strip()
-         .str.replace(r"\.0$", "", regex=True)
-         .dropna()
-         .astype(type)
-         .tolist()
-    )
-
-
+    return set(s.str.strip().str.replace(r"\.0$", "", regex=True).dropna().astype(type).tolist())

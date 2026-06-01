@@ -1,7 +1,7 @@
-import matplotlib.pyplot as plt
-import seaborn as sns
-import matplotlib.colors as mcolors
 import ast
+
+import matplotlib.pyplot as plt
+
 
 def _normalize_value(attr, value):
     if attr == "params.attention_scheme":
@@ -33,15 +33,10 @@ def build_map(attr, palette, runs_df):
     # convert palette colors to plotly-friendly format
     converted_palette = [_to_plotly_color(c) for c in palette]
 
-    return {
-        v: converted_palette[i % len(converted_palette)]
-        for i, v in enumerate(vals)
-    }
+    return {v: converted_palette[i % len(converted_palette)] for i, v in enumerate(vals)}
 
 
-
-def resolve_visuals(runinfo, attr_color, attr_marker, attr_linestyle,
-                    color_map, marker_map, linestyle_map):
+def resolve_visuals(runinfo, attr_color, attr_marker, attr_linestyle, color_map, marker_map, linestyle_map):
     """
     Given a runinfo row and the selected attributes,
     return (color, marker, linestyle) for plotting.
@@ -70,8 +65,7 @@ def resolve_visuals(runinfo, attr_color, attr_marker, attr_linestyle,
     return color, marker, linestyle
 
 
-def render_legends(ax, attr_color, attr_marker, attr_linestyle,
-                   color_map, marker_map, linestyle_map):
+def render_legends(ax, attr_color, attr_marker, attr_linestyle, color_map, marker_map, linestyle_map):
     """
     Draw legend blocks for color, marker, and linestyle.
     """
@@ -79,18 +73,14 @@ def render_legends(ax, attr_color, attr_marker, attr_linestyle,
 
     # COLOR LEGEND
     if attr_color:
-        handles = [
-            plt.Line2D([0], [0], color=col, lw=3, label=str(val))
-            for val, col in color_map.items()
-        ]
+        handles = [plt.Line2D([0], [0], color=col, lw=3, label=str(val)) for val, col in color_map.items()]
         if handles:
             legend_blocks.append(("Color = " + attr_color.replace("params.", ""), handles))
 
     # MARKER LEGEND
     if attr_marker:
         handles = [
-            plt.Line2D([0], [0], color="black", marker=mk, linestyle="",
-                       markersize=8, label=str(val))
+            plt.Line2D([0], [0], color="black", marker=mk, linestyle="", markersize=8, label=str(val))
             for val, mk in marker_map.items()
         ]
         if handles:
@@ -99,8 +89,7 @@ def render_legends(ax, attr_color, attr_marker, attr_linestyle,
     # LINESTYLE LEGEND
     if attr_linestyle:
         handles = [
-            plt.Line2D([0], [0], color="black", linestyle=ls, lw=2, label=str(val))
-            for val, ls in linestyle_map.items()
+            plt.Line2D([0], [0], color="black", linestyle=ls, lw=2, label=str(val)) for val, ls in linestyle_map.items()
         ]
         if handles:
             legend_blocks.append(("Line = " + attr_linestyle.replace("params.", ""), handles))
@@ -113,5 +102,5 @@ def render_legends(ax, attr_color, attr_marker, attr_linestyle,
             frameon=False,
             fontsize=9,
             loc="upper right",
-            bbox_to_anchor=(1.15, 1 - 0.22 * idx)
+            bbox_to_anchor=(1.15, 1 - 0.22 * idx),
         )

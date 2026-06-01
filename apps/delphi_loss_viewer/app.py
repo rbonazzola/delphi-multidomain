@@ -1,24 +1,21 @@
-import streamlit as st
-import numpy as np
-import pandas as pd
-import yaml
 import ast
 from pathlib import Path
-import seaborn as sns
-import plotly.graph_objs as go
-import sys
-import mlflow
 
-DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(DELPHI_DIR))
+import mlflow
+import pandas as pd
+import plotly.graph_objs as go
+import seaborn as sns
+import streamlit as st
+
+# local modules
+from helpers import exponential_moving_average, load_labels
+from mlflow_loader import filter_runs_with_loss_files, load_runs, validate_loss_files
+from plot_loss import add_plotly_legend, add_run_trace_plotly, load_token_loss_for_run
+from styling import _normalize_value, build_map
 
 from utils import setup_mlflow
 
-# local modules
-from helpers import load_labels, exponential_moving_average
-from styling import build_map, _normalize_value
-from mlflow_loader import load_runs, filter_runs_with_loss_files, validate_loss_files
-from plot_loss import load_token_loss_for_run, add_run_trace_plotly, add_plotly_legend
+DELPHI_DIR = Path(__file__).resolve().parent.parent.parent
 
 setup_mlflow()
 
@@ -29,11 +26,13 @@ print(mlflow.get_tracking_uri())
 st.set_page_config(page_title="Delphi Loss Evolution Viewer", layout="wide")
 st.title("Delphi Loss Evolution Viewer")
 
+
 # ---------------------------------------------------------
 # SIDEBAR — EXPERIMENTS
 # ---------------------------------------------------------
 def _valid_experiments():
     from mlflow_loader import _tracking_root
+
     tracking_root = _tracking_root()
     valid = []
     for exp in mlflow.search_experiments():
@@ -77,18 +76,15 @@ with st.sidebar:
     attn_schemes = set([_parse_attn(v) for v in raw_vals])
     selected_attn = st.multiselect(
         "attention_scheme",
-        options=list(attn_schemes) + ["(any)"],
+        options=[*list(attn_schemes), "(any)"],
     )
 
     selected_layers = st.multiselect(
-        "n_layer",
-        options=["(any)"] + [str(v) for v in sorted(runs_df["params.n_layer"].dropna().unique())]
+        "n_layer", options=["(any)"] + [str(v) for v in sorted(runs_df["params.n_layer"].dropna().unique())]
     )
 
     filtered = runs_df.copy()
-    filtered["params.attention_scheme"] = filtered["params.attention_scheme"].apply(
-        lambda x: _parse_attn(x)
-    )
+    filtered["params.attention_scheme"] = filtered["params.attention_scheme"].apply(lambda x: _parse_attn(x))
 
     if selected_attn and "(any)" not in selected_attn:
         filtered = filtered[filtered["params.attention_scheme"].isin(selected_attn)]
@@ -106,11 +102,7 @@ with st.sidebar:
         default=filtered["run_id"].tolist(),
     )
 
-    st.dataframe(
-        filtered[
-            ["run_id", "experiment_id", "status", "start_time", "end_time", "n_loss_files"]
-        ]
-    )
+    st.dataframe(filtered[["run_id", "experiment_id", "status", "start_time", "end_time", "n_loss_files"]])
 
     if not selected_runs:
         st.warning("Select at least one run.")
@@ -120,7 +112,7 @@ with st.sidebar:
 # ---------------------------------------------------------
 # TOKEN SELECTOR
 # ---------------------------------------------------------
-labels_list = load_labels(DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml") + ["Death"]
+labels_list = [*load_labels(DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml"), "Death"]
 id_to_name = {i: name for i, name in enumerate(labels_list)}
 name_to_id = {name: i for i, name in enumerate(labels_list)}
 
@@ -166,28 +158,21 @@ token_id = name_to_id[selected_name]
 # ---------------------------------------------------------
 # STYLING PARAMETERS
 # ---------------------------------------------------------
-styleable_params = [
-    c for c in runs_df.columns
-    if c.startswith("params.") and runs_df[c].nunique() > 1
-]
+styleable_params = [c for c in runs_df.columns if c.startswith("params.") and runs_df[c].nunique() > 1]
 
-style_choices = st.sidebar.multiselect(
-    "Select up to 3 styling parameters:",
-    options=styleable_params,
-    max_selections=3
-)
+style_choices = st.sidebar.multiselect("Select up to 3 styling parameters:", options=styleable_params, max_selections=3)
 
-while len(style_choices) < 3:
-    style_choices.append(None)
-
-attr_color, attr_marker, attr_linestyle = style_choices
+style_choices_padded: list[str | None] = list(style_choices)
+while len(style_choices_padded) < 3:
+    style_choices_padded.append(None)
+attr_color, attr_marker, attr_linestyle = style_choices_padded
 
 color_palette = sns.color_palette("tab10")
-marker_palette = ['o', 's', 'D', '^', 'v', 'P', 'X', '*', '+', '1']
-line_palette   = ['-', '--', '-.', ':']
+marker_palette = ["o", "s", "D", "^", "v", "P", "X", "*", "+", "1"]
+line_palette = ["-", "--", "-.", ":"]
 
-color_map     = build_map(attr_color, color_palette, runs_df)
-marker_map    = build_map(attr_marker, marker_palette, runs_df)
+color_map = build_map(attr_color, color_palette, runs_df)
+marker_map = build_map(attr_marker, marker_palette, runs_df)
 linestyle_map = build_map(attr_linestyle, line_palette, runs_df)
 
 # st.write("DEBUG color_map:", color_map)
@@ -216,7 +201,7 @@ for runid in selected_runs:
     # TOTAL LOSS
     val_total_file = Path(runinfo["artifact_uri"]) / "metrics" / "val_total"
     try:
-        val_total_loss = pd.read_csv(val_total_file, sep=' ', header=None).iloc[:, 1]
+        val_total_loss = pd.read_csv(val_total_file, sep=" ", header=None).iloc[:, 1]
         ema_total = exponential_moving_average(val_total_loss.values, ema_alpha)
 
         fig_total.add_trace(
@@ -226,7 +211,7 @@ for runid in selected_runs:
                 mode="lines",
                 name=runid,
                 showlegend=False,
-                line=dict(color="rgba(100,100,100,0.4)")
+                line=dict(color="rgba(100,100,100,0.4)"),
             )
         )
     except Exception:
@@ -237,7 +222,7 @@ for runid in selected_runs:
 
     if attr_color is not None:
         runinfo[attr_color] = _normalize_value(attr_color, runinfo[attr_color])
-                                           
+
     if df_sel is not None:
         add_run_trace_plotly(
             fig_token,
@@ -253,7 +238,6 @@ for runid in selected_runs:
             loss_col=loss_metric,
         )
 
-        
         # st.write("DEBUG PARAM VALS FOR", runid)
         # st.write("RAW:", runinfo[attr_color])
         # st.write("NORM:", _normalize_value(attr_color, runinfo[attr_color]))
@@ -312,7 +296,7 @@ st.plotly_chart(fig_token, use_container_width=True)
 # ---------------------------------------------------------
 # st.subheader("Selected runs metadata")
 # st.dataframe(
-    # runs_df[runs_df["run_id"].isin(selected_runs)][
-        # ["run_id", "experiment_id", "status", "start_time", "end_time", "n_loss_files", "artifact_uri"]
-    # ]
+# runs_df[runs_df["run_id"].isin(selected_runs)][
+# ["run_id", "experiment_id", "status", "start_time", "end_time", "n_loss_files", "artifact_uri"]
+# ]
 # )

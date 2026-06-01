@@ -11,16 +11,16 @@ from delphi.model import LayerNorm
 @dataclass
 class OptimConfig:
     # adamw optimizer
-    learning_rate: float        # peak LR — must be set by caller (no sensible universal default)
-    min_lr: float               # floor LR — must be set by caller (typically learning_rate / 10)
-    max_iters: int = 10000      # total number of training iterations
+    learning_rate: float  # peak LR — must be set by caller (no sensible universal default)
+    min_lr: float  # floor LR — must be set by caller (typically learning_rate / 10)
+    max_iters: int = 10000  # total number of training iterations
     weight_decay: float = 1e-1
     beta1: float = 0.9
     beta2: float = 0.95
-    grad_clip: float = 1.0      # clip gradients at this value, or disable if == 0.0
+    grad_clip: float = 1.0  # clip gradients at this value, or disable if == 0.0
 
     # learning rate decay settings
-    schedule: str = "cosine"    # cosine, constant
+    schedule: str = "cosine"  # cosine, constant
     warmup_iters: int = 2000
     lr_decay_iters: int = 10000  # should be ~= max_iters per Chinchilla
 
@@ -45,7 +45,7 @@ def get_constant_lr(it: int, cfg: OptimConfig) -> float:
 
 
 def configure_optimizers(
-    model: torch.nn.Module, cfg: OptimConfig, device_type: str = None
+    model: torch.nn.Module, cfg: OptimConfig, device_type: str | None = None
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
     if device_type is None:
         device_type = next(model.parameters()).device.type
@@ -55,16 +55,18 @@ def configure_optimizers(
     weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
     We are then returning the PyTorch optimizer object.
     """
-   
-    assert cfg.lr_decay_iters > cfg.warmup_iters, f"lr_decay_iters must be greater than warmup_iters, but got ({cfg.lr_decay_iters=}) <= ({cfg.warmup_iters=})"
+
+    assert cfg.lr_decay_iters > cfg.warmup_iters, (
+        f"lr_decay_iters must be greater than warmup_iters, but got ({cfg.lr_decay_iters=}) <= ({cfg.warmup_iters=})"
+    )
     # separate out all parameters to those that will and won't experience regularizing weight decay
     decay = set()
     no_decay = set()
     blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
     for mn, m in model.named_modules():
         if len(list(m.children())) == 0:
-            for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
+            for pn, _ in m.named_parameters():
+                fpn = f"{mn}.{pn}" if mn else pn  # full param name
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
@@ -90,13 +92,9 @@ def configure_optimizers(
     param_dict = {pn: p for pn, p in model.named_parameters()}
     inter_params = decay & no_decay
     union_params = decay | no_decay
-    assert (
-        len(inter_params) == 0
-    ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-    assert (
-        len(param_dict.keys() - union_params) == 0
-    ), "parameters %s were not separated into either decay/no_decay set!" % (
-        str(param_dict.keys() - union_params),
+    assert len(inter_params) == 0, f"parameters {inter_params} made it into both decay/no_decay sets!"
+    assert len(param_dict.keys() - union_params) == 0, (
+        f"parameters {param_dict.keys() - union_params} were not separated into either decay/no_decay set!"
     )
 
     trainable = set()
@@ -118,13 +116,9 @@ def configure_optimizers(
         },
     ]
     # new PyTorch nightly has a new 'fused' option for AdamW that is much faster
-    use_fused = (device_type == "cuda") and (
-        "fused" in inspect.signature(torch.optim.AdamW).parameters
-    )
+    use_fused = (device_type == "cuda") and ("fused" in inspect.signature(torch.optim.AdamW).parameters)
     extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(
-        optim_groups, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), **extra_args
-    )
+    optimizer = torch.optim.AdamW(optim_groups, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), **extra_args)
 
     if cfg.schedule == "cosine":
         lr_schedule_fn = partial(

@@ -28,7 +28,8 @@ dependencies = [
 log = [
   "wandb>=0.25.1,<0.26",
   "mlflow<3.6", # superior to 3.6 introduce sqlite as the recommended/default backend. 
-  "loguru"
+  "loguru",
+  "rich"
 ]
 apps = [
   "streamlit",
@@ -39,7 +40,11 @@ apps = [
 [dependency-groups]
 lint = [
   "ruff",
-  "mypy"
+  "mypy",
+  "pyright",
+  "pandas-stubs",
+  "types-PyYAML",
+  "pre-commit",
 ]
 test = [
   "pytest",
@@ -78,18 +83,40 @@ explicit = true
 [tool.ruff]
 line-length = 120
 extend-include = ["*.ipynb"]
-target-version = "py310"
+extend-exclude = ["deprecated"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors (E722 bare except, E731 lambda assign, E741 ambiguous names…)
+    "W",    # pycodestyle warnings (W291 trailing whitespace, W605 invalid escape sequence…)
+    "F",    # Pyflakes (unused imports F401, undefined names, unused variables…)
+    "I",    # isort — consistent import ordering
+    "UP",   # pyupgrade — modern Python syntax (UP006 built-in generics, UP007 x | None…)
+    "B",    # flake8-bugbear — common bug patterns (mutable defaults, unused loop vars…)
+    "SIM",  # flake8-simplify — simplify if/else, dict.keys() iteration…
+    "RUF",  # Ruff-specific — list unpacking, quadratic sum, unused unpacked vars…
+    "PTH",  # flake8-use-pathlib — replace os.path.* and open() with pathlib equivalents
+]
+ignore = [
+    "E501",   # line too long — formatter enforces line-length = 120, remaining cases are unfixable strings/comments
+    "RUF001", # ambiguous unicode in strings — intentional (×, –, ➕ used in UI labels and math)
+    "RUF002", # ambiguous unicode in docstrings — same rationale
+    "RUF003", # ambiguous unicode in comments — same rationale
+]
 
 [tool.mypy]
+exclude = ["deprecated/"]
 ignore_missing_imports = true
 explicit_package_bases = true
 check_untyped_defs = true
 warn_unreachable = true
 
+[tool.pyright]
+exclude = ["deprecated"]
+reportPrivateImportUsage = "none"
+
 [tool.hatch.build.targets.wheel]
 packages = ["delphi"]
-
-
-
 
 

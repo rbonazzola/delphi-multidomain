@@ -18,21 +18,20 @@ Components kept unchanged:
 
 from __future__ import annotations
 
-import os, sys
-import math
 import inspect
 import logging
+import math
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from dataclasses import dataclass, field, fields, is_dataclass, asdict
-from typing import Optional, List, Tuple, Dict, Union, Mapping
+from typing import Literal, TypedDict
 
-import yaml
-import numpy as np
 import torch
 import torch.nn as nn
+import yaml
 from torch.nn import functional as F
-from easydict import EasyDict
 
+from data.dataset import DelphiBatch
 from delphi.embedding import MultiDomainEmbedding
 
 logger = logging.getLogger(__name__)
@@ -59,8 +58,7 @@ def parse_duration(s) -> float:
     _units = {"d": 1.0, "m": _DAYS_PER_MONTH, "y": DAYS_PER_YEAR}
     if not s or s[-1] not in _units:
         raise ValueError(
-            f"Duration {s!r} requires a unit suffix: d (days), m (months), y (years). "
-            f"Examples: '-20y', '6m', '1000d'."
+            f"Duration {s!r} requires a unit suffix: d (days), m (months), y (years). Examples: '-20y', '6m', '1000d'."
         )
     return float(s[:-1]) * _units[s[-1]]
 
@@ -69,52 +67,53 @@ def parse_duration(s) -> float:
 #  Config
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class DomainConfig:
-    projector:  str           = "embed"
-    n_layers:   Optional[int] = None
-    n_hidden:   Optional[int] = None
-    input_size: Optional[int] = None
-    pretrained_path: Optional[str] = None
+    projector: str = "embed"
+    n_layers: int | None = None
+    n_hidden: int | None = None
+    input_size: int | None = None
+    pretrained_path: str | None = None
     freeze: bool = False
-    path: Optional[str] = None
+    path: str | None = None
     predict: bool = False
     age_jitter: bool = False
-    age_jitter_min: float = -20 * 365.25   # days
-    age_jitter_max: float =  40 * 365.25   # days
+    age_jitter_min: float = -20 * 365.25  # days
+    age_jitter_max: float = 40 * 365.25  # days
     type: str = "categorical"
     at_birth: bool = False
-    n_latent_tokens: Optional[int] = None
-    subdomain: Optional[str] = None        # filter tokens by metadata (e.g. "hla_a")
-    subdomain_column: str = "locus"        # metadata column used for subdomain filtering
-    token_value_column: Optional[str] = None  # collapse tokens by this metadata column (e.g. "allele_1field")
-    parent: Optional[str] = None          # inherit config from this domain (resolved at load time)
-    abstract: bool = False                 # template-only domain; excluded from the active config
-    group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
-    dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
-    dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
-    no_repeat: bool = False               # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
+    n_latent_tokens: int | None = None
+    subdomain: str | None = None  # filter tokens by metadata (e.g. "hla_a")
+    subdomain_column: str = "locus"  # metadata column used for subdomain filtering
+    token_value_column: str | None = None  # collapse tokens by this metadata column (e.g. "allele_1field")
+    parent: str | None = None  # inherit config from this domain (resolved at load time)
+    abstract: bool = False  # template-only domain; excluded from the active config
+    group: str | None = None  # alias for attention mask (e.g. "hla_alleles")
+    dropout_mode: str | None = None  # "token" (random tokens) | "block" (entire domain per subject)
+    dropout_rate: float = 0.0  # probability of dropping; 0 = disabled
+    no_repeat: bool = (
+        False  # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
+    )
 
     def __post_init__(self):
         if self.at_birth and self.age_jitter:
-            raise ValueError(
-                "DomainConfig: at_birth and age_jitter are mutually exclusive — set only one."
-            )
-        object.__setattr__(self, '_initialized', True)
+            raise ValueError("DomainConfig: at_birth and age_jitter are mutually exclusive — set only one.")
+        object.__setattr__(self, "_initialized", True)
 
     _DURATION_FIELDS = frozenset({"age_jitter_min", "age_jitter_max"})
 
     def __setattr__(self, name, value):
         if name in DomainConfig._DURATION_FIELDS and isinstance(value, str):
             value = parse_duration(value)
-        if getattr(self, '_initialized', False):
-            if name == 'at_birth' and value:
-                object.__setattr__(self, 'age_jitter', False)
-            elif name == 'age_jitter' and value:
-                object.__setattr__(self, 'at_birth', False)
+        if getattr(self, "_initialized", False):
+            if name == "at_birth" and value:
+                object.__setattr__(self, "age_jitter", False)
+            elif name == "age_jitter" and value:
+                object.__setattr__(self, "at_birth", False)
         object.__setattr__(self, name, value)
 
-    def set_age_jitter(self, value: bool, min: Optional[float] = None, max: Optional[float] = None):
+    def set_age_jitter(self, value: bool, min: float | None = None, max: float | None = None):
         self.age_jitter = value
         if min is not None:
             self.age_jitter_min = min
@@ -140,7 +139,7 @@ class DelphiConfig:
     n_head: int = 12
     n_embd: int = 120
     domains: dict[str, DomainConfig] = field(default_factory=dict)
-    attention_scheme: Union[str, List] = "all:causal(mask_ties=True)"
+    attention_scheme: str | list = "all:causal(mask_ties=True)"
     dropout: float = 0.1
     resid_pdrop: float = 0.1
     embd_pdrop: float = 0.1
@@ -170,7 +169,7 @@ class DelphiConfig:
         self.block_size = block_size
         return self
 
-    def set_attention_scheme(self, attention_scheme: Union[str, List]):
+    def set_attention_scheme(self, attention_scheme: str | list):
         self.attention_scheme = attention_scheme
         return self
 
@@ -188,24 +187,35 @@ class DelphiConfig:
 #  Attention Mask Builder  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class AttentionMaskBuilder(nn.Module):
 
-    def __init__(self, scheme_str: str, domain2id: dict, group_to_ints: Dict[str, List[int]] = None):
+class AttentionRule(TypedDict):
+    type: Literal["causal", "bidirectional"]
+    mask_ties: bool
+
+
+class AttentionMaskBuilder(nn.Module):
+    def __init__(self, scheme_str: str, domain2id: dict, group_to_ints: dict[str, list[int]] | None = None):
         super().__init__()
         self.scheme = AttentionMaskBuilder._parse_scheme(scheme_str)
         self.domain2id = domain2id
         self.group_to_ints = group_to_ints or {}
 
     @staticmethod
-    def _split_top_level(s: str, sep: str = ","):
-        parts, buf, depth_brack, depth_paren = [], "", 0, 0
+    def _split_top_level(s: str, sep: str = ",") -> list[str]:
+        parts: list[str] = []
+        buf, depth_brack, depth_paren = "", 0, 0
         for ch in s:
-            if ch == "[":   depth_brack += 1
-            elif ch == "]": depth_brack -= 1
-            elif ch == "(": depth_paren += 1
-            elif ch == ")": depth_paren -= 1
+            if ch == "[":
+                depth_brack += 1
+            elif ch == "]":
+                depth_brack -= 1
+            elif ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                depth_paren -= 1
             if ch == sep and depth_brack == 0 and depth_paren == 0:
-                parts.append(buf.strip())
+                if buf.strip():
+                    parts.append(buf.strip())
                 buf = ""
             else:
                 buf += ch
@@ -214,8 +224,11 @@ class AttentionMaskBuilder(nn.Module):
         return parts
 
     @staticmethod
-    def _parse_scheme(scheme_str: str) -> Dict[Tuple[str, ...], Dict[str, bool | str]]:
-        scheme = {}
+    def _parse_scheme(scheme_str: str) -> dict[tuple[str, ...], AttentionRule]:
+        rule_type: Literal["causal", "bidirectional"]
+        mask_ties: bool
+
+        scheme: dict[tuple[str, ...], AttentionRule] = {}
         parts = AttentionMaskBuilder._split_top_level(scheme_str)
         for part in parts:
             if ":" not in part:
@@ -226,6 +239,7 @@ class AttentionMaskBuilder(nn.Module):
                 domains = [d.strip() for d in domain_part[1:-1].split(",")]
             else:
                 domains = [domain_part]
+
             if rule_part.startswith("causal"):
                 rule_type = "causal"
                 mask_ties = "mask_ties=True" in rule_part
@@ -239,12 +253,12 @@ class AttentionMaskBuilder(nn.Module):
 
     def build(self, domains: torch.Tensor, local_token_ids: torch.Tensor, ages: torch.Tensor):
         B, L = ages.shape
-        dd = {'device': ages.device}
-        mask = torch.zeros(B, L, L, **dd)
+        device = ages.device
+        mask = torch.zeros(B, L, L, device=device)
         age_row = ages.unsqueeze(2)
         age_col = ages.unsqueeze(1)
 
-        all_domain_ids = torch.tensor(list(self.domain2id.values()), **dd)
+        all_domain_ids = torch.tensor(list(self.domain2id.values()), device=device)
 
         for dom_names, cfg in self.scheme.items():
             # Resolve "all" to every domain
@@ -257,17 +271,14 @@ class AttentionMaskBuilder(nn.Module):
                         ids.extend(self.group_to_ints[d])
                     else:
                         ids.append(self.domain2id[d])
-                dom_ids = torch.tensor(ids, **dd)
+                dom_ids = torch.tensor(ids, device=device)
             dom_mask = torch.isin(domains, dom_ids)
             pair_mask = dom_mask.unsqueeze(2) & dom_mask.unsqueeze(1)
 
             if cfg["type"] == "bidirectional":
                 mask[pair_mask] = 1
             elif cfg["type"] == "causal":
-                if cfg.get("mask_ties", False):
-                    causal = age_row > age_col
-                else:
-                    causal = age_row >= age_col
+                causal = age_row > age_col if cfg.get("mask_ties", False) else age_row >= age_col
                 final = pair_mask & causal
                 mask[final] = 1
             else:
@@ -297,13 +308,11 @@ class AttentionMaskBuilder(nn.Module):
 #  Age Encoding  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class AgeEncoding(nn.Module):
 
+class AgeEncoding(nn.Module):
     def __init__(self, n_embd: int, norm_factor: float = 365.25, max_wavelen: float = 10000.0):
         super().__init__()
-        div_term = torch.exp(
-            torch.arange(0, n_embd, 2) * (-math.log(max_wavelen) / n_embd)
-        )
+        div_term = torch.exp(torch.arange(0, n_embd, 2) * (-math.log(max_wavelen) / n_embd))
         self.register_buffer("div_term", div_term)
         self.n_embd = n_embd
         self.linear = nn.Linear(n_embd, n_embd, bias=False)
@@ -332,6 +341,7 @@ class AgeEncoding(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Transformer components  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class LayerNorm(nn.Module):
     def __init__(self, ndim, bias):
@@ -408,6 +418,7 @@ class Block(nn.Module):
 #  Weight initialization
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def initialize_weights(model: nn.Module, config: DelphiConfig):
     def _init_weights(module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -427,8 +438,8 @@ def initialize_weights(model: nn.Module, config: DelphiConfig):
 #  Delphi
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class Delphi(nn.Module):
 
+class Delphi(nn.Module):
     def __init__(self, config: DelphiConfig):
         super().__init__()
 
@@ -438,9 +449,7 @@ class Delphi(nn.Module):
         # Derive shared metadata from config.domains
         self.domain_to_int = self._build_domain_to_int(list(config.domains.keys()))
         self.int_to_domain = {v: k for k, v in self.domain_to_int.items()}
-        self.domain_offsets, global_vocab_size = self._build_domain_offsets(
-            self.domain_to_int, config.domains
-        )
+        self.domain_offsets, global_vocab_size = self._build_domain_offsets(self.domain_to_int, config.domains)
         self.global_vocab_size = global_vocab_size
 
         self._build_model(config)
@@ -455,7 +464,7 @@ class Delphi(nn.Module):
     # ── Domain metadata (static, reusable by dataset/collate) ─────────────
 
     @staticmethod
-    def _build_domain_to_int(domain_names: List[str]) -> Dict[str, int]:
+    def _build_domain_to_int(domain_names: list[str]) -> dict[str, int]:
         """Stable mapping: all domains except padding first, padding last."""
         ordered = [d for d in domain_names if d != "padding"] + ["padding"]
         return {name: i for i, name in enumerate(ordered)}
@@ -468,14 +477,14 @@ class Delphi(nn.Module):
         if cfg.projector == "pretrained" and cfg.pretrained_path is not None:
             return torch.load(cfg.pretrained_path, weights_only=True).shape[0]
         tokenizer_path = Path(cfg.path) / "tokenizer.yaml"
-        with open(tokenizer_path, "r") as f:
+        with tokenizer_path.open() as f:
             return len(yaml.safe_load(f))
 
     @staticmethod
     def _build_domain_offsets(
-        domain_to_int: Dict[str, int],
-        domain_cfg: Dict[str, "DomainConfig"],
-    ) -> tuple[Dict[int, int], int]:
+        domain_to_int: dict[str, int],
+        domain_cfg: dict[str, DomainConfig],
+    ) -> tuple[dict[int, int], int]:
         """Compute global embedding offsets. Returns (offsets, global_vocab_size)."""
         offsets = {}
         running = 0
@@ -508,10 +517,7 @@ class Delphi(nn.Module):
             attention_scheme = self.config.n_layer * attention_scheme
         if any("at_birth" in s for s in attention_scheme):
             at_birth_names = [name for name, cfg in self.config.domains.items() if cfg.at_birth]
-            if len(at_birth_names) == 1:
-                at_birth = at_birth_names[0]
-            else:
-                at_birth = "[" + ",".join(at_birth_names) + "]"
+            at_birth = at_birth_names[0] if len(at_birth_names) == 1 else "[" + ",".join(at_birth_names) + "]"
             attention_scheme = [s.replace("at_birth", at_birth) for s in attention_scheme]
         return attention_scheme
 
@@ -524,24 +530,31 @@ class Delphi(nn.Module):
             domain_to_int=self.domain_to_int,
         )
 
-        group_to_ints: Dict[str, List[int]] = {}
+        group_to_ints: dict[str, list[int]] = {}
         for dname, dcfg in config.domains.items():
             alias = dcfg.group or dcfg.parent
             if alias:
                 group_to_ints.setdefault(alias, []).append(self.domain_to_int[dname])
 
-        self.transformer = nn.ModuleDict(dict(
-            age_embedding=AgeEncoding(n_embd=config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            attn_mask_builder=nn.ModuleList([
-                nn.ModuleList([
-                    AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int, group_to_ints)
-                    for i in range(config.n_layer)
-                ]) for j in range(config.n_head)
-            ]),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=LayerNorm(config.n_embd, bias=config.bias),
-        ))
+        self.transformer = nn.ModuleDict(
+            dict(
+                age_embedding=AgeEncoding(n_embd=config.n_embd),
+                drop=nn.Dropout(config.dropout),
+                attn_mask_builder=nn.ModuleList(
+                    [
+                        nn.ModuleList(
+                            [
+                                AttentionMaskBuilder(self._attention_schemes[i], self.domain_to_int, group_to_ints)
+                                for i in range(config.n_layer)
+                            ]
+                        )
+                        for j in range(config.n_head)
+                    ]
+                ),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f=LayerNorm(config.n_embd, bias=config.bias),
+            )
+        )
 
     # ── Properties ────────────────────────────────────────────────────────
 
@@ -583,8 +596,8 @@ class Delphi(nn.Module):
             batch.domain_ids, batch.global_token_ids, batch.ages
         )
         attn_mask = (
-            single_mask
-            .unsqueeze(1).unsqueeze(1)
+            single_mask.unsqueeze(1)
+            .unsqueeze(1)
             .expand(-1, self.config.n_layer, self.config.n_head, -1, -1)
             .permute(1, 0, 2, 3, 4)
         )
@@ -618,23 +631,23 @@ class Delphi(nn.Module):
             [B, T, n_embd] if requested.
         """
         # 1. Embed all tokens
-        emb = self.embed(batch)                          # [B, T, n_embd]
+        emb = self.embed(batch)  # [B, T, n_embd]
 
         # 2. Add age encoding
         #    AgeEncoding expects (T, B) or (T,), but batch.ages is [B, T]
         #    Transpose, encode, transpose back.
         age_emb = self.transformer.age_embedding(
-            batch.ages.T                                  # [T, B]
-        )                                                 # [T, B, n_embd] or [T, n_embd]
+            batch.ages.T  # [T, B]
+        )  # [T, B, n_embd] or [T, n_embd]
         if age_emb.ndim == 2:
-            age_emb = age_emb.unsqueeze(1)                # [T, 1, n_embd]
-        age_emb = age_emb.transpose(0, 1)                 # [B, T, n_embd]
+            age_emb = age_emb.unsqueeze(1)  # [T, 1, n_embd]
+        age_emb = age_emb.transpose(0, 1)  # [B, T, n_embd]
 
         emb = emb + age_emb
         emb = self.transformer.drop(emb)
 
         # 3. Build attention mask
-        attn_mask = self.build_attn_mask(batch)           # [n_layer, B, n_head, T, T]
+        attn_mask = self.build_attn_mask(batch)  # [n_layer, B, n_head, T, T]
 
         # 4. Transformer blocks
         h = emb
@@ -643,7 +656,7 @@ class Delphi(nn.Module):
             h, att = block(h, attn_mask=attn_mask[i])
             att_list.append(att)
 
-        h = self.transformer.ln_f(h)                      # [B, T, n_embd]
+        h = self.transformer.ln_f(h)  # [B, T, n_embd]
 
         # 5. Logits (tied weights, predicted domains only)
         logits = self.embed.to_logits(h)
@@ -660,6 +673,7 @@ class Delphi(nn.Module):
 
     def cross_entropy_loss(self, logits, targets, agg=None):
         import pandas as pd
+
         n_classes = logits.size(-1)
         if agg == "per_token":
             log_softmax = F.log_softmax(logits.view(-1, n_classes), dim=-1)
@@ -673,9 +687,7 @@ class Delphi(nn.Module):
             log_softmax = F.log_softmax(logits.view(-1, n_classes), dim=-1)
             log_p = log_softmax[torch.arange(flat_targets.size(0), device=logits.device), flat_targets]
 
-            unique_ids, inverse, counts = torch.unique(
-                flat_targets, return_inverse=True, return_counts=True
-            )
+            unique_ids, inverse, counts = torch.unique(flat_targets, return_inverse=True, return_counts=True)
             sum_log_p = torch.zeros(unique_ids.size(0), dtype=log_p.dtype, device=logits.device)
             sum_log_p.scatter_add_(0, inverse, log_p)
             mean_log_p = sum_log_p / counts.float()
@@ -694,7 +706,7 @@ class Delphi(nn.Module):
                 ignore_index=-1,
             )
         else:
-            raise ValueError(f"agg should be in [None, 'per_token', 'per_disease']")
+            raise ValueError("agg should be in [None, 'per_token', 'per_disease']")
         return loss_ce
 
     def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
@@ -716,7 +728,7 @@ class Delphi(nn.Module):
 
     # ── Inference convenience ─────────────────────────────────────────────
 
-    def run_inference(self, dataloader, block_size=None, return_token_df=False):
+    def run_inference(self, dataloader: Iterable[DelphiBatch], block_size=None, return_token_df=False):
         """
         Run inference over an entire dataloader.
         The dataloader should use DelphiCollateFn.
@@ -724,22 +736,22 @@ class Delphi(nn.Module):
         if return_token_df:
             raise NotImplementedError
 
+        old_block_size = self.block_size
         if block_size is not None:
             logger.warning(f"Temporarily changing block_size from {self.block_size} to {block_size}")
-            old_block_size = self.block_size
             self.set_block_size(block_size)
 
-        all_logits = []
+        all_logits: list[torch.Tensor] = []
         for batch in dataloader:
             batch = batch.to(self.device)
             with torch.no_grad():
-                logits_dict, _ = self(batch)
+                logits_dict = self.forward(batch, return_embeddings=False)[0]
 
-            logits_all_domains = []
+            _logits_all_domains: list[torch.Tensor] = []
             for dom in self.predicted_domains:
                 assert dom in logits_dict
-                logits_all_domains.append(logits_dict[dom])
-            logits_all_domains = torch.cat(logits_all_domains, dim=-1)
+                _logits_all_domains.append(logits_dict[dom])
+            logits_all_domains = torch.cat(_logits_all_domains, dim=-1)
             all_logits.append(logits_all_domains)
 
         logits = torch.cat(all_logits, dim=0)
@@ -782,11 +794,12 @@ class Delphi(nn.Module):
 #  Post-forward utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def mask_seen_token_logits(
     model: Delphi,
-    batch: "DelphiBatch",
-    logits_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
+    batch: DelphiBatch,
+    logits_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
     """
     For domains with no_repeat=True, set logits of already-seen tokens to -inf.
 
@@ -795,10 +808,7 @@ def mask_seen_token_logits(
     the model from learning to suppress tokens that cannot recur by construction
     of the dataset (e.g. diseases recorded only at first diagnosis).
     """
-    no_repeat_domains = [
-        dname for dname, cfg in model.config.domains.items()
-        if cfg.no_repeat and dname in logits_dict
-    ]
+    no_repeat_domains = [dname for dname, cfg in model.config.domains.items() if cfg.no_repeat and dname in logits_dict]
     if not no_repeat_domains:
         return logits_dict
 
@@ -808,11 +818,11 @@ def mask_seen_token_logits(
     for dname in no_repeat_domains:
         d_int = model.domain_to_int[dname]
         d_offset = model.domain_offsets[d_int]
-        domain_logits = logits_dict[dname]        # [B, T, D_vocab]
+        domain_logits = logits_dict[dname]  # [B, T, D_vocab]
         D_vocab = domain_logits.shape[-1]
 
         # Use domain_ids to identify positions
-        is_domain = (batch.domain_ids == d_int)                       # [B, T]
+        is_domain = batch.domain_ids == d_int  # [B, T]
         b_idx, t_idx = is_domain.nonzero(as_tuple=True)
         local_ids = batch.global_token_ids[b_idx, t_idx] - d_offset  # guaranteed in [0, D_vocab-1]
 
@@ -825,6 +835,6 @@ def mask_seen_token_logits(
 
         # logits[:, t, :] predicts the next token after position t;
         # the context available at that step is exactly positions 0..t.
-        logits_dict[dname] = domain_logits.masked_fill(seen_up_to, float('-inf'))
+        logits_dict[dname] = domain_logits.masked_fill(seen_up_to, float("-inf"))
 
     return logits_dict

@@ -10,13 +10,13 @@ Run:
 """
 
 import csv
-import itertools
 import io
+import itertools
 from pathlib import Path
 
 import pandas as pd
-import yaml
 import streamlit as st
+import yaml
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Load attention schemes from config/attention_schemes.yaml
@@ -28,7 +28,7 @@ _SCHEMES_YAML = Path(__file__).resolve().parent.parent / "config" / "attention_s
 def _load_attention_schemes():
     if not _SCHEMES_YAML.exists():
         return {"Custom (edit below)": {"scheme": "", "domains": ""}}
-    with open(_SCHEMES_YAML) as f:
+    with _SCHEMES_YAML.open() as f:
         data = yaml.safe_load(f)
     schemes = {}
     for name, entry in data.items():
@@ -57,7 +57,7 @@ def _get_at_birth_domains(domain_config_path: str) -> list[str]:
     path = Path(domain_config_path)
     if not path.exists():
         return []
-    with open(path) as f:
+    with path.open() as f:
         data = yaml.safe_load(f)
     return [name for name, cfg in data.items() if isinstance(cfg, dict) and cfg.get("at_birth")]
 
@@ -71,10 +71,22 @@ def resolve_at_birth(s: str, at_birth_domains: list[str]) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ALL_DOMAINS = [
-    "diseases", "death", "lifestyle", "sex",
-    "hla_alleles", "hla_a", "hla_b", "hla_c",
-    "hla_dpa", "hla_dpb", "hla_dqa", "hla_dqb", "hla_drb",
-    "genetic_pcs", "cv_drugs", "ns_drugs",
+    "diseases",
+    "death",
+    "lifestyle",
+    "sex",
+    "hla_alleles",
+    "hla_a",
+    "hla_b",
+    "hla_c",
+    "hla_dpa",
+    "hla_dpb",
+    "hla_dqa",
+    "hla_dqb",
+    "hla_drb",
+    "genetic_pcs",
+    "cv_drugs",
+    "ns_drugs",
     "rare_variants",
 ]
 
@@ -93,6 +105,7 @@ PREDEFINED_DOMAIN_SETS = {
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Load params from TSV
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _load_params_from_tsv(path: str) -> str | None:
     """Parse a params TSV and populate session state for sidebar widgets and configs."""
@@ -166,20 +179,21 @@ def _load_params_from_tsv(path: str) -> str | None:
                 "Custom (edit below)",
             )
             attn_preset = next(
-                (label for label, info in PREDEFINED_ATTENTION_SCHEMES.items()
-                 if info["scheme"] == attn_str),
+                (label for label, info in PREDEFINED_ATTENTION_SCHEMES.items() if info["scheme"] == attn_str),
                 "Custom (edit below)",
             )
             suffix = f"_config{idx + 1}" if idx > 0 else "_base"
-            new_configs.append({
-                "domains_preset": domains_preset,
-                "domains_custom": domains_str if domains_preset == "Custom (edit below)" else "",
-                "attn_preset": attn_preset,
-                "attn_custom": attn_str if attn_preset == "Custom (edit below)" else "",
-                "suffix": suffix,
-                "_domains": domains_str,
-                "_attn": attn_str,
-            })
+            new_configs.append(
+                {
+                    "domains_preset": domains_preset,
+                    "domains_custom": domains_str if domains_preset == "Custom (edit below)" else "",
+                    "attn_preset": attn_preset,
+                    "attn_custom": attn_str if attn_preset == "Custom (edit below)" else "",
+                    "suffix": suffix,
+                    "_domains": domains_str,
+                    "_attn": attn_str,
+                }
+            )
         st.session_state.configs = new_configs
 
     return None  # success
@@ -219,29 +233,17 @@ with st.sidebar:
                 st.warning("Enter a file path first.")
 
     st.subheader("Experiment name")
-    experiment_name = st.text_input(
-        "MLflow experiment name", value="Delphi-experiment", key="ti_experiment_name"
-    )
+    experiment_name = st.text_input("MLflow experiment name", value="Delphi-experiment", key="ti_experiment_name")
 
     st.subheader("Architecture grid")
-    n_layers = st.multiselect(
-        "n_layer", [1, 2, 4, 6, 8, 12, 16, 24], default=[12], key="ms_n_layers"
-    )
-    n_embds = st.multiselect(
-        "n_embd", [60, 120, 180, 240, 360, 480], default=[240], key="ms_n_embds"
-    )
-    n_heads = st.multiselect(
-        "n_head", [1, 2, 3, 4, 6, 8, 12, 16], default=[12], key="ms_n_heads"
-    )
+    n_layers = st.multiselect("n_layer", [1, 2, 4, 6, 8, 12, 16, 24], default=[12], key="ms_n_layers")
+    n_embds = st.multiselect("n_embd", [60, 120, 180, 240, 360, 480], default=[240], key="ms_n_embds")
+    n_heads = st.multiselect("n_head", [1, 2, 3, 4, 6, 8, 12, 16], default=[12], key="ms_n_heads")
 
     st.subheader("Training grid")
-    batch_size_mode = st.radio(
-        "Batch size mode", ["Fixed", "Schedule"], horizontal=True, key="radio_batch_mode"
-    )
+    batch_size_mode = st.radio("Batch size mode", ["Fixed", "Schedule"], horizontal=True, key="radio_batch_mode")
     if batch_size_mode == "Fixed":
-        batch_sizes = st.multiselect(
-            "batch_size", [32, 64, 128, 256, 512], default=[128], key="ms_batch_sizes"
-        )
+        batch_sizes = st.multiselect("batch_size", [32, 64, 128, 256, 512], default=[128], key="ms_batch_sizes")
         batch_size_schedules = []
     else:
         batch_sizes = []
@@ -257,9 +259,7 @@ with st.sidebar:
         )
         batch_size_schedules = [s.strip() for s in _schedules_raw.splitlines() if s.strip()]
 
-    block_sizes = st.multiselect(
-        "block_size", ["auto", 32, 64, 96, 128, 192, 256], default=[128], key="ms_block_sizes"
-    )
+    block_sizes = st.multiselect("block_size", ["auto", 32, 64, 96, 128, 192, 256], default=[128], key="ms_block_sizes")
     learning_rates = st.multiselect(
         "learning_rate",
         [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
@@ -267,9 +267,7 @@ with st.sidebar:
         key="ms_learning_rates",
         format_func=lambda x: f"{x:.0e}",
     )
-    test_folds = st.multiselect(
-        "test_fold", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5], key="ms_test_folds"
-    )
+    test_folds = st.multiselect("test_fold", [1, 2, 3, 4, 5], default=[1, 2, 3, 4, 5], key="ms_test_folds")
 
     st.subheader("Domain config")
     _available_configs = sorted(_CONFIG_DIR.glob("domain_config*.yaml"))
@@ -281,12 +279,8 @@ with st.sidebar:
         st.caption(f"at_birth → {', '.join(at_birth_domains)}")
 
     st.subheader("Other")
-    num_workers = st.number_input(
-        "num_workers", min_value=0, max_value=16, value=4, key="ni_num_workers"
-    )
-    subjects_path = st.text_input(
-        "subjects (path, leave empty for all)", value="", key="ti_subjects"
-    )
+    num_workers = st.number_input("num_workers", min_value=0, max_value=16, value=4, key="ni_num_workers")
+    subjects_path = st.text_input("subjects (path, leave empty for all)", value="", key="ti_subjects")
     seeds_input = st.text_input("seed(s) (comma-separated)", value="142", key="ti_seeds")
     seeds = [int(s.strip()) for s in seeds_input.split(",") if s.strip().isdigit()]
 
@@ -303,9 +297,7 @@ with st.sidebar:
 
     st.subheader("Boolean flags")
     use_amp = st.checkbox("use_amp (mixed precision)", value=True, key="cb_use_amp")
-    compute_aucs = st.checkbox(
-        "compute_aucs (evaluate after training)", value=True, key="cb_compute_aucs"
-    )
+    compute_aucs = st.checkbox("compute_aucs (evaluate after training)", value=True, key="cb_compute_aucs")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -333,13 +325,15 @@ if "configs" not in st.session_state:
 
 
 def add_config():
-    st.session_state.configs.append({
-        "domains_preset": "Base (no HLA, no PCs)",
-        "domains_custom": "",
-        "attn_preset": _FIRST_ATTN_PRESET,
-        "attn_custom": "",
-        "suffix": f"_config{len(st.session_state.configs) + 1}",
-    })
+    st.session_state.configs.append(
+        {
+            "domains_preset": "Base (no HLA, no PCs)",
+            "domains_custom": "",
+            "attn_preset": _FIRST_ATTN_PRESET,
+            "attn_custom": "",
+            "suffix": f"_config{len(st.session_state.configs) + 1}",
+        }
+    )
 
 
 def remove_config(idx):
@@ -357,7 +351,8 @@ for i, cfg in enumerate(st.session_state.configs):
                 list(PREDEFINED_DOMAIN_SETS.keys()),
                 key=f"dom_preset_{i}",
                 index=list(PREDEFINED_DOMAIN_SETS.keys()).index(cfg["domains_preset"])
-                if cfg["domains_preset"] in PREDEFINED_DOMAIN_SETS else 0,
+                if cfg["domains_preset"] in PREDEFINED_DOMAIN_SETS
+                else 0,
             )
             cfg["domains_preset"] = domain_preset
 
@@ -378,7 +373,8 @@ for i, cfg in enumerate(st.session_state.configs):
                 list(PREDEFINED_ATTENTION_SCHEMES.keys()),
                 key=f"attn_preset_{i}",
                 index=list(PREDEFINED_ATTENTION_SCHEMES.keys()).index(cfg["attn_preset"])
-                if cfg["attn_preset"] in PREDEFINED_ATTENTION_SCHEMES else 0,
+                if cfg["attn_preset"] in PREDEFINED_ATTENTION_SCHEMES
+                else 0,
             )
             cfg["attn_preset"] = attn_preset
 
@@ -419,7 +415,7 @@ for i, cfg in enumerate(st.session_state.configs):
         cfg["_domains"] = resolve_at_birth(domains_str, at_birth_domains)
         cfg["_attn"] = resolve_at_birth(attn_str, at_birth_domains)
 
-col_add, _ = st.columns([1, 4])
+col_add, _spacer = st.columns([1, 4])
 with col_add:
     st.button("➕ Add configuration", on_click=add_config)
 
@@ -519,7 +515,7 @@ else:
                     st.text(f"  {col}: {vals}")
         with col2:
             st.markdown("**Configurations:**")
-            for i, cfg in enumerate(st.session_state.configs):
+            for _, cfg in enumerate(st.session_state.configs):
                 st.text(f"  {cfg['suffix']}: {cfg['_domains'][:40]}...")
         with col3:
             st.markdown("**Folds:**")

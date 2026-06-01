@@ -2,6 +2,7 @@
 Utilities for reconstructing a trained Delphi model (and optional dataloaders)
 from an MLflow run ID.
 """
+
 from __future__ import annotations
 
 import ast
@@ -10,11 +11,12 @@ import os
 import re
 from dataclasses import fields as dc_fields
 from pathlib import Path
-from typing import Union
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
-from data.dataset import FlexibleDataLoader, BatchSizeScheduler, DataModule
+
+from data.dataset import BatchSizeScheduler, DataModule, FlexibleDataLoader
 
 DELPHI_DIR = Path(__file__).resolve().parent.parent
 
@@ -22,21 +24,21 @@ AUTO_BLOCK_SIZE = 512  # used when a run was trained with block_size="auto"
 
 _SPLIT_TO_METADATA_KEY = {
     "train": "train_ids",
-    "val":   "valid_ids",
-    "test":  "test_ids",
+    "val": "valid_ids",
+    "test": "test_ids",
 }
 
 
 def reconstruct_from_run(
     run_id: str,
-    split: Union[str, list[str]] = "test",
+    split: str | list[str] = "test",
     block_size: int | None = None,
     batch_size: int = 512,
     num_workers: int = 4,
     date_cutoff: str | None = None,
     birth_dates_file: str | None = None,
     device: str | None = None,
-    tokens_path: Union[str, Path, None] = None,
+    tokens_path: str | Path | None = None,
 ) -> tuple:
     """
     Reconstruct a trained Delphi model and dataloaders from an MLflow run.
@@ -59,10 +61,10 @@ def reconstruct_from_run(
     loaders      : dict[str, DataLoader] — one entry per requested split.
     run_params   : dict — raw MLflow params.
     """
+    from data.dataset import AgeSampler, DelphiCollateFn, DelphiDataset
     from delphi.model import Delphi, DelphiConfig
-    from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
-    from utils.mlflow_utils import get_checkpoint_path, load_run_params, parse_domains_param
     from utils.ckpt_utils import strip_compiled_prefix
+    from utils.mlflow_utils import get_checkpoint_path, load_run_params, parse_domains_param
 
     if device is None:
         device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -97,8 +99,7 @@ def reconstruct_from_run(
         bs = block_size
     elif stored_block_size == "auto":
         logging.warning(
-            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d "
-            "as the fixed block size.", AUTO_BLOCK_SIZE
+            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d as the fixed block size.", AUTO_BLOCK_SIZE
         )
         bs = AUTO_BLOCK_SIZE
     else:
@@ -133,9 +134,7 @@ def reconstruct_from_run(
     logging.info("Model loaded: %d parameters", sum(p.numel() for p in model.parameters()))
 
     continuous_domains = {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in domain_cfg.items()
-        if cfg.type == "continuous"
+        dname: cfg.n_latent_tokens or 1 for dname, cfg in domain_cfg.items() if cfg.type == "continuous"
     }
 
     root_path = DELPHI_DIR / "data" / "transforms"
@@ -196,13 +195,13 @@ def reconstruct_model(run_id: str):
     Returns: model, test_ids, ckpt_path, params
     """
     from delphi.model import Delphi, DelphiConfig
-    from utils.mlflow_utils import load_run_params, load_checkpoint, parse_domains_param
     from utils.ckpt_utils import (
         infer_delphi_config_from_state_dict,
-        migrate_legacy_state_dict,
         migrate_domain_embed_to_global_embed,
+        migrate_legacy_state_dict,
         strip_compiled_prefix,
     )
+    from utils.mlflow_utils import load_checkpoint, load_run_params, parse_domains_param
 
     params = load_run_params(run_id)
     attn_scheme = params["attention_scheme"]
@@ -221,7 +220,7 @@ def reconstruct_model(run_id: str):
             continue
         dcfg.path = str(tokens_dir / Path(str(dcfg.path)).name)
 
-    block_size = int(params.get("block_size", cfg.get("block_size", 64)))
+    block_size = int(params.get("block_size") or cfg.get("block_size") or 64)  # type: ignore
     delphi_cfg = DelphiConfig(
         n_embd=cfg["n_embd"],
         n_layer=cfg["n_layer"],
@@ -249,9 +248,10 @@ def config_from_runid(runid: str):
              start_epoch, logged_params, previous_run_name
     """
     import mlflow
+
+    from data.dataset import AgeSampler, DelphiCollateFn, DelphiDataset
     from delphi.model import Delphi, DelphiConfig
     from delphi.optim import OptimConfig
-    from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
     from utils.mlflow_utils import get_checkpoint_path, parse_domains_param
 
     VAL_BATCH_SIZE = 256
@@ -259,21 +259,17 @@ def config_from_runid(runid: str):
     runinfo = mlflow.get_run(runid)
 
     batch_size = int(runinfo.data.params.pop("batch_size", 16))
-    test_fold  = runinfo.data.params.pop("test_fold", 0)
+    test_fold = runinfo.data.params.pop("test_fold", 0)
     runinfo.data.params.pop("learning_rate", None)
     runinfo.data.params.pop("ema_alpha", None)
 
     bs_schedule_str = runinfo.data.params.pop("batch_size_schedule", None)
     bs_scheduler = (
-        BatchSizeScheduler.from_string(bs_schedule_str)
-        if bs_schedule_str and bs_schedule_str != "None"
-        else None
+        BatchSizeScheduler.from_string(bs_schedule_str) if bs_schedule_str and bs_schedule_str != "None" else None
     )
 
     try:
-        runinfo.data.params["attention_scheme"] = ast.literal_eval(
-            runinfo.data.params["attention_scheme"]
-        )
+        runinfo.data.params["attention_scheme"] = ast.literal_eval(runinfo.data.params["attention_scheme"])
     except (ValueError, SyntaxError):
         runinfo.data.params["attention_scheme"] = [runinfo.data.params["attention_scheme"]]
 
@@ -315,17 +311,16 @@ def config_from_runid(runid: str):
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
 
     from utils.ckpt_utils import strip_compiled_prefix
+
     state_dict = strip_compiled_prefix(ckpt["state_dict"])
     model.load_state_dict(state_dict, strict=False)
 
     root_path = DELPHI_DIR / "data" / "transforms"
     continuous_domains = {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in delphi_cfg.domains.items()
-        if cfg.type == "continuous"
+        dname: cfg.n_latent_tokens or 1 for dname, cfg in delphi_cfg.domains.items() if cfg.type == "continuous"
     }
 
-    _ds_kwargs = dict(
+    _ds_kwargs: dict[str, Any] = dict(
         root=str(root_path),
         domains_cfg=delphi_cfg.domains,
         domain_to_int=model.domain_to_int,
@@ -338,9 +333,9 @@ def config_from_runid(runid: str):
         age_domains=["diseases", "death"],
     )
 
-    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)  # type: ignore[arg-type]
-    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)  # type: ignore[arg-type]
-    test_dataset  = DelphiDataset(subjects=ckpt["metadata"]["test_ids"],  **_ds_kwargs)  # type: ignore[arg-type]
+    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)
+    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)
+    test_dataset = DelphiDataset(subjects=ckpt["metadata"]["test_ids"], **_ds_kwargs)
 
     age_sampler = AgeSampler(
         insertion_mode=delphi_cfg.no_event_token_insertion_mode,
@@ -358,27 +353,28 @@ def config_from_runid(runid: str):
         continuous_domains=continuous_domains,
     )
 
-    train_batch_size = (
-        bs_scheduler.step(start_epoch).batch_size if bs_scheduler is not None else batch_size
-    )
+    train_batch_size = bs_scheduler.step(start_epoch).batch_size if bs_scheduler is not None else batch_size
     dataloaders = DataModule(
-        FlexibleDataLoader(train_dataset, batch_size=train_batch_size, shuffle=True,  pin_memory=True, collate_fn=collate),
-        DataLoader(valid_dataset,         batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
-        DataLoader(test_dataset,          batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
+        FlexibleDataLoader(
+            train_dataset, batch_size=train_batch_size, shuffle=True, pin_memory=True, collate_fn=collate
+        ),
+        DataLoader(valid_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
+        DataLoader(test_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, pin_memory=True, collate_fn=collate),
     )
 
     previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
-    logged_params = {
-        "test_fold": test_fold,
-        "batch_size": batch_size,
-        "batch_size_scheduler": bs_scheduler,
-    }
+    logged_params = {"test_fold": test_fold, "batch_size": batch_size, "batch_size_scheduler": bs_scheduler}
 
     optimizer_state = ckpt.get("optimizer_state", None)
     scheduler_state = ckpt.get("scheduler_state", None)
 
     return (
-        model, dataloaders, optim_config,
-        optimizer_state, scheduler_state,
-        start_epoch, logged_params, previous_run_name,
+        model,
+        dataloaders,
+        optim_config,
+        optimizer_state,
+        scheduler_state,
+        start_epoch,
+        logged_params,
+        previous_run_name,
     )

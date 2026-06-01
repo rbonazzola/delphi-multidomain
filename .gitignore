@@ -4,6 +4,7 @@
 __pycache__/
 .ipynb_checkpoints/
 *csv
+!delphi_labels_chapters_colours_icd.csv
 logs/
 dcgm/
 mlruns/
@@ -15,6 +16,11 @@ checkpoints/
 *swp
 *output*
 data
+!data/README.md                                                                                                                                                
+!data/dataset.py
+!data/generate_disease_metadata.py
+!data/transforms/
+!deprecated/data
 .mypy_cache/
 .vscode/
 .env

@@ -8,26 +8,20 @@ Usage:
     python compute_aucs.py --runid <mlflow_run_id> [--block_size 128] [--batch_size 512] [--n_jobs 8]
 """
 
-import os
-import sys
 import argparse
 import logging
-from pathlib import Path
+import os
 
-import torch
-import pandas as pd
 import mlflow
+import torch
+
+from auc.aucs import evaluate_aucs
+from utils.mlflow_utils import setup_mlflow
+from utils.run_loader import reconstruct_from_run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-
-if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
-    sys.path.insert(0, str(DELPHI_DIR))
-
-from auc.aucs import evaluate_aucs
-from utils.mlflow_utils import setup_mlflow, get_checkpoint_path, load_run_params, parse_domains_param
-from utils.run_loader import reconstruct_from_run, AUTO_BLOCK_SIZE
 
 setup_mlflow()
 
@@ -39,18 +33,23 @@ torch.backends.cudnn.allow_tf32 = True
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def main():
     parser = argparse.ArgumentParser(description="Compute AUCs for a trained Delphi model")
     parser.add_argument("--runid", required=True, help="MLflow run ID")
-    parser.add_argument("--block_size", type=int, default=128,
-                        help="Fixed block size for AUC evaluation (must be an integer; 'auto' is not supported)")
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=128,
+        help="Fixed block size for AUC evaluation (must be an integer; 'auto' is not supported)",
+    )
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--n_jobs", type=int, default=8, help="Parallel jobs for AUC computation")
     parser.add_argument("--output_file", type=str, default="aucs.csv")
     args = parser.parse_args()
 
-    model, loaders, run_params = reconstruct_from_run(
+    model, loaders, _run_params = reconstruct_from_run(
         args.runid,
         split="test",
         block_size=args.block_size,

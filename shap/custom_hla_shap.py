@@ -48,15 +48,16 @@ Donor genotype filtering:
     --donor_zygosity    {any,het,hom}  Zygosity applied to each --donor_requires group.
 """
 
-import os
-import sys
-import random
 import argparse
+import os
 import pickle as pkl
+import random
+import sys
 import warnings
 from difflib import get_close_matches
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pandas as pd
 import torch
@@ -65,7 +66,6 @@ from joblib import Parallel, delayed
 from loguru import logger
 from scipy import stats
 from tqdm import tqdm
-import mlflow
 
 warnings.filterwarnings("ignore")
 
@@ -75,14 +75,15 @@ DELPHI_DIR = Path("/nfs/research/birney/users/bonazzola/repos/delphis/delphi-ref
 if str(DELPHI_DIR) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
+from torch.utils.data import DataLoader  # noqa: E402
+
+from data.dataset import AgeSampler, DelphiCollateFn, DelphiDataset  # noqa: E402
+from utils import reconstruct_model  # noqa: E402
+from utils.utils import read_ids  # noqa: E402
+
 # Capture the invocation CWD before chdir so user-provided relative paths still resolve correctly.
 _INVOCATION_CWD = Path.cwd()
 os.chdir(DELPHI_DIR)
-
-from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
-from torch.utils.data import DataLoader
-from utils import reconstruct_model
-from utils.utils import read_ids
 
 device = "cpu"
 DAYS_PER_YEAR = 365.25
@@ -97,12 +98,10 @@ CACHE_DIR = "/hps/nobackup/birney/users/bonazzola/delphi/output/cache"
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
 
-hla_tokenizer = yaml.safe_load(
-    open(DELPHI_DIR / "data/transforms/tokens/hla_alleles/tokenizer.yaml", "rt")
-)
-disease_tokenizer = np.array(
-    yaml.safe_load(open(DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml", "rt"))
-)
+with (DELPHI_DIR / "data/transforms/tokens/hla_alleles/tokenizer.yaml").open() as _f:
+    hla_tokenizer = yaml.safe_load(_f)
+with (DELPHI_DIR / "data/transforms/tokens/diseases/tokenizer.yaml").open() as _f:
+    disease_tokenizer = np.array(yaml.safe_load(_f))
 
 
 def assign_age_bracket(age_days):
@@ -114,11 +113,7 @@ def assign_age_bracket(age_days):
 
 
 def _make_continuous_domains(model):
-    return {
-        dname: cfg.n_latent_tokens or 1
-        for dname, cfg in model.domain_cfg.items()
-        if cfg.type == "continuous"
-    }
+    return {dname: cfg.n_latent_tokens or 1 for dname, cfg in model.domain_cfg.items() if cfg.type == "continuous"}
 
 
 def _make_collate(model):
@@ -145,7 +140,7 @@ def get_dataloader(model, all_test_ids, subject_ids=None, block_size=None):
 
     if subject_ids is not None:
         if isinstance(subject_ids, str):
-            assert os.path.exists(subject_ids), f"File {subject_ids} does not exist."
+            assert Path(subject_ids).exists(), f"File {subject_ids} does not exist."
             subject_ids = read_ids(subject_ids)
         subject_ids = [sid for sid in all_test_ids if sid in set(subject_ids)]
     else:
@@ -175,12 +170,14 @@ def get_tokens_df_from_dataset(model, dataset):
     seq_idx = torch.arange(T).unsqueeze(0).expand(N, T)
     real_mask = seq_idx < dataset._real_counts.unsqueeze(1)
 
-    df = pd.DataFrame({
-        "subject_id": subj_expanded[real_mask].numpy(),
-        "domain_id":  dataset._domain_ids[real_mask].numpy(),
-        "token_id":   dataset._local_token_ids[real_mask].numpy(),
-        "age":        dataset._ages[real_mask].numpy(),
-    })
+    df = pd.DataFrame(
+        {
+            "subject_id": subj_expanded[real_mask].numpy(),
+            "domain_id": dataset._domain_ids[real_mask].numpy(),
+            "token_id": dataset._local_token_ids[real_mask].numpy(),
+            "age": dataset._ages[real_mask].numpy(),
+        }
+    )
     df["domain"] = df["domain_id"].map(model.int_to_domain)
     return df
 
@@ -228,10 +225,7 @@ def disease_prev_logits_from_embeddings(model, h, batch, disease_domain, disease
     W = model.embed._get_domain_weight(disease_domain)[disease_token_id]  # [n_embd]
     logits = (h @ W).float()  # [B, T]
 
-    next_is_disease = (
-        (batch.global_token_ids[:, 1:] == global_disease_id) &
-        (batch.domain_ids[:, 1:] == dom_id)
-    )
+    next_is_disease = (batch.global_token_ids[:, 1:] == global_disease_id) & (batch.domain_ids[:, 1:] == dom_id)
     b_idx, t_prev = torch.where(next_is_disease)
     return logits[b_idx, t_prev], torch.stack([b_idx, t_prev], dim=1)
 
@@ -270,14 +264,12 @@ def inject_hla_item(item_rec, item_don, hla_domain_int, padding_domain_id, paddi
     n_real = min(len(all_dom), block_size)
 
     new_item = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in item_rec.items()}
-    new_item["domain_ids"] = torch.full(
-        (block_size,), padding_domain_id, dtype=item_rec["domain_ids"].dtype
-    )
+    new_item["domain_ids"] = torch.full((block_size,), padding_domain_id, dtype=item_rec["domain_ids"].dtype)
     new_item["local_token_ids"] = torch.zeros(block_size, dtype=item_rec["local_token_ids"].dtype)
     new_item["ages"] = torch.full((block_size,), padding_age, dtype=item_rec["ages"].dtype)
-    new_item["domain_ids"][:n_real]      = all_dom[:n_real]
+    new_item["domain_ids"][:n_real] = all_dom[:n_real]
     new_item["local_token_ids"][:n_real] = all_tok[:n_real]
-    new_item["ages"][:n_real]            = all_age[:n_real]
+    new_item["ages"][:n_real] = all_age[:n_real]
     new_item["real_count"] = torch.tensor(n_real, dtype=item_rec["real_count"].dtype)
 
     return new_item
@@ -320,7 +312,7 @@ class GenotypeFilter:
     """
 
     def __init__(self, hla_counts: pd.DataFrame):
-        self._c = hla_counts   # subject_id, token_id, n_copies
+        self._c = hla_counts  # subject_id, token_id, n_copies
         self._all = set(hla_counts["subject_id"].unique())
 
     def carriers(self, allele_ids) -> set:
@@ -364,9 +356,16 @@ class GenotypeFilter:
 
 
 def compute_delta_for_run(
-    model, test_ids, tokens_df, disease_id, allele_ids,
-    sex_map, sex_filter=None, n_counterfactuals=1,
-    disease_name="disease", allele_name="allele",
+    model,
+    test_ids,
+    tokens_df,
+    disease_id,
+    allele_ids,
+    sex_map,
+    sex_filter=None,
+    n_counterfactuals=1,
+    disease_name="disease",
+    allele_name="allele",
     case_zygosity="any",
     case_also_allele_id_groups=None,
     donor_exclude_ids=None,
@@ -457,19 +456,17 @@ def compute_delta_for_run(
         with torch.no_grad():
             _, _, h = model(batch, return_embeddings=True)
 
-        logits_orig, idx_prev = disease_prev_logits_from_embeddings(
-            model, h, batch, "diseases", disease_id
-        )
+        logits_orig, idx_prev = disease_prev_logits_from_embeddings(model, h, batch, "diseases", disease_id)
         n_orig = len(logits_orig)
         if n_orig == 0:
             continue
 
         b_idx, t_prev = idx_prev[:, 0], idx_prev[:, 1]
-        ages_at_event  = batch.ages[b_idx, t_prev].cpu()
-        sids_at_event  = batch.subject_ids[b_idx].cpu()
+        ages_at_event = batch.ages[b_idx, t_prev].cpu()
+        sids_at_event = batch.subject_ids[b_idx].cpu()
         sexes_at_event = torch.tensor([sex_map.get(int(s), -1) for s in sids_at_event])
 
-        rec_sids  = batch.subject_ids.tolist()
+        rec_sids = batch.subject_ids.tolist()
         rec_items = [filtered_dataset[filtered_dataset._sid_to_idx[sid]] for sid in rec_sids]
 
         logits_sw_samples = []
@@ -482,16 +479,14 @@ def compute_delta_for_run(
 
             modified_items = [
                 inject_hla_item(r, d, hla_domain_int, padding_domain_id)
-                for r, d in zip(rec_items, don_items)
+                for r, d in zip(rec_items, don_items, strict=False)
             ]
             batch_sw = collate(modified_items).to(device)
 
             with torch.no_grad():
                 _, _, h_sw = model(batch_sw, return_embeddings=True)
 
-            logits_sw, _ = disease_prev_logits_from_embeddings(
-                model, h_sw, batch_sw, "diseases", disease_id
-            )
+            logits_sw, _ = disease_prev_logits_from_embeddings(model, h_sw, batch_sw, "diseases", disease_id)
             if len(logits_sw) == 0:
                 continue
             n = min(n_orig, len(logits_sw))
@@ -513,8 +508,16 @@ def compute_delta_for_run(
 
 
 def process_fold(
-    fold, runs_df, disease_id, allele_ids, sex_filter, n_counterfactuals,
-    cache_dir, subjects_include=None, disease_name="disease", allele_name="allele",
+    fold,
+    runs_df,
+    disease_id,
+    allele_ids,
+    sex_filter,
+    n_counterfactuals,
+    cache_dir,
+    subjects_include=None,
+    disease_name="disease",
+    allele_name="allele",
     case_zygosity="any",
     case_also_allele_id_groups=None,
     donor_exclude_ids=None,
@@ -535,10 +538,16 @@ def process_fold(
     sex_map = extract_sex_map(tokens_df)
 
     delta_fold, ages_fold, sexes_fold = compute_delta_for_run(
-        model, test_ids, tokens_df, disease_id, allele_ids,
-        sex_map=sex_map, sex_filter=sex_filter,
+        model,
+        test_ids,
+        tokens_df,
+        disease_id,
+        allele_ids,
+        sex_map=sex_map,
+        sex_filter=sex_filter,
         n_counterfactuals=n_counterfactuals,
-        disease_name=disease_name, allele_name=allele_name,
+        disease_name=disease_name,
+        allele_name=allele_name,
         case_zygosity=case_zygosity,
         case_also_allele_id_groups=case_also_allele_id_groups,
         donor_exclude_ids=donor_exclude_ids,
@@ -556,7 +565,7 @@ def get_allele_pairs_for_scan(
     within_loci=None,
     cross_loci=None,
     include_hom: bool = True,
-    min_hom_freq: float = None,
+    min_hom_freq: float | None = None,
 ) -> list:
     """
     Return list of (a_id, b_id, locus_a, locus_b, a_name, b_name, n_cocarriers, cocarrier_freq)
@@ -570,7 +579,7 @@ def get_allele_pairs_for_scan(
     min_hom_freq  : minimum homozygous carrier frequency; defaults to min_pair_freq.
     """
     tokens_path = DELPHI_DIR / "data/transforms/tokens/hla_alleles/tokens.csv"
-    meta_path   = DELPHI_DIR / "data/transforms/tokens/hla_alleles/token_metadata.csv"
+    meta_path = DELPHI_DIR / "data/transforms/tokens/hla_alleles/token_metadata.csv"
 
     tok = pd.read_csv(tokens_path)
     meta = pd.read_csv(meta_path)
@@ -582,8 +591,8 @@ def get_allele_pairs_for_scan(
     # subject sets per allele
     allele_to_subj = tok.groupby("token_id")["subject_id"].apply(set).to_dict()
 
-    id_to_name   = meta.set_index("token_id")["name"].to_dict()
-    id_to_locus  = meta.set_index("token_id")["locus"].to_dict()
+    id_to_name = meta.set_index("token_id")["name"].to_dict()
+    id_to_locus = meta.set_index("token_id")["locus"].to_dict()
     locus_to_ids = meta.groupby("locus")["token_id"].apply(list).to_dict()
 
     all_loci = list(locus_to_ids.keys())
@@ -596,7 +605,7 @@ def get_allele_pairs_for_scan(
     seen = set()
 
     # --- het / compound-het pairs ---
-    locus_pairs_to_check = [(l, l) for l in within_loci] + list(cross_loci)
+    locus_pairs_to_check = [(loc, loc) for loc in within_loci] + list(cross_loci)
     for locus_a, locus_b in locus_pairs_to_check:
         ids_a = locus_to_ids.get(locus_a, [])
         ids_b = locus_to_ids.get(locus_b, [])
@@ -613,31 +622,41 @@ def get_allele_pairs_for_scan(
                 n = len(s_a & s_b)
                 freq = n / n_subjects
                 if freq >= min_pair_freq:
-                    result.append((
-                        a_id, b_id, locus_a, locus_b,
-                        id_to_name.get(a_id, str(a_id)),
-                        id_to_name.get(b_id, str(b_id)),
-                        n, freq,
-                    ))
+                    result.append(
+                        (
+                            a_id,
+                            b_id,
+                            locus_a,
+                            locus_b,
+                            id_to_name.get(a_id, str(a_id)),
+                            id_to_name.get(b_id, str(b_id)),
+                            n,
+                            freq,
+                        )
+                    )
 
     # --- homozygous pairs (a_id == b_id) ---
     if include_hom:
         min_h = min_hom_freq if min_hom_freq is not None else min_pair_freq
-        copies = (
-            tok.groupby(["token_id", "subject_id"])
-            .size()
-            .reset_index(name="n_copies")
-        )
+        copies = tok.groupby(["token_id", "subject_id"]).size().reset_index(name="n_copies")
         hom = copies[copies["n_copies"] >= 2].groupby("token_id")["subject_id"].apply(set)
         for token_id, hom_subj in hom.items():
             freq = len(hom_subj) / n_subjects
             if freq >= min_h:
                 locus = id_to_locus.get(token_id, "?")
-                name  = id_to_name.get(token_id, str(token_id))
-                result.append((
-                    token_id, token_id, locus, locus,
-                    name, name, len(hom_subj), freq,
-                ))
+                name = id_to_name.get(token_id, str(token_id))
+                result.append(
+                    (
+                        token_id,
+                        token_id,
+                        locus,
+                        locus,
+                        name,
+                        name,
+                        len(hom_subj),
+                        freq,
+                    )
+                )
 
     result.sort(key=lambda r: -r[7])  # descending co-carrier / hom freq
     return result
@@ -661,8 +680,13 @@ def get_qualifying_allele_ids(min_carrier_freq: float, subject_ids=None) -> list
 
 
 def process_fold_scan(
-    fold, runs_df, disease_id, allele_ids_to_scan,
-    sex_filter, n_counterfactuals, cache_dir,
+    fold,
+    runs_df,
+    disease_id,
+    allele_ids_to_scan,
+    sex_filter,
+    n_counterfactuals,
+    cache_dir,
     subjects_include=None,
     case_zygosity="hom",
     donor_zygosity="any",
@@ -688,10 +712,16 @@ def process_fold_scan(
     for allele_id in tqdm(allele_ids_to_scan, desc=f"fold {fold} — alleles"):
         allele_name = hla_tokenizer[allele_id]
         delta, ages, sexes = compute_delta_for_run(
-            model, test_ids, tokens_df, disease_id, [allele_id],
-            sex_map=sex_map, sex_filter=sex_filter,
+            model,
+            test_ids,
+            tokens_df,
+            disease_id,
+            [allele_id],
+            sex_map=sex_map,
+            sex_filter=sex_filter,
             n_counterfactuals=n_counterfactuals,
-            disease_name="(scan)", allele_name=allele_name,
+            disease_name="(scan)",
+            allele_name=allele_name,
             case_zygosity=case_zygosity,
             donor_zygosity=donor_zygosity,
         )
@@ -702,8 +732,13 @@ def process_fold_scan(
 
 
 def process_fold_scan_pairs(
-    fold, runs_df, disease_id, pairs_to_scan,
-    sex_filter, n_counterfactuals, cache_dir,
+    fold,
+    runs_df,
+    disease_id,
+    pairs_to_scan,
+    sex_filter,
+    n_counterfactuals,
+    cache_dir,
     subjects_include=None,
     case_zygosity="any",
     donor_zygosity="any",
@@ -732,13 +767,15 @@ def process_fold_scan_pairs(
     sex_map = extract_sex_map(tokens_df)
 
     results = {}
-    for a_id, b_id, locus_a, locus_b, a_name, b_name, _, _ in tqdm(
-        pairs_to_scan, desc=f"fold {fold} — pairs"
-    ):
+    for a_id, b_id, _locus_a, _locus_b, a_name, b_name, _, _ in tqdm(pairs_to_scan, desc=f"fold {fold} — pairs"):
         delta, ages, sexes = compute_delta_for_run(
-            model, test_ids, tokens_df, disease_id,
+            model,
+            test_ids,
+            tokens_df,
+            disease_id,
             allele_ids=[a_id],
-            sex_map=sex_map, sex_filter=sex_filter,
+            sex_map=sex_map,
+            sex_filter=sex_filter,
             n_counterfactuals=n_counterfactuals,
             disease_name="(scan_pairs)",
             allele_name=f"{a_name}+{b_name}",
@@ -780,27 +817,32 @@ def _resolve_experiment_id(prefix: str) -> str:
     if not matches:
         raise SystemExit(f"No experiment found with ID prefix '{prefix}'.")
     if len(matches) > 1:
-        candidates = "\n  ".join(
-            f"{e.experiment_id}  ({e.name})" for e in matches
-        )
-        raise SystemExit(
-            f"Ambiguous prefix '{prefix}' matches {len(matches)} experiments:\n  {candidates}"
-        )
+        candidates = "\n  ".join(f"{e.experiment_id}  ({e.name})" for e in matches)
+        raise SystemExit(f"Ambiguous prefix '{prefix}' matches {len(matches)} experiments:\n  {candidates}")
     return matches[0].experiment_id
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--experiment_id", type=str, required=True,
+        "--experiment_id",
+        type=str,
+        required=True,
         help="MLflow experiment ID or unique prefix thereof.",
     )
     parser.add_argument(
-        "--run_name", type=str, default=None, metavar="REGEX",
+        "--run_name",
+        type=str,
+        default=None,
+        metavar="REGEX",
         help="Regex applied to run name; only matching runs are kept.",
     )
     parser.add_argument(
-        "--param", type=str, action="append", default=[], metavar="NAME=VALUE",
+        "--param",
+        type=str,
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
         help="Filter by parameter value: NAME=VALUE. Can be repeated.",
     )
     parser.add_argument("--disease", type=str)
@@ -808,88 +850,128 @@ def main():
     parser.add_argument("--hla_allele", type=str)
     parser.add_argument("--allele_id", type=int)
     parser.add_argument(
-        "--allele_id_b", type=int, default=None,
+        "--allele_id_b",
+        type=int,
+        default=None,
         help="Second allele ID forming a pair with --allele_id. "
-             "If equal to --allele_id, runs in homozygous mode (case_zygosity=hom). "
-             "Donors automatically exclude both alleles.",
+        "If equal to --allele_id, runs in homozygous mode (case_zygosity=hom). "
+        "Donors automatically exclude both alleles.",
     )
     parser.add_argument(
-        "--generate_pairs", action="store_true",
+        "--generate_pairs",
+        action="store_true",
         help="Generate the list of qualifying allele pairs and write a TSV ready for "
-             "sarray_params, then exit without running any model.",
+        "sarray_params, then exit without running any model.",
     )
     # --- scan mode ---
     parser.add_argument(
-        "--scan", action="store_true",
-        help="Scan all qualifying alleles instead of a single one. "
-             "Ignores --hla_allele/--allele_id.",
+        "--scan",
+        action="store_true",
+        help="Scan all qualifying alleles instead of a single one. Ignores --hla_allele/--allele_id.",
     )
     parser.add_argument(
-        "--min_carrier_freq", type=float, default=0.01,
+        "--min_carrier_freq",
+        type=float,
+        default=0.01,
         help="Minimum carrier frequency for qualifying alleles in --scan mode (default: 0.01).",
     )
     parser.add_argument(
-        "--scan_pairs", action="store_true",
-        help="Scan all qualifying allele pairs (within-locus + DPA/DPB, DQA/DQB). "
-             "Ignores --hla_allele/--allele_id.",
+        "--scan_pairs",
+        action="store_true",
+        help="Scan all qualifying allele pairs (within-locus + DPA/DPB, DQA/DQB). Ignores --hla_allele/--allele_id.",
     )
     parser.add_argument(
-        "--min_pair_freq", type=float, default=0.005,
+        "--min_pair_freq",
+        type=float,
+        default=0.005,
         help="Minimum co-carrier frequency for pairs in --scan_pairs mode (default: 0.005).",
     )
     parser.add_argument(
-        "--cross_loci", type=str, action="append", default=None,
+        "--cross_loci",
+        type=str,
+        action="append",
+        default=None,
         metavar="LOCUS_A:LOCUS_B",
         help="Cross-locus pairs to include in --scan_pairs / --generate_pairs, "
-             "e.g. hla_dpa:hla_dpb. Repeatable. "
-             "Default: hla_dpa:hla_dpb and hla_dqa:hla_dqb.",
+        "e.g. hla_dpa:hla_dpb. Repeatable. "
+        "Default: hla_dpa:hla_dpb and hla_dqa:hla_dqb.",
     )
     parser.add_argument(
-        "--no_hom", action="store_true",
+        "--no_hom",
+        action="store_true",
         help="Exclude homozygous pairs from --generate_pairs / --scan_pairs.",
     )
     parser.add_argument(
-        "--pairs_output", type=str, default=None,
+        "--pairs_output",
+        type=str,
+        default=None,
         help="Output path for the sarray_params TSV generated by --generate_pairs. "
-             "Defaults to pairs_{disease_id}.tsv in the current directory.",
+        "Defaults to pairs_{disease_id}.tsv in the current directory.",
     )
     parser.add_argument("--n_counterfactuals", type=int, default=5)
     parser.add_argument(
-        "--sex", type=str, default=None, choices=["male", "female", "both"],
+        "--sex",
+        type=str,
+        default=None,
+        choices=["male", "female", "both"],
         help="Restrict cases and donors to this sex. 'both' or omitted = no filtering.",
     )
     parser.add_argument(
-        "--subjects", type=str, default=None,
+        "--subjects",
+        type=str,
+        default=None,
         help="Path to file with subject IDs to intersect with test set.",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
+        "--output",
+        type=str,
+        default=None,
         help="Output .pkl path. Supports {disease_id}, {allele_id}, {sex} placeholders.",
     )
     parser.add_argument(
-        "--dry-run", "--dryrun", "--dry_run", dest="dry_run", action="store_true",
+        "--dry-run",
+        "--dryrun",
+        "--dry_run",
+        dest="dry_run",
+        action="store_true",
         help="Print the disease, alleles and runs that would be processed, then exit.",
     )
     # --- case genotype ---
     parser.add_argument(
-        "--case_zygosity", choices=["any", "het", "hom"], default="any",
+        "--case_zygosity",
+        choices=["any", "het", "hom"],
+        default="any",
         help="Zygosity of the primary allele in cases. 'het'=exactly 1 copy, 'hom'=≥2 copies.",
     )
     parser.add_argument(
-        "--case_also", type=str, action="append", default=[], metavar="ALLELE_PREFIX",
+        "--case_also",
+        type=str,
+        action="append",
+        default=[],
+        metavar="ALLELE_PREFIX",
         help="Cases must also carry ≥1 allele matching this prefix (AND logic, repeatable).",
     )
     # --- donor genotype ---
     parser.add_argument(
-        "--donor_excludes", type=str, action="append", default=None, metavar="ALLELE_PREFIX",
+        "--donor_excludes",
+        type=str,
+        action="append",
+        default=None,
+        metavar="ALLELE_PREFIX",
         help="Alleles donors must NOT carry. Overrides the default (case alleles). Repeatable.",
     )
     parser.add_argument(
-        "--donor_requires", type=str, action="append", default=[], metavar="ALLELE_PREFIX",
+        "--donor_requires",
+        type=str,
+        action="append",
+        default=[],
+        metavar="ALLELE_PREFIX",
         help="Alleles donors MUST carry (AND logic, repeatable).",
     )
     parser.add_argument(
-        "--donor_zygosity", choices=["any", "het", "hom"], default="any",
+        "--donor_zygosity",
+        choices=["any", "het", "hom"],
+        default="any",
         help="Zygosity applied to each --donor_requires group.",
     )
     args = parser.parse_args()
@@ -898,9 +980,7 @@ def main():
 
     runs_df = mlflow.search_runs(experiment_ids=[experiment_id])
     runs_df = runs_df.loc[:, runs_df.nunique() > 1]
-    runs_df = runs_df.rename(columns=lambda c: (
-        c.replace("metrics.", "").replace("params.", "").replace("tags.", "")
-    ))
+    runs_df = runs_df.rename(columns=lambda c: c.replace("metrics.", "").replace("params.", "").replace("tags.", ""))
     runs_df = runs_df.loc[:, ~runs_df.columns.duplicated()]
 
     if args.run_name is not None:
@@ -940,7 +1020,7 @@ def main():
     # --- subjects ---
     subjects_include = None
     if args.subjects is not None:
-        assert os.path.exists(args.subjects), f"File {args.subjects} does not exist."
+        assert Path(args.subjects).exists(), f"File {args.subjects} does not exist."
         subjects_include = set(read_ids(args.subjects))
         logger.info(f"Loaded {len(subjects_include)} subject IDs from {args.subjects}")
 
@@ -961,8 +1041,10 @@ def main():
             cross_loci=cross_loci,
             include_hom=not args.no_hom,
         )
-        print(f"{len(pairs)} pairs with freq ≥ {args.min_pair_freq:.1%} "
-              f"({'including' if not args.no_hom else 'excluding'} hom)")
+        print(
+            f"{len(pairs)} pairs with freq ≥ {args.min_pair_freq:.1%} "
+            f"({'including' if not args.no_hom else 'excluding'} hom)"
+        )
 
         # --- sarray_params TSV: only allele_id and allele_id_b ---
         # Column names become --allele_id and --allele_id_b when submitted.
@@ -970,10 +1052,7 @@ def main():
             args.pairs_output,
             DELPHI_DIR / "shap" / f"pairs_{disease_id}.tsv",
         )
-        rows_args = [
-            {"allele_id": a_id, "allele_id_b": b_id}
-            for a_id, b_id, *_ in pairs
-        ]
+        rows_args = [{"allele_id": a_id, "allele_id_b": b_id} for a_id, b_id, *_ in pairs]
         pd.DataFrame(rows_args).to_csv(pairs_tsv_path, sep="\t", index=False)
         print(f"sarray_params TSV  → {pairs_tsv_path}")
 
@@ -981,24 +1060,27 @@ def main():
         meta_tsv_path = pairs_tsv_path.with_suffix(".meta.tsv")
         rows_meta = [
             {
-                "allele_id":  a_id, "allele_id_b": b_id,
-                "allele_name_a": a_name, "allele_name_b": b_name,
-                "locus_a": la, "locus_b": lb,
-                "n_cocarriers": n, "cocarrier_freq": f"{freq:.4f}",
-                "pair_type": "hom" if a_id == b_id else
-                             ("within" if la == lb else "cross"),
+                "allele_id": a_id,
+                "allele_id_b": b_id,
+                "allele_name_a": a_name,
+                "allele_name_b": b_name,
+                "locus_a": la,
+                "locus_b": lb,
+                "n_cocarriers": n,
+                "cocarrier_freq": f"{freq:.4f}",
+                "pair_type": "hom" if a_id == b_id else ("within" if la == lb else "cross"),
             }
             for a_id, b_id, la, lb, a_name, b_name, n, freq in pairs
         ]
         pd.DataFrame(rows_meta).to_csv(meta_tsv_path, sep="\t", index=False)
         print(f"Metadata TSV       → {meta_tsv_path}")
 
-        print(f"\nExample submission:")
+        print("\nExample submission:")
         print(f"  sarray_params shap/custom_hla_shap_v2.py {pairs_tsv_path} \\")
         print(f"    --experiment_id {args.experiment_id} \\")
         print(f"    --disease_id {disease_id} \\")
         print(f"    --n_counterfactuals {args.n_counterfactuals} \\")
-        print(f"    --time=06:00:00 --mem=32G --cpus=4")
+        print("    --time=06:00:00 --mem=32G --cpus=4")
         return
 
     # ------------------------------------------------------------------ #
@@ -1020,32 +1102,40 @@ def main():
             print("\n--- DRY RUN (scan_pairs) ---")
             print(f"Disease : {disease_name} (id={disease_id})")
             print(f"Pairs   : {len(pairs_to_scan)} (showing top 10)")
-            for a_id, b_id, la, lb, a_name, b_name, n, freq in pairs_to_scan[:10]:
+            for _a_id, _b_id, la, lb, a_name, b_name, n, freq in pairs_to_scan[:10]:
                 print(f"  {a_name} + {b_name}  ({la}/{lb})  n_cocarriers={n}  freq={freq:.3f}")
             print(f"Runs ({n_folds}):")
             for _, row in runs_df.iterrows():
                 print(f"  fold={row['test_fold']}  run_id={row['run_id']}")
             raise SystemExit(0)
 
-        fold_pair_results = list(tqdm(
-            Parallel(n_jobs=-1, backend="loky", return_as="generator")(
-                delayed(process_fold_scan_pairs)(
-                    fold, runs_df, disease_id, pairs_to_scan,
-                    args.sex, args.n_counterfactuals, CACHE_DIR, subjects_include,
-                    case_zygosity=args.case_zygosity,
-                    donor_zygosity=args.donor_zygosity,
-                )
-                for fold in sorted(runs_df.test_fold.unique())
-            ),
-            total=n_folds,
-            desc="Folds",
-        ))
+        fold_pair_results = list(
+            tqdm(
+                Parallel(n_jobs=-1, backend="loky", return_as="generator")(
+                    delayed(process_fold_scan_pairs)(
+                        fold,
+                        runs_df,
+                        disease_id,
+                        pairs_to_scan,
+                        args.sex,
+                        args.n_counterfactuals,
+                        CACHE_DIR,
+                        subjects_include,
+                        case_zygosity=args.case_zygosity,
+                        donor_zygosity=args.donor_zygosity,
+                    )
+                    for fold in sorted(runs_df.test_fold.unique())
+                ),
+                total=n_folds,
+                desc="Folds",
+            )
+        )
 
         output_dir = _resolve_output_path(args.output, DELPHI_DIR / "shap/output_delta_logit/scan_pairs")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         MIN_N_WILCOXON = 10
-        pair_meta = {(r[0], r[1]): r for r in pairs_to_scan}
+        {(r[0], r[1]): r for r in pairs_to_scan}
         summary_rows = []
 
         for a_id, b_id, locus_a, locus_b, a_name, b_name, n_cocarriers, cocarrier_freq in pairs_to_scan:
@@ -1053,33 +1143,35 @@ def main():
             parts = [res[key] for res in fold_pair_results if key in res]
             if not parts:
                 continue
-            delta  = torch.cat([p[0] for p in parts]).numpy()
-            ages   = torch.cat([p[1] for p in parts]).numpy()
-            sexes  = torch.cat([p[2] for p in parts]).numpy()
+            delta = torch.cat([p[0] for p in parts]).numpy()
+            ages = torch.cat([p[1] for p in parts]).numpy()
+            sexes = torch.cat([p[2] for p in parts]).numpy()
             age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
             out_path = output_dir / f"{disease_id}__{a_id}-{b_id}__{sex_label}.pkl"
-            pkl.dump(
-                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
-                open(out_path, "wb"),
-            )
+            with out_path.open("wb") as _fh:
+                pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets}, _fh)
 
             n = len(delta)
             mean_d = float(delta.mean())
             p = float(stats.wilcoxon(delta).pvalue) if n >= MIN_N_WILCOXON else float("nan")
-            summary_rows.append({
-                "allele_id_a": a_id, "allele_name_a": a_name,
-                "allele_id_b": b_id, "allele_name_b": b_name,
-                "locus_a": locus_a, "locus_b": locus_b,
-                "n_cocarriers": n_cocarriers, "cocarrier_freq": cocarrier_freq,
-                "n_cases": n, "mean_delta": mean_d, "p_wilcoxon": p,
-            })
+            summary_rows.append(
+                {
+                    "allele_id_a": a_id,
+                    "allele_name_a": a_name,
+                    "allele_id_b": b_id,
+                    "allele_name_b": b_name,
+                    "locus_a": locus_a,
+                    "locus_b": locus_b,
+                    "n_cocarriers": n_cocarriers,
+                    "cocarrier_freq": cocarrier_freq,
+                    "n_cases": n,
+                    "mean_delta": mean_d,
+                    "p_wilcoxon": p,
+                }
+            )
 
-        summary_df = (
-            pd.DataFrame(summary_rows)
-            .sort_values("mean_delta", ascending=False)
-            .reset_index(drop=True)
-        )
+        summary_df = pd.DataFrame(summary_rows).sort_values("mean_delta", ascending=False).reset_index(drop=True)
         summary_path = output_dir / f"{disease_id}__scan_pairs__{sex_label}.tsv"
         summary_df.to_csv(summary_path, sep="\t", index=False)
         print(summary_df.to_string(index=False))
@@ -1104,19 +1196,27 @@ def main():
                 print(f"  fold={row['test_fold']}  run_id={row['run_id']}")
             raise SystemExit(0)
 
-        fold_scan_results = list(tqdm(
-            Parallel(n_jobs=-1, backend="loky", return_as="generator")(
-                delayed(process_fold_scan)(
-                    fold, runs_df, disease_id, qualifying_ids, args.sex,
-                    args.n_counterfactuals, CACHE_DIR, subjects_include,
-                    case_zygosity=args.case_zygosity,
-                    donor_zygosity=args.donor_zygosity,
-                )
-                for fold in sorted(runs_df.test_fold.unique())
-            ),
-            total=n_folds,
-            desc="Folds",
-        ))
+        fold_scan_results = list(
+            tqdm(
+                Parallel(n_jobs=-1, backend="loky", return_as="generator")(
+                    delayed(process_fold_scan)(
+                        fold,
+                        runs_df,
+                        disease_id,
+                        qualifying_ids,
+                        args.sex,
+                        args.n_counterfactuals,
+                        CACHE_DIR,
+                        subjects_include,
+                        case_zygosity=args.case_zygosity,
+                        donor_zygosity=args.donor_zygosity,
+                    )
+                    for fold in sorted(runs_df.test_fold.unique())
+                ),
+                total=n_folds,
+                desc="Folds",
+            )
+        )
 
         output_dir = _resolve_output_path(args.output, DELPHI_DIR / "shap/output_delta_logit/scan")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1129,15 +1229,13 @@ def main():
             if not parts:
                 continue
             delta = torch.cat([p[0] for p in parts]).numpy()
-            ages  = torch.cat([p[1] for p in parts]).numpy()
+            ages = torch.cat([p[1] for p in parts]).numpy()
             sexes = torch.cat([p[2] for p in parts]).numpy()
             age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
             out_path = output_dir / f"{disease_id}__{allele_id}__{sex_label}.pkl"
-            pkl.dump(
-                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
-                open(out_path, "wb"),
-            )
+            with out_path.open("wb") as _fh:
+                pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets}, _fh)
 
             n = len(delta)
             mean_d = float(delta.mean())
@@ -1145,16 +1243,17 @@ def main():
                 _, p = stats.wilcoxon(delta)
             else:
                 p = float("nan")
-            summary_rows.append({
-                "allele_id": allele_id, "allele_name": allele_name,
-                "n_hom_cases": n, "mean_delta": mean_d, "p_wilcoxon": p,
-            })
+            summary_rows.append(
+                {
+                    "allele_id": allele_id,
+                    "allele_name": allele_name,
+                    "n_hom_cases": n,
+                    "mean_delta": mean_d,
+                    "p_wilcoxon": p,
+                }
+            )
 
-        summary_df = (
-            pd.DataFrame(summary_rows)
-            .sort_values("mean_delta", ascending=False)
-            .reset_index(drop=True)
-        )
+        summary_df = pd.DataFrame(summary_rows).sort_values("mean_delta", ascending=False).reset_index(drop=True)
         summary_path = output_dir / f"{disease_id}__scan_hom__{sex_label}.tsv"
         summary_df.to_csv(summary_path, sep="\t", index=False)
         print(summary_df.to_string(index=False))
@@ -1178,8 +1277,7 @@ def main():
     # --- genotype filter resolution ---
     case_also_allele_id_groups = [_resolve_allele_spec(s) for s in args.case_also]
     donor_exclude_ids = (
-        None if args.donor_excludes is None
-        else [iid for s in args.donor_excludes for iid in _resolve_allele_spec(s)]
+        None if args.donor_excludes is None else [iid for s in args.donor_excludes for iid in _resolve_allele_spec(s)]
     )
     donor_require_id_groups = [_resolve_allele_spec(s) for s in args.donor_requires]
 
@@ -1195,13 +1293,10 @@ def main():
             # donors: non-carriers (donor_exclude_ids stays as allele_ids if not overridden)
         else:
             # compound het / cross-locus pair
-            case_also_allele_id_groups = case_also_allele_id_groups + [[b_id]]
+            case_also_allele_id_groups = [*case_also_allele_id_groups, [b_id]]
             allele_name = f"{allele_name}+{b_name}"
             # donors must carry neither allele
-            if donor_exclude_ids is None:
-                donor_exclude_ids = allele_ids + [b_id]
-            else:
-                donor_exclude_ids = donor_exclude_ids + [b_id]
+            donor_exclude_ids = [*allele_ids, b_id] if donor_exclude_ids is None else [*donor_exclude_ids, b_id]
 
     if args.dry_run:
         print("\n--- DRY RUN ---")
@@ -1219,62 +1314,68 @@ def main():
             print(f"  fold={row['test_fold']}  run_id={row['run_id']}  name={row['mlflow.runName']}")
         raise SystemExit(0)
 
-    print(f"Computing Δlogit for {disease_name} and {allele_name}"
-          + (f" (sex={args.sex})" if args.sex else ""))
+    print(f"Computing Δlogit for {disease_name} and {allele_name}" + (f" (sex={args.sex})" if args.sex else ""))
 
     # --- output ---
-    _allele_stem = (
-        f"{allele_ids[0]}-{args.allele_id_b}"
-        if args.allele_id_b is not None
-        else str(allele_ids[0])
-    )
+    _allele_stem = f"{allele_ids[0]}-{args.allele_id_b}" if args.allele_id_b is not None else str(allele_ids[0])
     output_file = Path(
-        str(_resolve_output_path(
-            args.output,
-            DELPHI_DIR / "shap" / "output_delta_logit" /
-            f"{disease_id}__{_allele_stem}__{sex_label}.pkl",
-        )).format(disease_id=disease_id, allele_id=_allele_stem, sex=sex_label)
+        str(
+            _resolve_output_path(
+                args.output,
+                DELPHI_DIR / "shap" / "output_delta_logit" / f"{disease_id}__{_allele_stem}__{sex_label}.pkl",
+            )
+        ).format(disease_id=disease_id, allele_id=_allele_stem, sex=sex_label)
     )
 
-    fold_results = list(tqdm(
-        Parallel(n_jobs=-1, backend="loky", return_as="generator")(
-            delayed(process_fold)(
-                fold, runs_df, disease_id, allele_ids, args.sex,
-                args.n_counterfactuals, CACHE_DIR, subjects_include,
-                disease_name, allele_name,
-                case_zygosity=args.case_zygosity,
-                case_also_allele_id_groups=case_also_allele_id_groups,
-                donor_exclude_ids=donor_exclude_ids,
-                donor_require_id_groups=donor_require_id_groups,
-                donor_zygosity=args.donor_zygosity,
-            )
-            for fold in sorted(runs_df.test_fold.unique())
-        ),
-        total=n_folds,
-        desc="Folds",
-    ))
+    fold_results = list(
+        tqdm(
+            Parallel(n_jobs=-1, backend="loky", return_as="generator")(
+                delayed(process_fold)(
+                    fold,
+                    runs_df,
+                    disease_id,
+                    allele_ids,
+                    args.sex,
+                    args.n_counterfactuals,
+                    CACHE_DIR,
+                    subjects_include,
+                    disease_name,
+                    allele_name,
+                    case_zygosity=args.case_zygosity,
+                    case_also_allele_id_groups=case_also_allele_id_groups,
+                    donor_exclude_ids=donor_exclude_ids,
+                    donor_require_id_groups=donor_require_id_groups,
+                    donor_zygosity=args.donor_zygosity,
+                )
+                for fold in sorted(runs_df.test_fold.unique())
+            ),
+            total=n_folds,
+            desc="Folds",
+        )
+    )
 
-    all_delta, all_ages, all_sexes = zip(*fold_results)
+    all_delta, all_ages, all_sexes = zip(*fold_results, strict=False)
     delta = torch.cat(all_delta).numpy()
-    ages  = torch.cat(all_ages).numpy()
+    ages = torch.cat(all_ages).numpy()
     sexes = torch.cat(all_sexes).numpy()
     age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
     # --- summary ---
     MIN_N_WILCOXON = 10
-    stat, p_two_sided = stats.wilcoxon(delta)
+    _stat, p_two_sided = stats.wilcoxon(delta)
     print(f"mean Δlogit = {delta.mean():.4f}")
     print(f"Wilcoxon two-sided p = {p_two_sided:.2e}")
 
     groupby_cols = ["age_bracket", "sex"] if args.sex is None else ["age_bracket"]
-    summary_df = pd.DataFrame({
-        "delta":       delta,
-        "age_bracket": age_brackets,
-        "sex":         np.vectorize(INT_TO_SEX.get)(sexes, "unknown"),
-    })
+    summary_df = pd.DataFrame(
+        {
+            "delta": delta,
+            "age_bracket": age_brackets,
+            "sex": np.vectorize(INT_TO_SEX.get)(sexes, "unknown"),
+        }
+    )
 
-    print(f"\nΔlogit summary: {disease_name}  |  {allele_name}"
-          + (f"  |  sex={args.sex}" if args.sex else ""))
+    print(f"\nΔlogit summary: {disease_name}  |  {allele_name}" + (f"  |  sex={args.sex}" if args.sex else ""))
     header = f"{'Age bracket':<12}  {'Sex':<8}  {'n':>6}  {'mean Δlogit':>12}  {'p (Wilcoxon)':>14}"
     print(header)
     print("-" * len(header))
@@ -1284,19 +1385,19 @@ def main():
             keys = (keys,)
         bracket = keys[0]
         sex_col = keys[1] if len(keys) > 1 else (args.sex or "all")
-        n       = len(grp)
-        mean_d  = grp["delta"].mean()
+        n = len(grp)
+        mean_d = grp["delta"].mean()
         if n >= MIN_N_WILCOXON:
             _, p = stats.wilcoxon(grp["delta"])
             p_str = f"{p:.2e}"
         else:
             p_str = f"n<{MIN_N_WILCOXON}"
-        print(f"{str(bracket):<12}  {str(sex_col):<8}  {n:>6}  {mean_d:>12.4f}  {p_str:>14}")
+        print(f"{bracket!s:<12}  {sex_col!s:<8}  {n:>6}  {mean_d:>12.4f}  {p_str:>14}")
 
     # --- save ---
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
-             open(output_file, "wb"))
+    with Path(output_file).open("wb") as _fh:
+        pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets}, _fh)
     print(f"\nSaved to {output_file}")
 
 

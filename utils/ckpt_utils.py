@@ -1,44 +1,43 @@
 import re
+from typing import TypedDict
 
-from easydict import EasyDict
+
+class InferredConfig(TypedDict):
+    n_layer: int
+    n_embd: int
+    domains: list[str]
+    use_age_embedding: bool
+    use_final_layernorm: bool
+    vocab_sizes: dict[str, int]
 
 
-def infer_delphi_config_from_state_dict(sd: dict) -> EasyDict:
-    cfg = EasyDict()
+def infer_delphi_config_from_state_dict(sd: dict) -> InferredConfig:
+    layer_indices = [int(m.group(1)) for key in sd if (m := re.match(r"transformer\.h\.(\d+)\.", key))]
+    if not layer_indices:
+        raise ValueError("No transformer layer keys found in state dict")
 
-    layer_indices = []
-    for key in sd:
-        m = re.match(r"transformer\.h\.(\d+)\.", key)
-        if m:
-            layer_indices.append(int(m.group(1)))
-    cfg.n_layer = max(layer_indices) + 1
+    n_embd: int | None = next((val.shape[1] for key, val in sd.items() if "attn.c_attn.weight" in key), None)
+    if n_embd is None:
+        raise ValueError("Could not infer n_embd: no 'attn.c_attn.weight' key found")
 
-    for key, val in sd.items():
-        if "attn.c_attn.weight" in key:
-            cfg.n_embd = val.shape[1]
-            break
+    domains: list[str] = [
+        m.group(1) for key in sd if (m := re.match(r"transformer\.embed\.domain_embed\.(\w+)\.projector\.weight", key))
+    ]
 
-    for key, val in sd.items():
-        if "mlp.c_fc.weight" in key:
-            cfg.mlp_hidden_dim = val.shape[0]
-            break
-
-    cfg.domains = []
-    for key in sd:
-        m = re.match(r"transformer\.embed\.domain_embed\.(\w+)\.projector\.weight", key)
-        if m:
-            cfg.domains.append(m.group(1))
-
-    cfg.use_age_embedding = any("age_embedding" in k for k in sd)
-    cfg.use_final_layernorm = "transformer.ln_f.weight" in sd
-
-    cfg.vocab_sizes = EasyDict()
-    for d in cfg.domains:
+    vocab_sizes: dict[str, int] = {}
+    for d in domains:
         key = f"embedding_to_logits.embedding_layer_dict.domain_embed.{d}.projector.weight"
         if key in sd:
-            cfg.vocab_sizes[d] = sd[key].shape[0]
+            vocab_sizes[d] = sd[key].shape[0]
 
-    return cfg
+    return InferredConfig(
+        n_layer=max(layer_indices) + 1,
+        n_embd=n_embd,
+        domains=domains,
+        use_age_embedding=any("age_embedding" in k for k in sd),
+        use_final_layernorm="transformer.ln_f.weight" in sd,
+        vocab_sizes=vocab_sizes,
+    )
 
 
 def migrate_legacy_state_dict(weights: dict) -> dict:
@@ -68,8 +67,7 @@ def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
     Old: embed.domain_embed.{domain}.projector.weight
     New: embed.global_embed.weight
     """
-    old_keys = [k for k in weights
-                if k.startswith("embed.domain_embed.") and k.endswith(".projector.weight")]
+    old_keys = [k for k in weights if k.startswith("embed.domain_embed.") and k.endswith(".projector.weight")]
     if not old_keys:
         return weights
 
@@ -84,10 +82,9 @@ def migrate_domain_embed_to_global_embed(weights: dict, model) -> dict:
         offset = embed.domain_offsets[d_int]
         domain_weight = weights[key]
         vocab_size = domain_weight.shape[0]
-        global_weight[offset: offset + vocab_size] = domain_weight
+        global_weight[offset : offset + vocab_size] = domain_weight
 
-    new_weights = {k: v for k, v in weights.items()
-                   if not k.startswith("embed.domain_embed.")}
+    new_weights = {k: v for k, v in weights.items() if not k.startswith("embed.domain_embed.")}
     new_weights["embed.global_embed.weight"] = global_weight
     return new_weights
 
