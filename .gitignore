@@ -14,7 +14,8 @@ tmp*/
 checkpoints/
 *swp
 *output*
-data
+data/transforms/
+data/datasets/
 .mypy_cache/
 .vscode/
 .env
