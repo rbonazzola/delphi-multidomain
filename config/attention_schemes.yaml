@@ -12,12 +12,17 @@
 
 # ── Clinical only ──────────────────────────────────────────────────────────────
 
-clinical_causal:
+base:
   description: Clinical domains only, fully causal
   domains: diseases,death,lifestyle,sex
   scheme: "all:causal(mask_ties=True)"
 
-clinical_causal_with_pcs:
+base_pcs:
+  description: Clinical domains + genetic PCs; PCs and sex form a bidirectional block
+  domains: diseases,death,lifestyle,genetic_pcs,sex
+  scheme: "[genetic_pcs,sex]:bidirectional,all:causal(mask_ties=True)"
+
+base_with_pcs:
   description: Clinical domains + genetic PCs; PCs, lifestyle and sex form a bidirectional block
   domains: diseases,death,lifestyle,genetic_pcs,sex
   scheme: "[genetic_pcs,lifestyle,sex]:bidirectional,all:causal(mask_ties=True)"
@@ -25,7 +30,7 @@ clinical_causal_with_pcs:
 
 # ── HLA ────────────────────────────────────────────────────────────────────────
 
-hla_causal:
+hla_no_self_attention:
   description: HLA + clinical domains, fully causal
   domains: diseases,death,lifestyle,hla_alleles,sex
   scheme: "all:causal(mask_ties=True)"
@@ -34,6 +39,16 @@ hla_bidirectional:
   description: HLA + sex form a bidirectional block; clinical domains causal
   domains: diseases,death,lifestyle,hla_alleles,sex
   scheme: "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"
+
+hla_no_self_attention_pcs:
+  description: HLA + genetic PCs + clinical; PCs and sex bidirectional, HLA causal (no self-attention among HLA tokens)
+  domains: diseases,death,lifestyle,hla_alleles,genetic_pcs,sex
+  scheme: "[genetic_pcs,sex]:bidirectional,all:causal(mask_ties=True)"
+
+hla_bidirectional_pcs:
+  description: HLA + genetic PCs + sex form a bidirectional block; clinical domains causal
+  domains: diseases,death,lifestyle,hla_alleles,genetic_pcs,sex
+  scheme: "[hla_alleles,sex,genetic_pcs]:bidirectional,all:causal(mask_ties=True)"
 
 hla_pcs_causal:
   description: HLA + genetic PCs + clinical; PCs/lifestyle/sex bidirectional, HLA causal
