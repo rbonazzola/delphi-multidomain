@@ -102,6 +102,12 @@ class EarlyStopping:
     def set_patience(self, patience):
         self.patience = patience
 
+    def reset(self):
+        self.best_score = None
+        self.counter = 0
+        self.should_stop = False
+        self.is_improvement = False
+
     def step(self, current_score):
         score = -current_score if self.mode == 'min' else current_score
 
@@ -994,9 +1000,10 @@ class Trainer(BaseTrainer):
             import logging as _logging
             new_alpha = self.token_loss_alpha_scheduler.step(epoch + 1)
             if new_alpha != self._current_alpha:
-                _logging.info("token_loss_alpha: %g → %g at epoch %d", self._current_alpha, new_alpha, epoch + 1)
+                _logging.info("token_loss_alpha: %g → %g at epoch %d — resetting early stopping", self._current_alpha, new_alpha, epoch + 1)
                 self._current_alpha = new_alpha
                 self._token_weights = self._build_token_weights(new_alpha)
+                self.early_stopper.reset()
 
     def epoch_end(self):
         self.train_outputs = []

@@ -1,6 +1,7 @@
 # %%
 import os
 import sys
+import dataclasses
 from pathlib import Path
 import yaml
 from dataclasses import asdict
@@ -627,7 +628,12 @@ if __name__ == "__main__":
         
         logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
     
-        mlflow.log_artifact(domain_config_yaml)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, prefix="domain_config_") as f:
+            yaml.dump({k: dataclasses.asdict(v) for k, v in domain_cfg.items()}, f, default_flow_style=False)
+            _effective_cfg_path = f.name
+        mlflow.log_artifact(_effective_cfg_path, artifact_path="config")
+        Path(_effective_cfg_path).unlink(missing_ok=True)
     
         logged_params = {
             "test_fold": args.test_fold,
