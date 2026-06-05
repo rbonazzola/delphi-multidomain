@@ -46,7 +46,12 @@ from utils.trainer import (
 )
 
 from utils.cv_utils import get_data_partitions
-from utils import load_domain_config, apply_domain_overrides, setup_mlflow, AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
+from utils import (
+    load_domain_config, 
+    apply_domain_overrides, 
+    setup_mlflow, 
+    AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
+)
 
 setup_mlflow()
 
@@ -647,6 +652,8 @@ if __name__ == "__main__":
             "patience": args.patience,
             "attention_scheme_alias": attention_scheme_alias,
             "domain_list": ",".join(domains),
+            "token_loss_alpha": args.token_loss_alpha,
+            "token_loss_alpha_schedule": args.token_loss_alpha_schedule,
         }
      
     else:
@@ -745,7 +752,7 @@ if __name__ == "__main__":
     )
 
     trainer.train(max_epochs=args.max_epochs, min_epochs=args.min_epochs, patience=args.patience)
-
+    
     if args.compute_aucs:
 
         from auc.aucs import evaluate_aucs
@@ -754,6 +761,7 @@ if __name__ == "__main__":
 
         # evaluate_aucs requires fixed T across all batches; swap collate to use
         # block_size=128 instead of "auto" so torch.cat on embeddings doesn't fail.
+        # tofix: 
         auc_collate = copy.copy(dataloaders[2]._collate_fn)
         auc_collate.block_size = 128
         test_loader = DataLoader(
