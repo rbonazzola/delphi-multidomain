@@ -490,7 +490,7 @@ def get_dataloaders(
     )
 
     domain_dropout = {
-        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate)
+        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate, cfg.token_dropout_rate)
         for dname, cfg in domain_cfg.items()
         if cfg.dropout_mode is not None and cfg.dropout_rate > 0
     }

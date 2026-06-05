@@ -986,7 +986,7 @@ class DelphiCollateFn:
         self.padding_domain_id = padding_domain_id
         self.no_event_token_id = no_event_token_id
         self.continuous_domains = continuous_domains or {}
-        # {domain_int: (mode, rate)}  mode in {"token", "block"}
+        # {domain_int: (mode, rate, token_rate)}  mode in {"token", "block", "block_and_token"}
         self.domain_dropout = domain_dropout or {}
         # {domain_int: (min_days, max_days)} — applied during training only
         self.age_jitter = age_jitter or {}
@@ -1062,23 +1062,34 @@ class DelphiCollateFn:
 
         # ── 2.5. Domain dropout (training only) ──────────────────────────
         if self.training and self.domain_dropout:
-            for d_int, (mode, rate) in self.domain_dropout.items():
-                if rate <= 0.0:
+            for d_int, (mode, rate, token_rate) in self.domain_dropout.items():
+                if rate <= 0.0 and token_rate <= 0.0:
                     continue
                 d_mask = domain_ids == d_int  # [B, T]
                 if mode == "token":
-                    drop = torch.bernoulli(torch.full((B, T), rate, dtype=torch.float)) > 0
+                    drop = torch.bernoulli(torch.full((B, T), rate, dtype=torch.float)).bool()
                     drop_mask = d_mask & drop
-                elif mode == "block":
+                    ages[drop_mask] = self.PADDING_AGE
+                    domain_ids[drop_mask] = self.padding_domain_id
+                    local_token_ids[drop_mask] = self.PADDING_TOKEN
+                elif mode in ("block", "block_and_token"):
                     block_drop = torch.bernoulli(
                         torch.full((B,), rate, dtype=torch.float)
-                    ).bool()
+                    ).bool()  # [B]
                     drop_mask = d_mask & block_drop.unsqueeze(1)
-                else:
-                    continue
-                ages[drop_mask] = self.PADDING_AGE
-                domain_ids[drop_mask] = self.padding_domain_id
-                local_token_ids[drop_mask] = self.PADDING_TOKEN
+                    ages[drop_mask] = self.PADDING_AGE
+                    domain_ids[drop_mask] = self.padding_domain_id
+                    local_token_ids[drop_mask] = self.PADDING_TOKEN
+                    if mode == "block_and_token" and token_rate > 0.0:
+                        # token dropout on subjects whose block was NOT dropped
+                        surviving = d_mask & ~block_drop.unsqueeze(1)
+                        tok_drop = torch.bernoulli(
+                            torch.full((B, T), token_rate, dtype=torch.float)
+                        ).bool()
+                        drop_mask2 = surviving & tok_drop
+                        ages[drop_mask2] = self.PADDING_AGE
+                        domain_ids[drop_mask2] = self.padding_domain_id
+                        local_token_ids[drop_mask2] = self.PADDING_TOKEN
 
         # ── 2.7. Age jitter (training only) ──────────────────────────────
         if self.training and self.age_jitter:

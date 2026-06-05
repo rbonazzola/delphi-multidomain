@@ -91,8 +91,9 @@ class DomainConfig:
     parent: Optional[str] = None          # inherit config from this domain (resolved at load time)
     abstract: bool = False                 # template-only domain; excluded from the active config
     group: Optional[str] = None            # alias for attention mask (e.g. "hla_alleles")
-    dropout_mode: Optional[str] = None    # "token" (random tokens) | "block" (entire domain per subject)
-    dropout_rate: float = 0.0             # probability of dropping; 0 = disabled
+    dropout_mode: Optional[str] = None    # "token" | "block" | "block_and_token"
+    dropout_rate: float = 0.0             # block-drop probability (or token-drop probability for mode="token")
+    token_dropout_rate: float = 0.0       # token-drop probability for mode="block_and_token" (applied to non-blocked subjects)
     no_repeat: bool = False               # mask already-seen tokens from logits (for domains where only first occurrence is recorded)
 
     def __post_init__(self):
