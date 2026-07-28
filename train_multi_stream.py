@@ -17,10 +17,21 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 if (DELPHI_DIR := Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
-from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler, FlexibleDataLoader, BatchSizeScheduler, DataModule
+from data.dataset import (
+    DelphiDataset, 
+    DelphiCollateFn, 
+    AgeSampler, 
+    FlexibleDataLoader, 
+    BatchSizeScheduler, 
+    DataModule
+)
+
 from delphi.optim import OptimConfig, configure_optimizers
-from delphi.model import DelphiConfig
-from delphi.cross_attn_model import DelphiCrossAttention, parse_cross_attention_scheme
+from delphi.multi_stream_model import (
+    DelphiMultiStream,
+    DelphiMultiStreamConfig,
+    parse_multi_stream_scheme,
+)
 from utils.trainer import MLFlowLogger, Trainer
 from utils.cv_utils import get_data_partitions
 from utils import load_domain_config, apply_domain_overrides, setup_mlflow, AUTO_BLOCK_SIZE
@@ -59,7 +70,7 @@ def _resolve_attention_scheme(s: str) -> str:
                 return scheme[0]
             raise ValueError(
                 f"Attention scheme alias '{s}' defines a per-layer list, "
-                f"which is not supported in DelphiCrossAttention. "
+                f"which is not supported in DelphiMultiStream. "
                 f"Provide a single policy string instead."
             )
         return scheme
@@ -122,15 +133,14 @@ def print_config_rich(arch_str, attention_scheme, delphi_config, args, overrides
 
     console.print(Panel(table, title="[bold]Domain configuration[/bold]", border_style="blue"))
 
-    scheme = parse_cross_attention_scheme(arch_str)
+    scheme = parse_multi_stream_scheme(arch_str)
     attn_escaped = attention_scheme.replace("[", r"\[")
-    arch_text = (
-        f"encoder_A: domains=[cyan]{scheme.encoder_A.domains}[/]  "
-        f"h={scheme.encoder_A.n_head} d={scheme.encoder_A.n_embd} l={scheme.encoder_A.n_layer}\n"
-        f"encoder_B: domains=[cyan]{scheme.encoder_B.domains}[/]  "
-        f"h={scheme.encoder_B.n_head} d={scheme.encoder_B.n_embd} l={scheme.encoder_B.n_layer}\n"
-        f"xattn:     h={scheme.xattn_n_head} d={scheme.xattn_n_embd}\n"
-        f"trunk:     h={scheme.trunk_n_head} d={scheme.trunk_n_embd} l={scheme.trunk_n_layer}\n"
+    encoder_lines = [
+        f"encoder_{i}: domains=[cyan]{spec.domains}[/]  h={spec.n_head} d={spec.n_embd} l={spec.n_layer}"
+        for i, spec in enumerate(scheme.encoders)
+    ]
+    arch_text = "\n".join(encoder_lines) + (
+        f"\ntrunk:     h={scheme.trunk_n_head} d={scheme.trunk_n_embd} l={scheme.trunk_n_layer}\n"
         f"attention: [cyan]{attn_escaped}[/]\n"
         f"no_event_token_rate=[cyan]{args.no_event_token_rate}[/]"
     )
@@ -202,7 +212,9 @@ def get_dataloaders(domain_cfg, model, args):
         seed=args.seed,
     )
     domain_dropout = {
-        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate)
+        # group_key: domains inheriting dropout config from the same parent (e.g. per-locus
+        # HLA subdomains) share one block-drop draw per subject instead of dropping independently
+        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate, cfg.token_dropout_rate, cfg.parent or dname)
         for dname, cfg in domain_cfg.items()
         if cfg.dropout_mode is not None and cfg.dropout_rate > 0
     }
@@ -254,14 +266,14 @@ def get_cli_args():
             result[k.strip()] = v.strip()
         return result
 
-    parser = argparse.ArgumentParser(description="Train DelphiCrossAttention model.")
+    parser = argparse.ArgumentParser(description="Train DelphiMultiStream model.")
 
     # ── Architecture ──────────────────────────────────────────────────────────
     parser.add_argument(
         "--arch", required=True,
         help=(
-            "CrossAttention architecture string. Example: "
-            "'CrossAttention([hla_alleles,sex]:(h24d240l3),[diseases,lifestyle,sex]:(h24d240l6),xattn:(h24d240)):(h24d240l6)'"
+            "MultiStream architecture string (2 or more encoder groups). Example: "
+            "'MultiStream([hla_alleles,sex]:(h24d240l3),[diseases,lifestyle,sex]:(h24d240l6)):(h24d240l6)'"
         ),
     )
     parser.add_argument(
@@ -371,10 +383,6 @@ if __name__ == "__main__":
     # ── Resolve attention scheme alias ────────────────────────────────────────
     attention_scheme = _resolve_attention_scheme(args.attention_scheme)
 
-    # ── Parse arch string to extract n_embd ──────────────────────────────────
-    arch_scheme = parse_cross_attention_scheme(args.arch)
-    n_embd = arch_scheme.trunk_n_embd   # same across all stages (validated in model __init__)
-
     # ── Domain config ─────────────────────────────────────────────────────────
     domains = [d for d in args.domains.split(",") if d != "padding"]
     domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
@@ -388,17 +396,11 @@ if __name__ == "__main__":
     if args.domain_config_overrides:
         apply_domain_overrides(domain_cfg, args.domain_config_overrides)
 
-    # ── DelphiConfig (used for embedding + metadata) ──────────────────────────
-    delphi_config = DelphiConfig(
-        n_embd=n_embd,
-        n_layer=arch_scheme.trunk_n_layer,   # stored for reference; not used by the model
-        n_head=arch_scheme.trunk_n_head,
+    # ── DelphiMultiStreamConfig (used for embedding + metadata) ────────────
+    delphi_config = DelphiMultiStreamConfig(
         domains=domain_cfg,
-        attention_scheme=attention_scheme,
         token_dropout=args.token_dropout,
         block_size=128,
-        no_event_token_rate=args.no_event_token_rate,
-        no_event_token_insertion_mode=args.no_event_token_insertion_mode,
         seed=args.seed,
     )
 
@@ -410,7 +412,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = DelphiCrossAttention.from_scheme_string(
+    model = DelphiMultiStream.from_scheme_string(
         arch_str=args.arch,
         attention_scheme=attention_scheme,
         config=delphi_config,
@@ -504,28 +506,46 @@ if __name__ == "__main__":
         cache_block_size = AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
         
         TRAIN, VAL, TEST = 0, 1, 2
-        
+
         auc_collate = copy.copy(dataloaders[2]._collate_fn)
         auc_collate.block_size = 128
-        test_loader = DataLoader(
-            dataloaders[TEST].dataset,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            num_workers=dataloaders[2]._num_workers,
-            pin_memory=True,
-            collate_fn=auc_collate,
-        )
+        eval_loaders = {
+            "test": DataLoader(
+                dataloaders[TEST].dataset,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                num_workers=dataloaders[2]._num_workers,
+                pin_memory=True,
+                collate_fn=auc_collate,
+            ),
+            "val": DataLoader(
+                dataloaders[VAL].dataset,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                num_workers=dataloaders[1]._num_workers,
+                pin_memory=True,
+                collate_fn=auc_collate,
+            ),
+        }
         del dataloaders
 
-        auc_df = evaluate_aucs(
-            model,
-            test_loader,
-            block_size=cache_block_size,
-            run_id=logger.active_run.info.run_id,
-            n_jobs=8,
-            logger=logger,
-        )
-        logging.info("AUCs:\n%s", pformat(auc_df, sort_dicts=False))
+        # "aucs.csv" kept as the test filename for backward compatibility with
+        # existing consumers (e.g. mlflow-utils/check_missing_artifact.py).
+        auc_filenames = {"test": "aucs.csv", "val": "aucs_val.csv"}
+        auc_dfs = {}
+        for split, loader in eval_loaders.items():
+            auc_dfs[split] = evaluate_aucs(
+                model,
+                loader,
+                block_size=cache_block_size,
+                run_id=logger.active_run.info.run_id,
+                n_jobs=8,
+                logger=logger,
+                output_file=auc_filenames[split],
+            )
+            logging.info("%s AUCs:\n%s", split, pformat(auc_dfs[split], sort_dicts=False))
+
+        auc_df = auc_dfs["test"]
 
         diseases_domain = "diseases"
         if diseases_domain in model.config.domains:

@@ -1,12 +1,13 @@
 """
-DelphiCrossAttention — two-stream encoder with cross-attention fusion.
+DelphiMultiStream — N-stream encoder with trunk fusion.
 
 Architecture string (specifies structure only):
 
-    CrossAttention(
-        [group_A_domains] : (hN dD lL_A),
-        [group_B_domains] : (hN dD lL_B),
-        xattn             : (hN dD),
+    MultiStream(
+        [group_1_domains] : (hN dD lL_1),
+        [group_2_domains] : (hN dD lL_2),
+        ...
+        [group_K_domains] : (hN dD lL_K),
     ) : (hN dD lL_trunk)
 
 The attention *policy* (which tokens attend to which) is passed separately,
@@ -16,20 +17,20 @@ using the same syntax as ``Delphi``::
 
 The policy is applied globally and then restricted per stage:
 
-    Encoder A     — global_mask AND (query ∈ A  AND key ∈ A)
-    Encoder B     — global_mask AND (query ∈ B  AND key ∈ B)
-    Cross-attn    — global_mask AND (query ∈ A  AND key ∈ B)  OR  vice-versa
-    Trunk         — global_mask  (unrestricted)
+    Encoder i     — global_mask AND (query ∈ group_i  AND key ∈ group_i)
+    Trunk         — global_mask  (unrestricted; this is where cross-group mixing happens)
 
-Tokens that belong to both groups (e.g. ``sex`` in both A and B) participate
-in both encoders; their representations are averaged before cross-attention.
-All stages share the same ``n_embd``.
+Tokens that belong to more than one group (e.g. ``sex`` in both group 1 and
+group 2) participate in every encoder whose group they belong to; their
+representations are averaged before the trunk. All stages share the same
+``n_embd``.
 """
 from __future__ import annotations
 
 import re
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -37,7 +38,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from delphi.model import (
-    DelphiConfig,
+    DomainConfig,
     AgeEncoding, LayerNorm, Block,
     AttentionMaskBuilder,
     initialize_weights,
@@ -86,41 +87,32 @@ class EncoderSpec:
 
 
 @dataclass
-class CrossAttentionScheme:
-    encoder_A: EncoderSpec
-    encoder_B: EncoderSpec
-    xattn_n_head: int
-    xattn_n_embd: int
+class MultiStreamScheme:
+    encoders: List[EncoderSpec]
     trunk_n_head: int
     trunk_n_embd: int
     trunk_n_layer: int
 
 
-def parse_cross_attention_scheme(scheme: str) -> CrossAttentionScheme:
+def parse_multi_stream_scheme(scheme: str) -> MultiStreamScheme:
     """
-    Parse a CrossAttention architecture string into a :class:`CrossAttentionScheme`.
+    Parse a MultiStream architecture string into a :class:`MultiStreamScheme`.
 
-    Expected format::
+    Expected format (any number ``K >= 2`` of encoder groups)::
 
-        CrossAttention([g1]:(hNdDlL),[g2]:(hNdDlL),xattn:(hNdD)):(hNdDlL)
+        MultiStream([g1]:(hNdDlL),[g2]:(hNdDlL),...,[gK]:(hNdDlL)):(hNdDlL)
     """
     scheme = scheme.strip()
-    outer = re.match(r"^CrossAttention\((.+)\):\(([^)]+)\)$", scheme, re.DOTALL)
+    outer = re.match(r"^MultiStream\((.+)\):\(([^)]+)\)$", scheme, re.DOTALL)
     if not outer:
-        raise ValueError(f"Cannot parse CrossAttention scheme: {scheme!r}")
+        raise ValueError(f"Cannot parse MultiStream scheme: {scheme!r}")
 
     trunk_cfg = _parse_arch_str(outer.group(2))
     encoders: List[EncoderSpec] = []
-    xattn: Dict[str, int] = {}
 
     for part in _split_top_level(outer.group(1).strip()):
         part = part.strip()
-        if part.lower().startswith("xattn:"):
-            m = re.search(r"\(([^)]+)\)", part)
-            if not m:
-                raise ValueError(f"Invalid xattn spec: {part!r}")
-            xattn = _parse_arch_str(m.group(1))
-        elif part.startswith("["):
+        if part.startswith("["):
             m = re.match(r"^\[([^\]]+)\]:\(([^)]+)\)$", part)
             if not m:
                 raise ValueError(f"Invalid encoder spec: {part!r}")
@@ -133,18 +125,13 @@ def parse_cross_attention_scheme(scheme: str) -> CrossAttentionScheme:
                 n_layer=cfg.get("n_layer", 1),
             ))
         else:
-            raise ValueError(f"Unexpected fragment in CrossAttention spec: {part!r}")
+            raise ValueError(f"Unexpected fragment in MultiStream spec: {part!r}")
 
-    if len(encoders) != 2:
-        raise ValueError(f"Expected exactly 2 encoder groups, got {len(encoders)}")
-    if not xattn:
-        raise ValueError("Missing xattn:(hNdD) in CrossAttention spec")
+    if len(encoders) < 2:
+        raise ValueError(f"Expected at least 2 encoder groups, got {len(encoders)}")
 
-    return CrossAttentionScheme(
-        encoder_A=encoders[0],
-        encoder_B=encoders[1],
-        xattn_n_head=xattn["n_head"],
-        xattn_n_embd=xattn["n_embd"],
+    return MultiStreamScheme(
+        encoders=encoders,
         trunk_n_head=trunk_cfg["n_head"],
         trunk_n_embd=trunk_cfg["n_embd"],
         trunk_n_layer=trunk_cfg.get("n_layer", 1),
@@ -152,6 +139,56 @@ def parse_cross_attention_scheme(scheme: str) -> CrossAttentionScheme:
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DelphiMultiStreamConfig:
+    """
+    Config for :class:`DelphiMultiStream`.
+
+    Deliberately has no ``n_layer`` / ``n_head`` / ``n_embd`` / ``attention_scheme``
+    fields, unlike :class:`~delphi.model.DelphiConfig`. Per-stage architecture
+    (per-encoder / trunk sizes) comes from :class:`MultiStreamScheme` instead,
+    and the attention policy string is passed as a separate constructor
+    argument. A generic ``DelphiConfig`` used to be reused here, but its
+    ``n_embd`` silently fed the embedding table while the transformer blocks
+    used ``scheme``'s ``n_embd`` — two disconnected sources of truth that broke
+    with a confusing shape-mismatch error whenever they disagreed. This config
+    has only one place ``n_embd`` can come from.
+    """
+    domains: Dict[str, DomainConfig] = field(default_factory=dict)
+    dropout: float = 0.1
+    token_dropout: float = 0.1
+    bias: bool = True
+    block_size: int = 64
+    seed: int = 42
+
+    def items(self):
+        # Duck-types this as dict-like for mlflow.log_params (called as
+        # `logger.log_params(self.model.config)` in Trainer.train), mirroring
+        # DelphiConfig.items().
+        return asdict(self).items()
+
+    def set_dropout(self, dropout: float):
+        self.dropout = dropout
+        return self
+
+    def set_token_dropout(self, token_dropout: float):
+        self.token_dropout = token_dropout
+        return self
+
+    def set_block_size(self, block_size: int):
+        self.block_size = block_size
+        return self
+
+    def add_domain(self, domain_name: str, domain_config: DomainConfig):
+        self.domains[domain_name] = domain_config
+        return self
+
+    def remove_domain(self, domain_name: str):
+        if domain_name in self.domains:
+            del self.domains[domain_name]
+        return self
+
 
 @dataclass
 class _StageConfig:
@@ -162,18 +199,19 @@ class _StageConfig:
     bias: bool
 
 
-class DelphiCrossAttention(nn.Module):
+class DelphiMultiStream(nn.Module):
     """
-    Two-stream encoder variant of Delphi.
+    N-stream encoder variant of Delphi.
 
     Parameters
     ----------
     config:
-        Standard :class:`~delphi.model.DelphiConfig` (domains, dropout, bias, …).
-        ``n_layer`` / ``n_head`` / ``n_embd`` are ignored — those come from *scheme*.
+        :class:`DelphiMultiStreamConfig` (domains, dropout, bias, …).
+        Architecture (``n_layer`` / ``n_head`` / ``n_embd`` per stage) is not
+        part of this config at all — it comes from *scheme*.
     scheme:
-        Architecture spec (encoder sizes, trunk size).  Build with
-        :func:`parse_cross_attention_scheme`.
+        Architecture spec (per-encoder sizes, trunk size). Build with
+        :func:`parse_multi_stream_scheme`.
     attention_scheme:
         Global attention policy string, same syntax as Delphi, e.g.
         ``"[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"``.
@@ -182,28 +220,25 @@ class DelphiCrossAttention(nn.Module):
 
     def __init__(
         self,
-        config: DelphiConfig,
-        scheme: CrossAttentionScheme,
+        config: DelphiMultiStreamConfig,
+        scheme: MultiStreamScheme,
         attention_scheme: str,
     ):
         super().__init__()
 
-        n_embds = {
-            "encoder_A": scheme.encoder_A.n_embd,
-            "encoder_B": scheme.encoder_B.n_embd,
-            "xattn":     scheme.xattn_n_embd,
-            "trunk":     scheme.trunk_n_embd,
-        }
+        n_embds = {f"encoder_{i}": spec.n_embd for i, spec in enumerate(scheme.encoders)}
+        n_embds["trunk"] = scheme.trunk_n_embd
         if len(set(n_embds.values())) != 1:
             raise ValueError(f"All stages must share the same n_embd: {n_embds}")
 
         self._config  = config
         self._scheme  = scheme
+        self.n_streams = len(scheme.encoders)
         n_embd  = scheme.trunk_n_embd
         dropout = config.dropout
         bias    = config.bias
 
-        # ── Embedding (shared with Delphi) ────────────────────────────────
+        # ── Embedding (shared with Delphi) ──────────────────────────────  ──
         self.domain_to_int = Delphi._build_domain_to_int(list(config.domains.keys()))
         self.int_to_domain = {v: k for k, v in self.domain_to_int.items()}
         self.domain_offsets, global_vocab_size = Delphi._build_domain_offsets(
@@ -211,8 +246,13 @@ class DelphiCrossAttention(nn.Module):
         )
         self.global_vocab_size = global_vocab_size
 
+        # MultiDomainEmbedding is duck-typed (needs .domains/.n_embd/.token_dropout);
+        # n_embd comes from `scheme` (validated above), never from `config`, so
+        # there is exactly one place n_embd is read from.
         self.embed = MultiDomainEmbedding(
-            config=config,
+            config=SimpleNamespace(
+                domains=config.domains, n_embd=n_embd, token_dropout=config.token_dropout
+            ),
             domain_offsets=self.domain_offsets,
             global_vocab_size=global_vocab_size,
             domain_to_int=self.domain_to_int,
@@ -225,11 +265,9 @@ class DelphiCrossAttention(nn.Module):
             cfg = _StageConfig(n_embd=n_embd, n_head=n_head, dropout=dropout, bias=bias)
             return nn.ModuleList([Block(cfg) for _ in range(n_layer)])
 
-        self.encoder_A        = _blocks(scheme.encoder_A.n_head, scheme.encoder_A.n_layer)
-        self.encoder_B        = _blocks(scheme.encoder_B.n_head, scheme.encoder_B.n_layer)
-        self.cross_attn_block = Block(
-            _StageConfig(n_embd=n_embd, n_head=scheme.xattn_n_head, dropout=dropout, bias=bias)
-        )
+        self.encoders = nn.ModuleList([
+            _blocks(spec.n_head, spec.n_layer) for spec in scheme.encoders
+        ])
         self.trunk = _blocks(scheme.trunk_n_head, scheme.trunk_n_layer)
         self.ln_f  = LayerNorm(n_embd, bias=bias)
 
@@ -237,32 +275,47 @@ class DelphiCrossAttention(nn.Module):
         # Resolve the at_birth alias before storing.
         attention_scheme = self._resolve_at_birth(attention_scheme, config)
         self.attention_scheme = attention_scheme
-        self.mask_builder = AttentionMaskBuilder(attention_scheme, self.domain_to_int)
 
-        # Group-membership buffers (follow .to(device) automatically).
-        self.register_buffer("_group_A_ids", torch.tensor([
-            self.domain_to_int[d] for d in scheme.encoder_A.domains if d in self.domain_to_int
-        ]))
-        self.register_buffer("_group_B_ids", torch.tensor([
-            self.domain_to_int[d] for d in scheme.encoder_B.domains if d in self.domain_to_int
-        ]))
+        # Group aliases (e.g. "hla_alleles" standing in for its per-locus
+        # children via `group` or `parent`), same resolution as Delphi._build_model.
+        # Without this, an attention_scheme bracket referencing an alias name
+        # that isn't itself a real domain (e.g. ESM2 per-locus configs, where
+        # "hla_alleles" is abstract) raises a KeyError in AttentionMaskBuilder.build.
+        group_to_ints: Dict[str, list] = {}
+        for dname, dcfg in config.domains.items():
+            alias = dcfg.group or dcfg.parent
+            if alias:
+                group_to_ints.setdefault(alias, []).append(self.domain_to_int[dname])
+
+        self.mask_builder = AttentionMaskBuilder(attention_scheme, self.domain_to_int, group_to_ints)
+
+        # Group-membership buffers, one per stream (follow .to(device) automatically).
+        # Registered under indexed names since ModuleList/buffers can't hold a
+        # plain Python list of tensors; use group_ids(i) to retrieve.
+        for i, spec in enumerate(scheme.encoders):
+            self.register_buffer(f"_group_ids_{i}", torch.tensor([
+                self.domain_to_int[d] for d in spec.domains if d in self.domain_to_int
+            ]))
 
         # ── Weight initialisation ─────────────────────────────────────────
         total_layers = (
-            scheme.encoder_A.n_layer + scheme.encoder_B.n_layer
-            + 1  # cross-attention block
-            + scheme.trunk_n_layer
+            sum(spec.n_layer for spec in scheme.encoders) + scheme.trunk_n_layer
         )
         torch.manual_seed(config.seed)
-        initialize_weights(self, config=replace(config, n_layer=total_layers))
+        # initialize_weights only reads .n_layer (for scaled residual init);
+        # config has no n_layer field, so pass a minimal stand-in.
+        initialize_weights(self, config=SimpleNamespace(n_layer=total_layers))
         self.embed._zero_placeholder_rows()
 
         self.block_size = config.block_size
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def group_ids(self, stream_idx: int) -> torch.Tensor:
+        return getattr(self, f"_group_ids_{stream_idx}")
+
     @staticmethod
-    def _resolve_at_birth(attention_scheme: str, config: DelphiConfig) -> str:
+    def _resolve_at_birth(attention_scheme: str, config: DelphiMultiStreamConfig) -> str:
         if "at_birth" in attention_scheme:
             at_birth = ",".join(
                 name for name, cfg in config.domains.items() if cfg.at_birth
@@ -290,41 +343,36 @@ class DelphiCrossAttention(nn.Module):
         mask[b_idx, t_idx, t_idx] = 1
         return mask
 
-    def _build_masks(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Derive the four per-stage attention masks from the global policy.
+    def _is_in_group(self, domain_ids: torch.Tensor, stream_idx: int) -> torch.Tensor:
+        return torch.isin(domain_ids, self.group_ids(stream_idx))
 
-        Returns ``(mask_A, mask_B, mask_xattn, mask_trunk)`` each shaped
-        ``[B, 1, T, T]`` (broadcast-ready over heads).
+    def _build_masks(self, batch) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """
+        Derive the per-stage attention masks from the global policy.
+
+        Returns ``(masks, mask_trunk)`` where ``masks`` is a list of one
+        ``[B, 1, T, T]`` mask per stream, and ``mask_trunk`` is ``[B, 1, T, T]``
+        (broadcast-ready over heads).
         """
         global_mask = self.mask_builder.build(
             batch.domain_ids, batch.global_token_ids, batch.ages
         )  # [B, T, T]  int
 
-        is_A = torch.isin(batch.domain_ids, self._group_A_ids)  # [B, T]
-        is_B = torch.isin(batch.domain_ids, self._group_B_ids)
+        masks = []
+        for i in range(self.n_streams):
+            is_i = self._is_in_group(batch.domain_ids, i)         # [B, T]
+            pair = is_i.unsqueeze(2) & is_i.unsqueeze(1)           # [B, T, T]
+            # Re-apply fallback after ANDing with group pair, because
+            # out-of-group tokens lose all valid targets.
+            mask_i = self._apply_self_attn_fallback(global_mask & pair)
+            masks.append(mask_i.unsqueeze(1))
 
-        # Within-group masks — re-apply fallback after ANDing with group pair,
-        # because out-of-group tokens lose all valid targets.
-        pair_A = is_A.unsqueeze(2) & is_A.unsqueeze(1)   # [B, T, T]
-        pair_B = is_B.unsqueeze(2) & is_B.unsqueeze(1)
-
-        mask_A = self._apply_self_attn_fallback(global_mask & pair_A)
-        mask_B = self._apply_self_attn_fallback(global_mask & pair_B)
-
-        # Cross-group mask: A→B and B→A only (no within-group)
-        cross = (
-            (is_A.unsqueeze(2) & is_B.unsqueeze(1)) |
-            (is_B.unsqueeze(2) & is_A.unsqueeze(1))
-        )
-        mask_x = self._apply_self_attn_fallback(global_mask & cross)
-
-        return mask_A.unsqueeze(1), mask_B.unsqueeze(1), mask_x.unsqueeze(1), global_mask.unsqueeze(1)
+        return masks, global_mask.unsqueeze(1)
 
     # ── Properties ───────────────────────────────────────────────────────────
 
     @property
-    def config(self) -> DelphiConfig:
+    def config(self) -> DelphiMultiStreamConfig:
         return self._config
 
     @property
@@ -350,33 +398,29 @@ class DelphiCrossAttention(nn.Module):
         h = self.drop(h)
 
         # 2. Build all masks at once
-        mask_A, mask_B, mask_xattn, mask_trunk = self._build_masks(batch)
+        masks, mask_trunk = self._build_masks(batch)
 
         # 3. Independent encoders (parallel, on cloned copies)
-        h_A = h.clone()
-        for block in self.encoder_A:
-            h_A, _ = block(h_A, mask_A)
+        is_in = [self._is_in_group(batch.domain_ids, i) for i in range(self.n_streams)]  # [B, T] each
 
-        h_B = h.clone()
-        for block in self.encoder_B:
-            h_B, _ = block(h_B, mask_B)
+        acc   = torch.zeros_like(h)
+        count = torch.zeros(batch.domain_ids.shape, dtype=h.dtype, device=h.device)  # [B, T]
+        for i in range(self.n_streams):
+            h_i = h.clone()
+            for block in self.encoders[i]:
+                h_i, _ = block(h_i, masks[i])
+            m = is_in[i].unsqueeze(-1).to(h.dtype)   # [B, T, 1]
+            acc = acc + h_i * m
+            count = count + is_in[i].to(h.dtype)
 
-        # 4. Merge encoder outputs
-        is_A = torch.isin(batch.domain_ids, self._group_A_ids)
-        is_B = torch.isin(batch.domain_ids, self._group_B_ids)
+        # 4. Merge encoder outputs: average over whichever streams a token
+        # belongs to; tokens in no stream keep their original embedding.
+        any_membership = (count > 0).unsqueeze(-1)             # [B, T, 1]
+        merged = acc / count.clamp(min=1).unsqueeze(-1)
+        h = torch.where(any_membership, merged, h)
 
-        h = h.clone()
-        h[is_A & ~is_B] = h_A[is_A & ~is_B]
-        h[is_B & ~is_A] = h_B[is_B & ~is_A]
-        overlap = is_A & is_B
-        if overlap.any():
-            h[overlap] = 0.5 * (h_A[overlap] + h_B[overlap])
-
-        # 5. Cross-attention (cross-group only, policy-filtered)
-        h, att_x = self.cross_attn_block(h, mask_xattn)
-
-        # 6. Causal trunk (full global policy)
-        att_list = [att_x] if return_attention else []
+        # 5. Causal trunk (full global policy) — cross-stream mixing happens here
+        att_list = []
         for block in self.trunk:
             h, att = block(h, mask_trunk)
             if return_attention:
@@ -392,7 +436,7 @@ class DelphiCrossAttention(nn.Module):
 
     # ── Loss functions (identical to Delphi) ─────────────────────────────────
 
-    def cross_entropy_loss(self, logits, targets, agg=None):
+    def cross_entropy_loss(self, logits, targets, agg=None, token_weights=None):
         import pandas as pd
         n_classes = logits.size(-1)
         if agg == "per_token":
@@ -413,17 +457,22 @@ class DelphiCrossAttention(nn.Module):
             result.index.name = "token_id"
             return result
         elif agg is None:
+            w = token_weights.to(dtype=logits.dtype, device=logits.device) if token_weights is not None else None
             return F.cross_entropy(
-                logits.reshape(-1, n_classes), targets.reshape(-1), ignore_index=-1
+                logits.reshape(-1, n_classes), targets.reshape(-1), ignore_index=-1, weight=w
             )
         raise ValueError(f"agg must be None, 'per_token', or 'per_disease'")
 
-    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None):
+    def time_to_event_loss(self, logits, time_to_next, t_min, agg=None, pos_weights=None):
         lse = torch.logsumexp(logits, -1)
         lse = -torch.log(torch.exp(-lse) + t_min)
         log_dt = -torch.log(torch.clamp(time_to_next, min=1.0) + t_min).view(-1)
         loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - log_dt))
-        if agg == "mean":  return loss_dt.mean()
+        if agg == "mean":
+            if pos_weights is not None:
+                w = pos_weights.to(dtype=loss_dt.dtype, device=loss_dt.device)
+                return (loss_dt * w).sum() / w.sum()
+            return loss_dt.mean()
         if agg == "sum":   return loss_dt.sum()
         if agg is None:    return loss_dt
         raise NotImplementedError(f"agg={agg!r}")
@@ -451,20 +500,20 @@ class DelphiCrossAttention(nn.Module):
         cls,
         arch_str: str,
         attention_scheme: str,
-        config: DelphiConfig,
-    ) -> "DelphiCrossAttention":
+        config: DelphiMultiStreamConfig,
+    ) -> "DelphiMultiStream":
         """
         Instantiate from strings.
 
         Parameters
         ----------
         arch_str:
-            CrossAttention architecture string, e.g.
-            ``"CrossAttention([hla_alleles,sex]:(h24d240l3),...):(h24d240l6)"``.
+            MultiStream architecture string, e.g.
+            ``"MultiStream([hla_alleles,sex]:(h24d240l3),...):(h24d240l6)"``.
         attention_scheme:
             Global attention policy, e.g.
             ``"[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"``.
         config:
-            Base :class:`~delphi.model.DelphiConfig` (domains, dropout, …).
+            :class:`DelphiMultiStreamConfig` (domains, dropout, …).
         """
-        return cls(config, parse_cross_attention_scheme(arch_str), attention_scheme)
+        return cls(config, parse_multi_stream_scheme(arch_str), attention_scheme)

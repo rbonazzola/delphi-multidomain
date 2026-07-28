@@ -1,26 +1,33 @@
 """
-Synthetic tests for DelphiCrossAttention.
+Synthetic tests for DelphiMultiStream.
 No CSV data is loaded — only tokenizer.yaml (for vocab sizes) and a hand-built
 DelphiBatch.  Runs on CPU so it can execute without a GPU.
 """
 import pytest
 import torch
 from data.dataset import DelphiBatch
-from delphi.model import DelphiConfig, DomainConfig
-from delphi.cross_attn_model import (
-    DelphiCrossAttention,
-    parse_cross_attention_scheme,
-    CrossAttentionScheme,
+from delphi.model import DomainConfig
+from delphi.multi_stream_model import (
+    DelphiMultiStream,
+    DelphiMultiStreamConfig,
+    parse_multi_stream_scheme,
+    MultiStreamScheme,
     EncoderSpec,
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 ARCH_STR = (
-    "CrossAttention("
+    "MultiStream("
     "[hla_alleles,sex]:(h4d32l2),"
-    "[diseases,lifestyle,sex]:(h4d32l3),"
-    "xattn:(h4d32)"
+    "[diseases,lifestyle,sex]:(h4d32l3)"
+    "):(h4d32l2)"
+)
+ARCH_STR_3STREAM = (
+    "MultiStream("
+    "[hla_alleles,sex]:(h4d32l2),"
+    "[diseases,sex]:(h4d32l2),"
+    "[lifestyle,sex]:(h4d32l1)"
     "):(h4d32l2)"
 )
 ATTN_SCHEME = "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"
@@ -42,8 +49,7 @@ VOCAB = {"padding": 2, "diseases": 1256, "hla_alleles": 359, "lifestyle": 9, "se
 
 @pytest.fixture(scope="module")
 def config():
-    return DelphiConfig(
-        n_embd=32, n_layer=2, n_head=4,
+    return DelphiMultiStreamConfig(
         domains=DOMAINS,
         block_size=32,
         seed=0,
@@ -52,7 +58,12 @@ def config():
 
 @pytest.fixture(scope="module")
 def model(config):
-    return DelphiCrossAttention.from_scheme_string(ARCH_STR, ATTN_SCHEME, config)
+    return DelphiMultiStream.from_scheme_string(ARCH_STR, ATTN_SCHEME, config)
+
+
+@pytest.fixture(scope="module")
+def model_3stream(config):
+    return DelphiMultiStream.from_scheme_string(ARCH_STR_3STREAM, ATTN_SCHEME, config)
 
 
 def _make_batch(model, B=4, T=32, device="cpu"):
@@ -110,44 +121,52 @@ def _make_batch(model, B=4, T=32, device="cpu"):
 # ── Parser tests ──────────────────────────────────────────────────────────────
 
 def test_parser_basic():
-    s = parse_cross_attention_scheme(ARCH_STR)
-    assert s.encoder_A.domains == ["hla_alleles", "sex"]
-    assert s.encoder_A.n_layer == 2
-    assert s.encoder_B.domains == ["diseases", "lifestyle", "sex"]
-    assert s.encoder_B.n_layer == 3
-    assert s.xattn_n_head == 4
+    s = parse_multi_stream_scheme(ARCH_STR)
+    assert len(s.encoders) == 2
+    assert s.encoders[0].domains == ["hla_alleles", "sex"]
+    assert s.encoders[0].n_layer == 2
+    assert s.encoders[1].domains == ["diseases", "lifestyle", "sex"]
+    assert s.encoders[1].n_layer == 3
     assert s.trunk_n_layer == 2
 
 
-def test_parser_rejects_missing_xattn():
-    with pytest.raises(ValueError, match="xattn"):
-        parse_cross_attention_scheme(
-            "CrossAttention([a]:(h4d32l1),[b]:(h4d32l1)):(h4d32l2)"
-        )
+def test_parser_supports_more_than_two_encoders():
+    s = parse_multi_stream_scheme(ARCH_STR_3STREAM)
+    assert len(s.encoders) == 3
+    assert [e.domains for e in s.encoders] == [
+        ["hla_alleles", "sex"], ["diseases", "sex"], ["lifestyle", "sex"],
+    ]
+    assert [e.n_layer for e in s.encoders] == [2, 2, 1]
 
 
 def test_parser_rejects_wrong_n_encoders():
-    with pytest.raises(ValueError, match="2 encoder"):
-        parse_cross_attention_scheme(
-            "CrossAttention([a]:(h4d32l1),xattn:(h4d32)):(h4d32l2)"
+    with pytest.raises(ValueError, match="at least 2 encoder"):
+        parse_multi_stream_scheme(
+            "MultiStream([a]:(h4d32l1)):(h4d32l2)"
         )
 
 
 def test_parser_rejects_mismatched_n_embd():
     with pytest.raises(ValueError, match="n_embd"):
-        DelphiCrossAttention.from_scheme_string(
-            "CrossAttention([hla_alleles,sex]:(h4d32l1),[diseases,lifestyle,sex]:(h4d64l1),xattn:(h4d32)):(h4d32l2)",
+        DelphiMultiStream.from_scheme_string(
+            "MultiStream([hla_alleles,sex]:(h4d32l1),[diseases,lifestyle,sex]:(h4d64l1)):(h4d32l2)",
             ATTN_SCHEME,
-            DelphiConfig(n_embd=32, domains=DOMAINS, block_size=32),
+            DelphiMultiStreamConfig(domains=DOMAINS, block_size=32),
         )
 
 
 # ── Model construction ────────────────────────────────────────────────────────
 
 def test_model_builds(model):
-    assert len(model.encoder_A) == 2
-    assert len(model.encoder_B) == 3
-    assert len(model.trunk)     == 2
+    assert model.n_streams == 2
+    assert len(model.encoders[0]) == 2
+    assert len(model.encoders[1]) == 3
+    assert len(model.trunk)       == 2
+
+
+def test_model_builds_3stream(model_3stream):
+    assert model_3stream.n_streams == 3
+    assert [len(enc) for enc in model_3stream.encoders] == [2, 2, 1]
 
 
 def test_at_birth_resolved(model):
@@ -157,10 +176,10 @@ def test_at_birth_resolved(model):
 
 def test_group_buffers(model):
     d2i = model.domain_to_int
-    assert d2i["hla_alleles"] in model._group_A_ids.tolist()
-    assert d2i["sex"]         in model._group_A_ids.tolist()
-    assert d2i["diseases"]    in model._group_B_ids.tolist()
-    assert d2i["sex"]         in model._group_B_ids.tolist()
+    assert d2i["hla_alleles"] in model.group_ids(0).tolist()
+    assert d2i["sex"]         in model.group_ids(0).tolist()
+    assert d2i["diseases"]    in model.group_ids(1).tolist()
+    assert d2i["sex"]         in model.group_ids(1).tolist()
 
 
 # ── Forward pass ──────────────────────────────────────────────────────────────
@@ -176,6 +195,14 @@ def test_forward_shapes(model, config):
     assert logits["diseases"].shape == (4, 32, VOCAB["diseases"])
 
 
+def test_forward_shapes_3stream(model_3stream):
+    batch = _make_batch(model_3stream, B=4, T=32)
+    model_3stream.eval()
+    with torch.no_grad():
+        logits, att = model_3stream(batch)
+    assert logits["diseases"].shape == (4, 32, VOCAB["diseases"])
+
+
 def test_no_nan_in_logits(model):
     batch = _make_batch(model, B=4, T=32)
     model.eval()
@@ -185,40 +212,22 @@ def test_no_nan_in_logits(model):
         assert not torch.isnan(lg).any(), f"NaN in logits[{name!r}]"
 
 
+def test_no_nan_in_logits_3stream(model_3stream):
+    batch = _make_batch(model_3stream, B=4, T=32)
+    model_3stream.eval()
+    with torch.no_grad():
+        logits, _ = model_3stream(batch)
+    for name, lg in logits.items():
+        assert not torch.isnan(lg).any(), f"NaN in logits[{name!r}] (3-stream)"
+
+
 def test_no_nan_in_masks(model):
     batch = _make_batch(model, B=2, T=32)
-    mask_A, mask_B, mask_x, mask_trunk = model._build_masks(batch)
-    for name, m in [("A", mask_A), ("B", mask_B), ("xattn", mask_x), ("trunk", mask_trunk)]:
-        assert not torch.isnan(m.float()).any(), f"NaN in mask_{name}"
-
-
-def test_xattn_mask_is_cross_group(model):
-    """Cross-attention mask must be zero for within-group pairs."""
-    batch = _make_batch(model, B=1, T=32)
-    _, _, mask_x, _ = model._build_masks(batch)
-    mask_x = mask_x.squeeze()   # [T, T]
-
-    d2i = model.domain_to_int
-    domain_ids = batch.domain_ids[0]   # [T]
-
-    is_A = torch.isin(domain_ids, model._group_A_ids)
-    is_B = torch.isin(domain_ids, model._group_B_ids)
-    is_A_only = is_A & ~is_B
-    is_B_only = is_B & ~is_A
-
-    # A-only tokens must not attend to other A-only tokens
-    for i in is_A_only.nonzero(as_tuple=True)[0]:
-        for j in is_A_only.nonzero(as_tuple=True)[0]:
-            if i != j:
-                assert mask_x[i, j].item() == 0, \
-                    f"A-only token {i} should not attend to A-only token {j} in cross-attn"
-
-    # B-only tokens must not attend to other B-only tokens
-    for i in is_B_only.nonzero(as_tuple=True)[0]:
-        for j in is_B_only.nonzero(as_tuple=True)[0]:
-            if i != j:
-                assert mask_x[i, j].item() == 0, \
-                    f"B-only token {i} should not attend to B-only token {j} in cross-attn"
+    masks, mask_trunk = model._build_masks(batch)
+    assert len(masks) == model.n_streams
+    for i, m in enumerate(masks):
+        assert not torch.isnan(m.float()).any(), f"NaN in mask_{i}"
+    assert not torch.isnan(mask_trunk.float()).any(), "NaN in mask_trunk"
 
 
 def test_return_attention(model):
@@ -226,9 +235,9 @@ def test_return_attention(model):
     model.eval()
     with torch.no_grad():
         logits, att = model(batch, return_attention=True)
-    # 1 cross-attn block + 2 trunk layers = 3 attention tensors
+    # one attention tensor per trunk layer
     assert att is not None
-    assert att.shape[0] == 1 + len(model.trunk)
+    assert att.shape[0] == len(model.trunk)
 
 
 def test_return_embeddings(model):
@@ -268,5 +277,22 @@ def test_backward_pass(model, config):
     loss.backward()
 
     for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            assert not torch.isnan(p.grad).any(), f"NaN gradient in {name}"
+
+
+def test_backward_pass_3stream(model_3stream):
+    """Gradients must flow through all stages with 3 encoder groups."""
+    batch  = _make_batch(model_3stream, B=2, T=32)
+    model_3stream.train()
+    logits, _ = model_3stream(batch)
+
+    lg = logits["diseases"]
+    B, T, V = lg.shape
+    targets = torch.randint(0, V, (B, T))
+    loss = model_3stream.cross_entropy_loss(lg, targets)
+    loss.backward()
+
+    for name, p in model_3stream.named_parameters():
         if p.requires_grad and p.grad is not None:
             assert not torch.isnan(p.grad).any(), f"NaN gradient in {name}"
