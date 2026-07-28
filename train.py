@@ -769,14 +769,22 @@ if __name__ == "__main__":
 
         # evaluate_aucs requires fixed T across all batches; swap collate to use
         # block_size=128 instead of "auto" so torch.cat on embeddings doesn't fail.
-        # tofix: 
-        auc_collate = copy.copy(dataloaders[2]._collate_fn)
+        # dataloaders[2] is a FlexibleDataLoader (fresh training) or a plain
+        # DataLoader (resumed via config_from_runid) — they store collate_fn/
+        # num_workers under different attribute names.
+        test_loader_src = dataloaders[2]
+        collate_fn = getattr(test_loader_src, "_collate_fn", None) or test_loader_src.collate_fn
+        num_workers = getattr(test_loader_src, "_num_workers", None)
+        if num_workers is None:
+            num_workers = test_loader_src.num_workers
+
+        auc_collate = copy.copy(collate_fn)
         auc_collate.block_size = 128
         test_loader = DataLoader(
-            dataloaders[2].dataset,
+            test_loader_src.dataset,
             batch_size=args.eval_batch_size,
             shuffle=False,
-            num_workers=dataloaders[2]._num_workers,
+            num_workers=num_workers,
             pin_memory=True,
             collate_fn=auc_collate,
         )
