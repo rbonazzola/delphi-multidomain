@@ -490,7 +490,9 @@ def get_dataloaders(
     )
 
     domain_dropout = {
-        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate, cfg.token_dropout_rate)
+        # group_key: domains inheriting dropout config from the same parent (e.g. per-locus
+        # HLA subdomains) share one block-drop draw per subject instead of dropping independently
+        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate, cfg.token_dropout_rate, cfg.parent or dname)
         for dname, cfg in domain_cfg.items()
         if cfg.dropout_mode is not None and cfg.dropout_rate > 0
     }
@@ -655,6 +657,12 @@ if __name__ == "__main__":
             "token_loss_alpha": args.token_loss_alpha,
             "token_loss_alpha_schedule": args.token_loss_alpha_schedule,
         }
+        for dname, cfg in domain_cfg.items():
+            if cfg.dropout_mode is not None and cfg.dropout_rate > 0:
+                logged_params[f"{dname}_dropout_mode"] = cfg.dropout_mode
+                logged_params[f"{dname}_dropout_rate"] = cfg.dropout_rate
+                if cfg.dropout_mode == "block_and_token":
+                    logged_params[f"{dname}_token_dropout_rate"] = cfg.token_dropout_rate
      
     else:
 

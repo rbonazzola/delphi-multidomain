@@ -986,7 +986,9 @@ class DelphiCollateFn:
         self.padding_domain_id = padding_domain_id
         self.no_event_token_id = no_event_token_id
         self.continuous_domains = continuous_domains or {}
-        # {domain_int: (mode, rate, token_rate)}  mode in {"token", "block", "block_and_token"}
+        # {domain_int: (mode, rate, token_rate, group_key)}  mode in {"token", "block", "block_and_token"}
+        # domains sharing the same group_key (e.g. per-locus HLA subdomains sharing a parent)
+        # share one block-drop Bernoulli draw per subject instead of dropping independently
         self.domain_dropout = domain_dropout or {}
         # {domain_int: (min_days, max_days)} — applied during training only
         self.age_jitter = age_jitter or {}
@@ -1062,7 +1064,8 @@ class DelphiCollateFn:
 
         # ── 2.5. Domain dropout (training only) ──────────────────────────
         if self.training and self.domain_dropout:
-            for d_int, (mode, rate, token_rate) in self.domain_dropout.items():
+            group_block_drop: Dict[str, torch.Tensor] = {}  # group_key -> [B] bool, shared block-drop draw
+            for d_int, (mode, rate, token_rate, group_key) in self.domain_dropout.items():
                 if rate <= 0.0 and token_rate <= 0.0:
                     continue
                 d_mask = domain_ids == d_int  # [B, T]
@@ -1073,9 +1076,11 @@ class DelphiCollateFn:
                     domain_ids[drop_mask] = self.padding_domain_id
                     local_token_ids[drop_mask] = self.PADDING_TOKEN
                 elif mode in ("block", "block_and_token"):
-                    block_drop = torch.bernoulli(
-                        torch.full((B,), rate, dtype=torch.float)
-                    ).bool()  # [B]
+                    if group_key not in group_block_drop:
+                        group_block_drop[group_key] = torch.bernoulli(
+                            torch.full((B,), rate, dtype=torch.float)
+                        ).bool()  # [B]
+                    block_drop = group_block_drop[group_key]
                     drop_mask = d_mask & block_drop.unsqueeze(1)
                     ages[drop_mask] = self.PADDING_AGE
                     domain_ids[drop_mask] = self.padding_domain_id

@@ -37,6 +37,9 @@ def simple_yaml(tmp_path):
           path: hla_alleles
           at_birth: true
           subdomain_column: locus
+          dropout_mode: block_and_token
+          dropout_rate: 0.3
+          token_dropout_rate: 0.1
 
         hla_a:
           parent: hla_alleles
@@ -103,6 +106,27 @@ class TestParentInheritance:
         cfg = load_domain_config(cfg_path, tokens_path)
         assert cfg["diseases"].predict is True
         assert cfg["diseases"].at_birth is False
+
+    def test_child_inherits_dropout_mode(self, simple_yaml):
+        cfg_path, tokens_path = simple_yaml
+        cfg = load_domain_config(cfg_path, tokens_path)
+        assert cfg["hla_a"].dropout_mode == "block_and_token"
+        assert cfg["hla_dp"].dropout_mode == "block_and_token"
+
+    def test_child_inherits_dropout_rate_and_token_dropout_rate(self, simple_yaml):
+        cfg_path, tokens_path = simple_yaml
+        cfg = load_domain_config(cfg_path, tokens_path)
+        for dname in ("hla_a", "hla_dp"):
+            assert cfg[dname].dropout_rate == 0.3
+            assert cfg[dname].token_dropout_rate == 0.1
+
+    def test_child_keeps_own_parent_name(self, simple_yaml):
+        """`.parent` must survive resolution — it's used as the dropout group key
+        so that sibling subdomains (e.g. per-locus HLA) share one block-drop draw."""
+        cfg_path, tokens_path = simple_yaml
+        cfg = load_domain_config(cfg_path, tokens_path)
+        assert cfg["hla_a"].parent == "hla_alleles"
+        assert cfg["hla_dp"].parent == "hla_alleles"
 
     def test_unknown_parent_raises(self, tmp_path):
         yaml_text = textwrap.dedent("""\
