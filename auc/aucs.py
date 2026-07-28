@@ -380,7 +380,7 @@ def evaluate_aucs(
     if n_jobs == 1:
         results = [process_disease(*a, block_size=block_size) for a in _auc_args]
     else:
-        results = Parallel(n_jobs=n_jobs, backend="loky")(
+        results = Parallel(n_jobs=n_jobs, backend="threading")(
             delayed(process_disease)(*a, block_size=block_size) for a in _auc_args
         )
 
