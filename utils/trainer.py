@@ -54,7 +54,15 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
 
     exp = mlflow.get_experiment_by_name(new_experiment_name)
     if exp is None:
-        exp_id = mlflow.create_experiment(new_experiment_name)
+        try:
+            exp_id = mlflow.create_experiment(new_experiment_name)
+        except mlflow.exceptions.MlflowException:
+            # Race: another concurrent process (e.g. a sibling array task) created
+            # an experiment with this name between our lookup and create() call.
+            exp = mlflow.get_experiment_by_name(new_experiment_name)
+            if exp is None:
+                raise
+            exp_id = exp.experiment_id
     else:
         exp_id = exp.experiment_id
 
@@ -153,12 +161,18 @@ class MLFlowLogger:
             self.start(nested=nested)
 
     def start(self, nested=False, resume_run_id=None):
-        mlflow.set_experiment(self.experiment_name)
         if self.active_run is None:
             if resume_run_id:
+                # run_id alone fully determines the experiment; skip set_experiment(name) —
+                # under concurrent array tasks, its own by-name lookup can race against a
+                # sibling task's experiment creation and resolve to a *different* experiment
+                # than the one this run actually belongs to, raising a spurious mismatch error.
                 self.active_run = mlflow.start_run(run_id=resume_run_id)
             else:
+                mlflow.set_experiment(self.experiment_name)
                 self.active_run = mlflow.start_run(run_name=self.run_name, nested=nested)
+        else:
+            mlflow.set_experiment(self.experiment_name)
         self.tracking_base = self._strip_file_prefix(mlflow.get_tracking_uri())
         return self.active_run
 
