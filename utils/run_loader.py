@@ -37,6 +37,7 @@ def reconstruct_from_run(
     birth_dates_file: str | None = None,
     device: str | None = None,
     tokens_path: Union[str, Path, None] = None,
+    domain_config_yaml: Union[str, Path, None] = None,
 ) -> tuple:
     """
     Reconstruct a trained Delphi model and dataloaders from an MLflow run.
@@ -83,7 +84,12 @@ def reconstruct_from_run(
         if metadata.get(key) is None:
             raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
 
-    domain_cfg = parse_domains_param(params["domains"])
+    if domain_config_yaml is not None:
+        from utils.utils import load_domain_config
+        tokens_root = Path(tokens_path) if tokens_path else DELPHI_DIR / "data" / "transforms" / "tokens"
+        domain_cfg = load_domain_config(domain_config_yaml, tokens_path=tokens_root)
+    else:
+        domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
 
     if tokens_path is not None:
         tokens_root = Path(tokens_path)
@@ -213,7 +219,7 @@ def reconstruct_model(run_id: str):
     test_ids = ckpt["metadata"]["test_ids"]
 
     cfg = infer_delphi_config_from_state_dict(weights)
-    domain_cfg = parse_domains_param(params["domains"])
+    domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
 
     tokens_dir = DELPHI_DIR / "data" / "transforms" / "tokens"
     for dname, dcfg in domain_cfg.items():
@@ -277,10 +283,10 @@ def config_from_runid(runid: str):
     except (ValueError, SyntaxError):
         runinfo.data.params["attention_scheme"] = [runinfo.data.params["attention_scheme"]]
 
-    runinfo.data.params["domains"] = parse_domains_param(runinfo.data.params["domains"])
+    runinfo.data.params["domains"] = parse_domains_param(runinfo.data.params["domains"], run_id=runid)
 
     for param, value in runinfo.data.params.items():
-        if "drop" in param:
+        if "drop" in param and not param.endswith("_mode"):
             runinfo.data.params[param] = float(value)
         if param in {"n_embd", "n_head", "n_layer", "block_size"}:
             runinfo.data.params[param] = int(value)
