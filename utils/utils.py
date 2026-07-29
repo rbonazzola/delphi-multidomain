@@ -137,3 +137,36 @@ def read_ids(path, type=int):
     )
 
 
+def read_disease_ids(path, metadata_path=None) -> list:
+    """
+    Read disease identifiers from a file (one per line; blank lines and '#'
+    comments — whole-line or trailing — are ignored). Each entry is either an
+    integer token_id, or an icd_code (e.g. "E11") matched case-insensitively
+    against metadata_path (the diseases domain's token_metadata.tsv).
+
+    Used to restrict fine-tuning loss to a disease subset (see finetune.py).
+    """
+    lines = Path(path).read_text().splitlines()
+    stripped = [l.split("#", 1)[0].strip() for l in lines]
+    entries = [l for l in stripped if l]
+
+    meta = None
+    token_ids = []
+    for entry in entries:
+        if entry.isdigit():
+            token_ids.append(int(entry))
+            continue
+        if meta is None:
+            if metadata_path is None:
+                raise ValueError(
+                    f"Non-numeric disease identifier {entry!r} in {path} requires "
+                    "metadata_path for icd_code lookup"
+                )
+            meta = pd.read_csv(metadata_path, sep="\t")
+        match = meta[meta["icd_code"].str.lower() == entry.lower()]
+        if match.empty:
+            raise ValueError(f"No disease found with icd_code={entry!r} (from {path}) in {metadata_path}")
+        token_ids.extend(match["token_id"].tolist())
+    return sorted(set(token_ids))
+
+

@@ -639,6 +639,16 @@ class Trainer(BaseTrainer):
             _print("Restored best model weights into model.")
 
 
+    def _extra_predict_mask(self, target_domain_ids, target_global_ids):
+        """
+        Hook for subclasses to further restrict which [B, T-1] positions
+        contribute to the loss, on top of the base predicted-domain/eval_mask
+        filtering already applied in shared_step. Return None (default) to
+        apply no additional restriction, or a boolean tensor shaped like
+        target_domain_ids.
+        """
+        return None
+
     def shared_step(self,
           batch, batch_idx, epoch,
           return_logits=False, return_att=False, stage="training", add_prefix=None
@@ -679,6 +689,12 @@ class Trainer(BaseTrainer):
             # Exclude post-cutoff tokens from loss when eval_mask is present
             if batch.eval_mask is not None:
                 predict_mask = predict_mask & ~batch.eval_mask[:, 1:]
+
+            # Subclass hook: let subclasses (e.g. FinetuneTrainer) further restrict
+            # which positions contribute to the loss, without touching this method.
+            extra_mask = self._extra_predict_mask(target_domain_ids, target_global_ids)
+            if extra_mask is not None:
+                predict_mask = predict_mask & extra_mask
 
             f_logits     = logits_cat[predict_mask]              # [N_pred, V_total]
             f_global_ids = target_global_ids[predict_mask]       # [N_pred]
