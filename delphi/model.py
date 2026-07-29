@@ -275,9 +275,10 @@ class AttentionMaskBuilder(nn.Module):
                 raise ValueError(f"Unknown attention type: {cfg['type']}")
 
         mask = mask.bool()
-        # Padding tokens have age == PADDING_AGE (-10000); no-event tokens share
-        # the padding domain but carry real positive ages, so age-based detection
-        # is more robust than checking local_token_ids (which may be global IDs).
+        # Padding tokens have age == PADDING_AGE (-10000); no_event tokens are a
+        # distinct domain but carry real positive ages, so age-based detection
+        # (rather than checking domain/local_token_ids) is what excludes only
+        # true padding filler here, leaving no_event tokens attendable.
         is_padding = ages < 0.0
         mask &= ~(is_padding.unsqueeze(2) | is_padding.unsqueeze(1))
         mask = mask.int()
@@ -457,8 +458,18 @@ class Delphi(nn.Module):
 
     @staticmethod
     def _build_domain_to_int(domain_names: List[str]) -> Dict[str, int]:
-        """Stable mapping: all domains except padding first, padding last."""
-        ordered = [d for d in domain_names if d != "padding"] + ["padding"]
+        """Stable mapping: all domains except padding/no_event first, then those two last.
+
+        padding and no_event are reserved pseudo-domains, always present
+        regardless of what's in config.domains: padding (id N-2) is the pure
+        filler token for unused sequence slots, never predictable. no_event
+        (id N-1) is the "an interval passed with no event" token inserted by
+        AgeSampler at collate time -- it is a distinct domain, so it can be
+        independently marked `predict: true` in the domain config YAML
+        without also making the literal padding filler predictable.
+        """
+        reserved = ("padding", "no_event")
+        ordered = [d for d in domain_names if d not in reserved] + list(reserved)
         return {name: i for i, name in enumerate(ordered)}
 
     @staticmethod
@@ -484,9 +495,9 @@ class Delphi(nn.Module):
             d_int = domain_to_int[dname]
             cfg = domain_cfg.get(dname)
 
-            if dname == "padding":
+            if dname in ("padding", "no_event"):
                 offsets[d_int] = running
-                running += 2  # PADDING_TOKEN=0, NO_EVENT_TOKEN=1
+                running += 1  # single slot each
             elif cfg is None:
                 offsets[d_int] = running
             elif cfg.type == "categorical" and cfg.projector in ("embed", "Embed", "pretrained"):

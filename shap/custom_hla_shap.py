@@ -134,7 +134,7 @@ def _make_collate(model):
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
     )
 

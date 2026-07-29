@@ -422,7 +422,7 @@ class DelphiDataset(Dataset):
         # ── Load raw domains ──────────────────────────────────────────────
         self.domains = EasyDict()
         for dname, dinfo in domains_cfg.items():
-            if dname == "padding":
+            if dname in ("padding", "no_event"):
                 continue
             # Use path from config (allows multiple domains to share the same data dir)
             datafile = Path(dinfo.path) if Path(dinfo.path).is_absolute() else self.root / "tokens" / dinfo.path
@@ -963,8 +963,9 @@ class DelphiCollateFn:
         {domain_name: offset} for computing global IDs.
         For projected domains, the offset points to placeholder (zero) embeddings.
     padding_domain_id : int
-    no_event_token_id : int
-        The local token ID for no-event tokens (typically 1).
+    no_event_domain_id : int
+        Domain ID for the reserved no_event pseudo-domain (single local
+        token, always 0).
     continuous_domains : dict[str, int]
         {domain_name: n_latent_tokens}
     """
@@ -979,7 +980,7 @@ class DelphiCollateFn:
         domain_to_int: Dict[str, int],
         domain_offsets: Dict[int, int],   # domain_int -> global offset
         padding_domain_id: int,
-        no_event_token_id: int = 1,
+        no_event_domain_id: int,
         continuous_domains: Optional[Dict[str, int]] = None,
         domain_dropout: Optional[Dict[int, tuple]] = None,
         age_jitter: Optional[Dict[int, tuple]] = None,
@@ -990,7 +991,7 @@ class DelphiCollateFn:
         self.domain_to_int = domain_to_int
         self.domain_offsets = domain_offsets
         self.padding_domain_id = padding_domain_id
-        self.no_event_token_id = no_event_token_id
+        self.no_event_domain_id = no_event_domain_id
         self.continuous_domains = continuous_domains or {}
         # {domain_int: (mode, rate, token_rate, group_key)}  mode in {"token", "block", "block_and_token"}
         # domains sharing the same group_key (e.g. per-locus HLA subdomains sharing a parent)
@@ -1065,8 +1066,8 @@ class DelphiCollateFn:
                 end = start + n
                 # These slots are currently padding; overwrite them
                 ages[b_idx, start:end] = b_ages
-                local_token_ids[b_idx, start:end] = self.no_event_token_id
-                domain_ids[b_idx, start:end] = self.padding_domain_id
+                local_token_ids[b_idx, start:end] = 0  # no_event's only local token
+                domain_ids[b_idx, start:end] = self.no_event_domain_id
 
         # ── 2.5. Domain dropout (training only) ──────────────────────────
         if self.training and self.domain_dropout:
@@ -1241,6 +1242,7 @@ def color_by_domain(row):
         "diseases": "background-color: #FFF5E5",
         "death": "background-color: #F5E5FF",
         "padding": "background-color: #F0F0F0",
+        "no_event": "background-color: #E0E0E0",
     }
     return [colors.get(row["domain_name"], "")] * len(row)
 
@@ -1475,12 +1477,12 @@ class DataModule:
         """Print a formatted table with dataset and loader stats per split."""
         import logging as _logging
 
-        # Collect all domain names across splits (excluding padding)
+        # Collect all domain names across splits (excluding padding/no_event)
         all_domains: List[str] = []
         for loader in [self.train, self.val, self.test]:
             ds = loader.dataset
             for dname in ds.domain_to_int:
-                if dname != "padding" and dname not in all_domains:
+                if dname not in ("padding", "no_event") and dname not in all_domains:
                     all_domains.append(dname)
 
         rows = []

@@ -188,7 +188,7 @@ collate = DelphiCollateFn(
     domain_to_int=domain_to_int,
     domain_offsets=domain_offsets,
     padding_domain_id=domain_to_int["padding"],
-    no_event_token_id=1,
+    no_event_domain_id=domain_to_int["no_event"],
     continuous_domains=continuous_domains,
 )
 
@@ -236,7 +236,7 @@ if is_padding.any():
     print(f"\nPadding token ages (should be -10000): min={padding_ages.min():.1f}, max={padding_ages.max():.1f}")
 
 # ── Check no-event tokens exist ──
-no_event_global_id = domain_offsets[domain_to_int["padding"]] + 1
+no_event_global_id = domain_offsets[domain_to_int["no_event"]]
 is_no_event = batch.global_token_ids == no_event_global_id
 print(f"No-event tokens in batch: {is_no_event.sum().item()}")
 if is_no_event.any():

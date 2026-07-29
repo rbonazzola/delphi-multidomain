@@ -194,8 +194,8 @@ class MultiDomainEmbedding(nn.Module):
         """Resolve and cache vocab size for every domain, once at init."""
         sizes = {}
         for dname, dcfg in domain_configs.items():
-            if dname == "padding":
-                sizes[dname] = 2
+            if dname in ("padding", "no_event"):
+                sizes[dname] = 1
             elif dcfg.input_size is not None:
                 sizes[dname] = dcfg.input_size
             else:
@@ -213,7 +213,7 @@ class MultiDomainEmbedding(nn.Module):
         n_embd = config.n_embd
 
         for dname, dcfg in config.domains.items():
-            if dname == "padding":
+            if dname in ("padding", "no_event"):
                 continue
 
             d_int = self.domain_to_int[dname]
@@ -427,7 +427,7 @@ class MultiDomainEmbedding(nn.Module):
     def __repr__(self):
         simple = [
             d for d in self.domain_configs
-            if d not in self._projected_domain_names and d != "padding"
+            if d not in self._projected_domain_names and d not in ("padding", "no_event")
         ]
         return (
             f"MultiDomainEmbedding(\n"

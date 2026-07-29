@@ -117,7 +117,7 @@ def print_config_rich(arch_str, attention_scheme, delphi_config, args, overrides
         return Text(str(value), style="bold yellow" if override_style else "")
 
     for name, dc in domains.items():
-        if name == "padding":
+        if name in ("padding", "no_event"):
             continue
         cells = []
         for c in cols:
@@ -229,7 +229,7 @@ def get_dataloaders(domain_cfg, model, args):
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
         domain_dropout=domain_dropout,
     )
@@ -384,10 +384,13 @@ if __name__ == "__main__":
     attention_scheme = _resolve_attention_scheme(args.attention_scheme)
 
     # ── Domain config ─────────────────────────────────────────────────────────
-    domains = [d for d in args.domains.split(",") if d != "padding"]
+    domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
     domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
     default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / "tokens")
-    domain_cfg = {k: v for k, v in default_cfg_per_domain.items() if k in domains or k == "padding"}
+    domain_cfg = {
+        k: v for k, v in default_cfg_per_domain.items()
+        if k in domains or k in ("padding", "no_event")
+    }
 
     missing = [k for k in domains if k not in default_cfg_per_domain]
     if missing:

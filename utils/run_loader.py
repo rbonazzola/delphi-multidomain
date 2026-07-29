@@ -94,7 +94,7 @@ def reconstruct_from_run(
     if tokens_path is not None:
         tokens_root = Path(tokens_path)
         for dname, dcfg in domain_cfg.items():
-            if dname == "padding" or not getattr(dcfg, "path", None):
+            if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
                 continue
             dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
 
@@ -158,7 +158,7 @@ def reconstruct_from_run(
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
         domain_dropout={},
         training=False,
@@ -223,7 +223,7 @@ def reconstruct_model(run_id: str):
 
     tokens_dir = DELPHI_DIR / "data" / "transforms" / "tokens"
     for dname, dcfg in domain_cfg.items():
-        if dname == "padding" or not getattr(dcfg, "path", None):
+        if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
             continue
         dcfg.path = str(tokens_dir / Path(str(dcfg.path)).name)
 
@@ -360,7 +360,7 @@ def config_from_runid(runid: str):
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
     )
 

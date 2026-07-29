@@ -202,7 +202,7 @@ def load_everything(domains_str, test_fold, block_size, no_event_token_rate, no_
         domain_to_int=domain_to_int,
         domain_offsets=domain_offsets,
         padding_domain_id=domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=domain_to_int["no_event"],
         continuous_domains=continuous_domains,
         age_jitter=age_jitter_config,
     )
@@ -290,9 +290,10 @@ def batch_subject_to_df(data, batch, batch_subject_idx):
 
         # Identify token type
         pad_offset = data.domain_offsets.get(data.domain_to_int["padding"], 0)
+        no_event_offset = data.domain_offsets.get(data.domain_to_int["no_event"], -1)
         if g_id == pad_offset:
             token_type = "padding"
-        elif g_id == pad_offset + 1:
+        elif g_id == no_event_offset:
             token_type = "no_event"
         else:
             token_type = "real"
@@ -745,7 +746,7 @@ def main():
             domain_to_int=data.domain_to_int,
             domain_offsets=data.domain_offsets,
             padding_domain_id=data.domain_to_int["padding"],
-            no_event_token_id=1,
+            no_event_domain_id=data.domain_to_int["no_event"],
             continuous_domains=data.continuous_domains,
             domain_dropout=dropout_config,
             age_jitter=data.collate.age_jitter if apply_age_jitter else {},

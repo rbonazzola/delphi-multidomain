@@ -55,8 +55,11 @@ def _load_raw_yaml(cfg_path: Path) -> dict:
 def load_domain_config(cfg_path, tokens_path):
     raw = _load_raw_yaml(Path(cfg_path))
 
-    # First pass: collect raw dicts (excluding padding)
-    raw_configs = {k: dict(v) for k, v in raw.items() if k != "padding" and v is not None}
+    # First pass: collect raw dicts (excluding padding/no_event reserved pseudo-domains)
+    raw_configs = {
+        k: dict(v) for k, v in raw.items()
+        if k not in ("padding", "no_event") and v is not None
+    }
 
     # Second pass: resolve parent inheritance
     for domain, params in raw_configs.items():
@@ -84,7 +87,16 @@ def load_domain_config(cfg_path, tokens_path):
             p["path"] = tokens_path / p["path"]
         cfg[domain] = DomainConfig(**p)
 
+    # padding is pure filler for unused sequence slots: never predictable.
     cfg["padding"] = DomainConfig(projector="embed")
+
+    # no_event is the "an interval passed with no event" token inserted by
+    # AgeSampler at collate time. It's a distinct reserved domain, so
+    # `predict` can be toggled for it independently of the (always
+    # unpredictable) padding filler.
+    no_event_raw = raw.get("no_event") or {}
+    cfg["no_event"] = DomainConfig(projector="embed", predict=bool(no_event_raw.get("predict", False)))
+
     return _normalize_domain_cfg(cfg)
 
 

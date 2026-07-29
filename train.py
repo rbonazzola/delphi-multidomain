@@ -125,7 +125,7 @@ def print_config_rich(delphi_config, args, overrides: list[str] | None = None) -
         return Text(str(value), style="bold yellow" if override_style else "")
 
     for name, dc in domains.items():
-        if name == "padding":
+        if name in ("padding", "no_event"):
             continue
         cells = []
         for c in cols:
@@ -211,7 +211,7 @@ def get_cli_args():
                         help="Override domain config fields, e.g. --dcfg diseases.predict=True hla.dropout_rate=0.1")
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex")
     parser.add_argument("--attention_scheme", "--attention-scheme", dest="attention_scheme",
-                        default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding]:causal(mask_ties=True)", nargs="+")
+                        default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding,no_event]:causal(mask_ties=True)", nargs="+")
     parser.add_argument("--n_layer", "--n-layer",       dest="n_layer", default=12,  type=int)
     parser.add_argument("--n_head",  "--n-head",        dest="n_head",  default=6,   type=int)
     parser.add_argument("--n_embd",  "--n-embd",        dest="n_embd",  default=120, type=int)
@@ -510,7 +510,7 @@ def get_dataloaders(
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
         domain_dropout=domain_dropout,
     )
@@ -550,14 +550,14 @@ if __name__ == "__main__":
             _raw = _raw[0] if len(set(_raw)) == 1 else None
         attention_scheme_alias = _raw if _raw in ATTENTION_SCHEMES else None
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
-        domains = [d for d in args.domains.split(",") if d != "padding"]
+        domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
         default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
 
         # Expand group aliases (e.g. "core" → ["diseases", "death", "lifestyle", "sex"])
         group_to_domains = {}
         for dname, dcfg in default_cfg_per_domain.items():
-            if dname == "padding" or dcfg.group is None:
+            if dname in ("padding", "no_event") or dcfg.group is None:
                 continue
             group_to_domains.setdefault(dcfg.group, []).append(dname)
         expanded = []
@@ -565,7 +565,10 @@ if __name__ == "__main__":
             expanded.extend(group_to_domains[d] if d in group_to_domains and d not in default_cfg_per_domain else [d])
         domains = list(dict.fromkeys(expanded))  # deduplicate, preserve order
 
-        domain_cfg = {k: v for k, v in default_cfg_per_domain.items() if k in domains or k == "padding"}
+        domain_cfg = {
+            k: v for k, v in default_cfg_per_domain.items()
+            if k in domains or k in ("padding", "no_event")
+        }
 
         if args.domain_config_overrides:
             apply_domain_overrides(domain_cfg, args.domain_config_overrides)
@@ -732,6 +735,9 @@ if __name__ == "__main__":
 
     n_params = sum(p.numel() for p in model.parameters())
     logged_params["n_params"] = n_params
+
+    diseases_cfg = model.config.domains.get("diseases")
+    logged_params["disease_no_repeat"] = bool(diseases_cfg.no_repeat) if diseases_cfg is not None else False
 
     dataloaders.log_info()
     logged_params["n_train"] = dataloaders.n_train
