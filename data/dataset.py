@@ -462,9 +462,15 @@ class DelphiDataset(Dataset):
         subject_set = set(subject_df.subject_id.tolist())
 
         # ── Filter domains ────────────────────────────────────────────────
+        # Only domains actually required to be present are asserted non-empty:
+        # for small ad hoc subject subsets (e.g. SHAP counterfactual case/donor
+        # pools), it's normal for a low-prevalence domain like "death" to have
+        # zero events even though the domain is configured and used elsewhere.
+        # _build_cache already skips empty domains gracefully (see below).
         for dname in self.domains:
             self.domains[dname].filter_subjects(subject_set)
-            assert len(self.domains[dname]) > 0, f"Domain '{dname}' has no tokens after filtering."
+            if dname in required_domains:
+                assert len(self.domains[dname]) > 0, f"Domain '{dname}' has no tokens after filtering."
 
         # ── Build subject index ───────────────────────────────────────────
         self._subject_indices = self._precompute_subject_indices()

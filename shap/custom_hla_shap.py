@@ -202,7 +202,12 @@ def get_tokens_df_cached(model, test_ids, run_id, cache_dir=None):
 
     if cache_dir is not None:
         print(f"Caching tokens_df at {cache_file}")
-        tokens_df.to_parquet(cache_file)
+        # Write to a per-process temp file then atomically rename, so concurrent
+        # array tasks racing on the same cache_file never observe a partially
+        # written (corrupt) parquet file.
+        tmp_file = cache_file.with_suffix(f".tmp{os.getpid()}.parquet")
+        tokens_df.to_parquet(tmp_file)
+        os.replace(tmp_file, cache_file)
 
     return tokens_df
 
@@ -236,16 +241,25 @@ def disease_prev_logits_from_embeddings(model, h, batch, disease_domain, disease
     return logits[b_idx, t_prev], torch.stack([b_idx, t_prev], dim=1)
 
 
-def inject_hla_item(item_rec, item_don, hla_domain_int, padding_domain_id, padding_age=-10000.0):
-    """Return a copy of item_rec with its HLA tokens replaced by those of item_don."""
+def inject_hla_item(item_rec, item_don, hla_domain_ints, padding_domain_id, padding_age=-10000.0):
+    """Return a copy of item_rec with its HLA tokens replaced by those of item_don.
+
+    hla_domain_ints may be a single domain int (merged "hla_alleles" domain) or a
+    set of domain ints (per-locus HLA layout, e.g. ESM2 configs with hla_a/hla_b/...).
+    """
     rec_real = int(item_rec["real_count"])
     don_real = int(item_don["real_count"])
 
     rec_doms = item_rec["domain_ids"][:rec_real]
     don_doms = item_don["domain_ids"][:don_real]
 
-    rec_hla = rec_doms == hla_domain_int
-    don_hla = don_doms == hla_domain_int
+    if isinstance(hla_domain_ints, (set, frozenset, list, tuple)):
+        hla_ints_t = torch.tensor(sorted(hla_domain_ints), dtype=rec_doms.dtype)
+        rec_hla = torch.isin(rec_doms, hla_ints_t)
+        don_hla = torch.isin(don_doms, hla_ints_t)
+    else:
+        rec_hla = rec_doms == hla_domain_ints
+        don_hla = don_doms == hla_domain_ints
 
     non_hla_dom = rec_doms[~rec_hla]
     non_hla_tok = item_rec["local_token_ids"][:rec_real][~rec_hla]
@@ -297,12 +311,72 @@ def build_hla_allele_counts(tokens_df: pd.DataFrame) -> pd.DataFrame:
     Count HLA allele copies per subject without deduplication.
     Returns a DataFrame with columns: subject_id, token_id, n_copies.
     n_copies is 1 for heterozygous carriers and 2 for homozygous carriers.
+
+    Only supports models storing HLA as a single merged "hla_alleles" domain.
+    For per-locus HLA layouts (ESM2 configs: hla_a/hla_b/hla_c/hla_drb/...),
+    use build_hla_allele_counts_global instead.
     """
     return (
         tokens_df.query('domain == "hla_alleles"')[["subject_id", "token_id"]]
         .groupby(["subject_id", "token_id"])
         .size()
         .reset_index(name="n_copies")
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  Per-locus HLA domain support (ESM2 configs split HLA into hla_a/hla_b/...
+#  domains, each with its own locus-local token-id space, instead of one
+#  merged "hla_alleles" domain — see config/domain_config_hla_esm2.yaml).
+#  --allele_id / --hla_allele always refer to the GLOBAL id (index into
+#  hla_tokenizer / data/transforms/tokens/hla_alleles/tokenizer.yaml); the
+#  helpers below translate to/from each locus's local id space.
+# --------------------------------------------------------------------------- #
+
+def _load_hla_locus_map() -> pd.DataFrame:
+    """Global token_id -> (locus, local_id). local_id mirrors the remapping
+    TokenDomain applies when subdomain-filtering (sorted by global token_id
+    within each locus, 0-indexed)."""
+    meta = pd.read_csv(DELPHI_DIR / "data/transforms/tokens/hla_alleles/token_metadata.tsv", sep="\t")
+    meta = meta.sort_values(["locus", "token_id"]).copy()
+    meta["local_id"] = meta.groupby("locus").cumcount()
+    return meta.set_index("token_id")[["locus", "local_id"]]
+
+
+def get_hla_domain_ints(model) -> set:
+    """Domain ints to treat as 'the HLA block' for this model: either the
+    single merged hla_alleles domain, or all per-locus hla_* domains."""
+    if "hla_alleles" in model.domain_to_int:
+        return {model.domain_to_int["hla_alleles"]}
+    loci = model.embed._pretrained_domain_names
+    return {model.domain_to_int[d] for d in loci if d in model.domain_to_int}
+
+
+def build_hla_allele_counts_global(tokens_df: pd.DataFrame, model, locus_map: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count HLA allele copies per subject, in the GLOBAL token-id space
+    (matching hla_tokenizer / --allele_id), regardless of whether the model
+    stores HLA as one merged domain or per-locus domains.
+    """
+    if "hla_alleles" in model.domain_to_int:
+        return build_hla_allele_counts(tokens_df)
+
+    loci = model.embed._pretrained_domain_names
+    sub = tokens_df[tokens_df["domain"].isin(loci)][["subject_id", "domain", "token_id"]].copy()
+    local_to_global = (
+        locus_map.reset_index()
+        .set_index(["locus", "local_id"])["token_id"]
+    )
+    sub["global_id"] = local_to_global.reindex(
+        pd.MultiIndex.from_arrays([sub["domain"], sub["token_id"]])
+    ).values
+    sub = sub.dropna(subset=["global_id"])
+    sub["global_id"] = sub["global_id"].astype(int)
+    return (
+        sub.groupby(["subject_id", "global_id"])
+        .size()
+        .reset_index(name="n_copies")
+        .rename(columns={"global_id": "token_id"})
     )
 
 
@@ -387,7 +461,8 @@ def compute_delta_for_run(
       donor_require_id_groups: list of allele-id lists, each group must be
       carried with donor_zygosity — AND logic across groups.
     """
-    hla_counts = build_hla_allele_counts(tokens_df)
+    locus_map = None if "hla_alleles" in model.domain_to_int else _load_hla_locus_map()
+    hla_counts = build_hla_allele_counts_global(tokens_df, model, locus_map)
     gf = GenotypeFilter(hla_counts)
 
     # --- case selection ---
@@ -438,7 +513,7 @@ def compute_delta_for_run(
         block_size=96,
     )
 
-    hla_domain_int = model.domain_to_int["hla_alleles"]
+    hla_domain_ints = get_hla_domain_ints(model)
     padding_domain_id = model.domain_to_int["padding"]
     collate = _make_collate(model)
 
@@ -481,7 +556,7 @@ def compute_delta_for_run(
                 don_items.append(donor_dataset[donor_dataset._sid_to_idx[don_sid]])
 
             modified_items = [
-                inject_hla_item(r, d, hla_domain_int, padding_domain_id)
+                inject_hla_item(r, d, hla_domain_ints, padding_domain_id)
                 for r, d in zip(rec_items, don_items)
             ]
             batch_sw = collate(modified_items).to(device)
