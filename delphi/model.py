@@ -767,6 +767,127 @@ class Delphi(nn.Module):
 
         return logits
 
+    @torch.no_grad()
+    def generate(
+        self,
+        batch: "DelphiBatch",
+        max_new_tokens: int = 100,
+        max_age: float = 85 * 365.25,
+        termination_domain: Optional[str] = "death",
+        apply_no_repeat: bool = True,
+    ) -> "DelphiBatch":
+        """
+        Autoregressively extend `batch` with sampled future events.
+
+        Matches the competing-exponential-risks process implied by
+        `time_to_event_loss`: at each step, every class across all
+        predicted domains gets an independent candidate time-to-event
+        sampled from Exponential(rate=exp(logit)) via inverse-CDF
+        (t = -exp(-logit) * log(U)); the minimum-time class wins and
+        becomes the next real event, at age + t.
+
+        Only predicted domains are grown -- `at_birth` conditioning
+        domains (sex, genetic_pcs, ...) are taken from `batch` as-is and
+        never regenerated, since they're not part of the sampled softmax
+        unless explicitly marked `predict: true`. A row stops advancing
+        once it samples a token from `termination_domain` (e.g. "death")
+        or its next sampled age would exceed `max_age`; positions from
+        that point on are set back to padding, matching the dataset's own
+        convention (domain=padding, token=0, age=-10000).
+
+        The full growing sequence is used as context at every step (no
+        block_size cropping), since cropping to the last N positions
+        could silently drop at_birth conditioning tokens near the start
+        of the sequence. Keep `max_new_tokens` reasonable accordingly.
+        """
+        from data.dataset import DelphiBatch
+
+        device = self.device
+        batch = batch.to(device)
+
+        global_token_ids = batch.global_token_ids.clone()
+        domain_ids = batch.domain_ids.clone()
+        ages = batch.ages.clone()
+        B = batch.batch_size
+
+        padding_int = self.domain_to_int["padding"]
+        term_int = self.domain_to_int[termination_domain] if termination_domain else None
+
+        # Rows whose conditioning sequence already ended (already contains
+        # the termination token, or is already past max_age) generate nothing.
+        terminated = ages.max(dim=1).values > max_age
+        if term_int is not None:
+            terminated = terminated | (domain_ids == term_int).any(dim=1)
+
+        # Precompute, once, the mapping from a slot in the concatenated
+        # predicted-domain softmax back to (domain_int, global offset).
+        predicted_domains = self.predicted_domains
+        vocab_sizes = [self.embed._domain_vocab_sizes[d] for d in predicted_domains]
+        boundaries = [0]
+        for v in vocab_sizes:
+            boundaries.append(boundaries[-1] + v)
+        boundaries_t = torch.tensor(boundaries, device=device)
+        domain_int_per_slot = torch.tensor(
+            [self.domain_to_int[d] for d in predicted_domains], device=device
+        )
+        offset_per_slot = torch.tensor(
+            [self.domain_offsets[self.domain_to_int[d]] for d in predicted_domains], device=device
+        )
+
+        for _ in range(max_new_tokens):
+            if terminated.all():
+                break
+
+            cur_batch = DelphiBatch(
+                global_token_ids=global_token_ids,
+                domain_ids=domain_ids,
+                ages=ages,
+                subject_ids=batch.subject_ids,
+                continuous_data=batch.continuous_data,
+                continuous_positions=batch.continuous_positions,
+                eval_mask=None,
+            )
+            logits_dict, _ = self(cur_batch)
+            if apply_no_repeat:
+                logits_dict = mask_seen_token_logits(self, cur_batch, logits_dict)
+
+            last_logits = torch.cat(
+                [logits_dict[d][:, -1, :] for d in predicted_domains], dim=-1
+            )  # [B, V_total]
+
+            # Competing exponentials: sample a candidate time per class,
+            # the minimum wins (both which class, and when it happens).
+            u = torch.rand_like(last_logits).clamp_min(1e-12)
+            t_candidate = -torch.exp(-last_logits) * u.log()
+            t_next, winner = t_candidate.min(dim=-1)  # [B], [B]
+
+            dom_slot = torch.bucketize(winner, boundaries_t[1:], right=True)
+            new_domain_ids_raw = domain_int_per_slot[dom_slot]
+            new_global_ids_raw = offset_per_slot[dom_slot] + (winner - boundaries_t[dom_slot])
+            new_ages_raw = ages[:, -1] + t_next
+
+            should_pad = terminated | (new_ages_raw > max_age)
+            new_global_ids = torch.where(should_pad, torch.zeros_like(new_global_ids_raw), new_global_ids_raw)
+            new_domain_ids = torch.where(should_pad, torch.full_like(new_domain_ids_raw, padding_int), new_domain_ids_raw)
+            new_ages = torch.where(should_pad, torch.full_like(new_ages_raw, -10000.0), new_ages_raw)
+
+            global_token_ids = torch.cat([global_token_ids, new_global_ids.unsqueeze(1)], dim=1)
+            domain_ids = torch.cat([domain_ids, new_domain_ids.unsqueeze(1)], dim=1)
+            ages = torch.cat([ages, new_ages.unsqueeze(1)], dim=1)
+
+            just_terminated = (new_domain_ids == term_int) if term_int is not None else should_pad
+            terminated = terminated | just_terminated | should_pad
+
+        return DelphiBatch(
+            global_token_ids=global_token_ids,
+            domain_ids=domain_ids,
+            ages=ages,
+            subject_ids=batch.subject_ids,
+            continuous_data=batch.continuous_data,
+            continuous_positions=batch.continuous_positions,
+            eval_mask=None,
+        )
+
     # ── Checkpoint loading ────────────────────────────────────────────────
 
     @classmethod
