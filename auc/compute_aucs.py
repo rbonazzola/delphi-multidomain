@@ -4,8 +4,27 @@ Standalone AUC evaluation script.
 Loads a trained model from an MLflow run_id (using best_model.pt),
 reconstructs the test dataloader, and computes AUCs.
 
+By default, evaluates on the run's own stored test split (the model's
+training cohort). Two optional overrides let you evaluate on a different
+cohort instead:
+
+  --tokens_dir  Load domain tokens from this folder instead of wherever the
+                run's own config points -- each domain's data must live under
+                <tokens_dir>/<domain_name>/ (tokens.csv + tokenizer.yaml),
+                sharing the same vocabulary the model was trained with (e.g.
+                a synthetic cohort, or another held-out dataset).
+  --subjects    Restrict to these subject_ids instead of the run's own
+                stored test_ids -- a file with one id per line (see
+                utils.utils.read_ids).
+
 Usage:
     python compute_aucs.py --runid <mlflow_run_id> [--block_size 128] [--batch_size 512] [--n_jobs 8]
+
+    # Evaluate on a different cohort's tokens, restricted to a subject list
+    python compute_aucs.py --runid <mlflow_run_id> \\
+        --tokens_dir transforms/tokens_synthetic \\
+        --subjects data/transforms/subject_lists/some_ids.csv \\
+        --output_file aucs_custom.csv
 """
 
 import os
@@ -48,6 +67,12 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--n_jobs", type=int, default=8, help="Parallel jobs for AUC computation")
     parser.add_argument("--output_file", type=str, default="aucs.csv")
+    parser.add_argument("--tokens_dir", type=str, default=None,
+                        help="Load domain tokens from this folder instead of the run's own "
+                             "config (each domain under <tokens_dir>/<domain_name>/)")
+    parser.add_argument("--subjects", type=str, default=None,
+                        help="Path to a subject ids file, to evaluate on instead of the "
+                             "run's own stored test split")
     args = parser.parse_args()
 
     model, loaders, run_params = reconstruct_from_run(
@@ -56,6 +81,8 @@ def main():
         block_size=args.block_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        tokens_path=args.tokens_dir,
+        subjects=args.subjects,
     )
     test_loader = loaders["test"]
 

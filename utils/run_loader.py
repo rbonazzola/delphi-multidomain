@@ -38,6 +38,7 @@ def reconstruct_from_run(
     device: str | None = None,
     tokens_path: Union[str, Path, None] = None,
     domain_config_yaml: Union[str, Path, None] = None,
+    subjects: Union[str, Path, list, None] = None,
 ) -> tuple:
     """
     Reconstruct a trained Delphi model and dataloaders from an MLflow run.
@@ -53,6 +54,15 @@ def reconstruct_from_run(
     date_cutoff : ISO date "YYYY-MM-DD" forwarded to DelphiDataset for eval_mask.
     birth_dates_file : Path to TSV (eid, year, month) used with date_cutoff.
     device : Target device; defaults to $DEVICE env var or auto-detect.
+    tokens_path : If given, rewrite every domain's data path to
+                  `tokens_path/<domain_name>` instead of wherever the run's
+                  own config points -- e.g. to evaluate on a different cohort
+                  (synthetic subjects, a held-out dataset) sharing the same
+                  vocabulary/tokenizer.yaml layout.
+    subjects : If given, use these subject_ids instead of the run's own
+               stored split (checkpoint metadata's train_ids/valid_ids/
+               test_ids) -- a list of ints, or a path to an ids file (read via
+               utils.utils.read_ids). Applied to every split in `split`.
 
     Returns
     -------
@@ -79,20 +89,31 @@ def reconstruct_from_run(
     ckpt = torch.load(ckpt_path, map_location="cpu")
     metadata = ckpt.get("metadata", {})
 
-    for s in splits:
-        key = _SPLIT_TO_METADATA_KEY[s]
-        if metadata.get(key) is None:
-            raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
+    if subjects is not None:
+        if isinstance(subjects, (str, Path)):
+            from utils.utils import read_ids
+            subject_override = sorted(read_ids(subjects))
+        else:
+            subject_override = list(subjects)
+    else:
+        subject_override = None
+        for s in splits:
+            key = _SPLIT_TO_METADATA_KEY[s]
+            if metadata.get(key) is None:
+                raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
 
     if domain_config_yaml is not None:
         from utils.utils import load_domain_config
-        tokens_root = Path(tokens_path) if tokens_path else DELPHI_DIR / "data" / "transforms" / "tokens"
+        tokens_root = Path(tokens_path).resolve() if tokens_path else DELPHI_DIR / "data" / "transforms" / "tokens"
         domain_cfg = load_domain_config(domain_config_yaml, tokens_path=tokens_root)
     else:
         domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
 
     if tokens_path is not None:
-        tokens_root = Path(tokens_path)
+        # Must be absolute: DelphiDataset only uses a domain's `path` as-is when
+        # it's absolute, otherwise it re-joins it under root/"tokens"/... -- a
+        # relative tokens_path here would silently double that prefix.
+        tokens_root = Path(tokens_path).resolve()
         for dname, dcfg in domain_cfg.items():
             if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
                 continue
@@ -166,13 +187,13 @@ def reconstruct_from_run(
 
     loaders: dict[str, DataLoader] = {}
     for s in splits:
-        subjects = metadata[_SPLIT_TO_METADATA_KEY[s]]
+        split_subjects = subject_override if subject_override is not None else metadata[_SPLIT_TO_METADATA_KEY[s]]
         dataset = DelphiDataset(
             root=str(root_path),
             domains_cfg=domain_cfg,
             domain_to_int=model.domain_to_int,
             block_size=bs,
-            subjects=subjects,
+            subjects=split_subjects,
             exclusions=[],
             required_domains=["diseases"],
             no_event_token_rate=delphi_config.no_event_token_rate,
