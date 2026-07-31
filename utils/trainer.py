@@ -23,6 +23,45 @@ import json
 from delphi.model import mask_seen_token_logits
 
 
+def time_to_next_distinct_age(ages: torch.Tensor) -> torch.Tensor:
+    """
+    For each position, time until the next position with a strictly greater
+    age -- skipping over any immediately-following same-age ties (e.g.
+    several diagnoses coded on the same hospital admission date).
+
+    Ports `mask_ties`'s "use time from last untied token" behavior from
+    delphi/legacy/model.py::time_to_event_loss to the refactored trainer.
+    Without this, the raw immediate gap is 0 for tied positions -- real UKB
+    diseases data has same-day pairs ~26% of the time -- training the
+    exponential-hazard time loss to reproduce near-zero gaps this often,
+    which manifests at generation time as a runaway hazard-acceleration
+    spiral once several diseases have accumulated in context.
+
+    Falls back to the raw immediate-next gap at the last position (or when
+    no strictly-greater age exists ahead, e.g. a trailing tied block) since
+    there's nothing better to target there.
+    """
+    B, T = ages.shape
+    idx = torch.arange(T, device=ages.device).unsqueeze(0).expand(B, T)
+    is_boundary = torch.cat([
+        torch.ones(B, 1, dtype=torch.bool, device=ages.device),
+        ages[:, 1:] != ages[:, :-1],
+    ], dim=1)
+    boundary_idx = idx.masked_fill(~is_boundary, T)  # T = sentinel, no boundary here
+    suffix_min = torch.flip(torch.cummin(torch.flip(boundary_idx, dims=[1]), dim=1).values, dims=[1])
+    # next boundary strictly after position t (exclude t itself)
+    next_boundary = torch.cat(
+        [suffix_min[:, 1:], torch.full((B, 1), T, dtype=torch.long, device=ages.device)], dim=1
+    )
+
+    has_next = next_boundary < T
+    next_distinct_age = torch.gather(ages, 1, next_boundary.clamp(max=T - 1))
+
+    fallback_next_age = torch.cat([ages[:, 1:], ages[:, -1:]], dim=1)
+    next_age = torch.where(has_next, next_distinct_age, fallback_next_age)
+    return next_age - ages
+
+
 def lod2dol(lod):
     """
     Convert list of dicts -> dict of lists.
@@ -672,7 +711,6 @@ class Trainer(BaseTrainer):
             # ── Build targets from the batch ──────────────────────────────
             target_global_ids = batch.global_token_ids[:, 1:]    # [B, T-1]
             target_domain_ids = batch.domain_ids[:, 1:]          # [B, T-1]
-            input_ages        = batch.ages[:, :-1]               # [B, T-1]
             target_ages       = batch.ages[:, 1:]                # [B, T-1]
 
             # Concatenate logits from all predicted domains → [B, T, sum(vocab_sizes)]
@@ -718,7 +756,11 @@ class Trainer(BaseTrainer):
             )
 
             # ── Time-to-event loss ────────────────────────────────────────
-            age_diff = (target_ages - input_ages)[predict_mask]
+            # Tie-aware gap: time to the next position with a strictly
+            # greater age, not the raw immediate-next gap (see
+            # time_to_next_distinct_age docstring for why this matters).
+            tie_aware_gaps = time_to_next_distinct_age(batch.ages)[:, :-1]  # [B, T-1]
+            age_diff = tie_aware_gaps[predict_mask]
             pos_weights = self._token_weights[f_targets] if self._token_weights is not None else None
             time_loss = model.time_to_event_loss(
                 f_logits, age_diff, t_min=1e-1, agg='mean', pos_weights=pos_weights
