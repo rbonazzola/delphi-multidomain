@@ -546,125 +546,6 @@ class DelphiDataset(Dataset):
                     events[dname] = torch.empty(0, 3, dtype=torch.float32)
         return events
 
-    def _build_cache_slow(self, subject_set: set, block_size: int, no_event_token_rate: float):
-        """
-        Original Python-loop implementation of _build_cache (kept for reference/benchmarking).
-        """
-        sorted_subjects = sorted(subject_set)
-        N = len(sorted_subjects)
-
-        domain_ids = torch.full((N, block_size), self.padding_domain_id, dtype=torch.long)
-        local_token_ids = torch.full((N, block_size), self.PADDING_TOKEN, dtype=torch.long)
-        ages = torch.full((N, block_size), self.PADDING_AGE, dtype=torch.float32)
-        real_counts = torch.zeros(N, dtype=torch.long)
-        max_ages_vec = torch.zeros(N, dtype=torch.float32)
-        subject_id_vec = torch.tensor(sorted_subjects, dtype=torch.long)
-
-        # For continuous domains: store raw values separately
-        continuous_cache = {}
-        for cd_name, n_latent in self.continuous_domains.items():
-            continuous_cache[cd_name] = torch.zeros(N, self.domain_configs[cd_name].input_size, dtype=torch.float32)
-
-        step = no_event_token_rate * DAYS_PER_YEAR
-
-        # Pre-compute column indices per domain (avoid repeated lookups)
-        domain_col_indices = {}
-        for dname, dom in self.domains.items():
-            cols = dom._as_dataframe.columns.tolist()
-            domain_col_indices[dname] = {
-                "age": cols.index("age"),
-                "token_id": cols.index("token_id") if "token_id" in cols else None,
-                "value": cols.index("value") if "value" in cols else None,
-            }
-
-        truncation_count = 0
-        min_real_tokens = float("inf")
-        max_real_tokens = 0
-
-        for i, sid in enumerate(sorted_subjects):
-            events = self._get_subject_events(sid)
-
-            # Collect all tokens for this subject into a flat list
-            tokens_list = []  # list of (domain_id, local_token_id, age)
-
-            for dname, ev in events.items():
-                if ev.numel() == 0:
-                    continue
-                d_id = self.domain_to_int[dname]
-                dcfg = self.domain_configs[dname]
-                cidx = domain_col_indices[dname]
-
-                if dcfg.type == "continuous":
-                    # ev has shape [input_size, n_cols] where each row is
-                    # one component: (subject_id, token_id, value, age)
-                    if ev.shape[0] > 0:
-                        continuous_cache[dname][i] = ev[:, cidx["value"]]
-                        age_val = float(ev[0, cidx["age"]])
-                        n_latent = self.continuous_domains.get(dname, 1)
-                        for lt in range(n_latent):
-                            tokens_list.append((d_id, 0, age_val))
-                else:
-                    for row_idx in range(ev.shape[0]):
-                        age_val = float(ev[row_idx, cidx["age"]])
-                        if age_val < 0:
-                            continue  # skip tokens with negative ages
-                        tok_val = int(ev[row_idx, cidx["token_id"]])
-                        tokens_list.append((d_id, tok_val, age_val))
-
-            n_real = len(tokens_list)
-
-            # Compute max age from age_domains
-            max_age = -float("inf")
-            for ad in self.age_domains:
-                if ad in events and events[ad].numel() > 0:
-                    age_col = domain_col_indices[ad]["age"]
-                    max_age = max(max_age, float(events[ad][:, age_col].max()))
-            if max_age == -float("inf"):
-                max_age = 0.0
-
-            # Track truncation stats
-            if step > 0:
-                max_noevents = int(max_age // step)
-                total_needed = n_real + max_noevents
-                if total_needed > block_size:
-                    truncation_count += 1
-                    min_real_tokens = min(min_real_tokens, n_real)
-                    max_real_tokens = max(max_real_tokens, n_real)
-
-            # Sort by (age, domain_id)
-            tokens_list.sort(key=lambda t: (t[2], t[0]))
-
-            # Fill cache (truncate to block_size if necessary)
-            n_fill = min(n_real, block_size)
-            for j in range(n_fill):
-                domain_ids[i, j] = tokens_list[j][0]
-                local_token_ids[i, j] = tokens_list[j][1]
-                ages[i, j] = tokens_list[j][2]
-
-            real_counts[i] = n_fill
-            max_ages_vec[i] = max_age
-
-        # Summary warning for truncated subjects
-        if truncation_count > 0:
-            warnings.warn(
-                f"{truncation_count}/{N} subjects will have no-event tokens truncated "
-                f"(block_size={block_size}, real tokens range: "
-                f"{min_real_tokens}–{max_real_tokens}).",
-                UserWarning,
-            )
-
-        # Store everything
-        self._domain_ids = domain_ids
-        self._local_token_ids = local_token_ids
-        self._ages = ages
-        self._real_counts = real_counts
-        self._max_ages = max_ages_vec
-        self._subject_ids = subject_id_vec
-        self._continuous_cache = continuous_cache
-
-        # Build subject_id -> index mapping
-        self._sid_to_idx = {int(sid): i for i, sid in enumerate(sorted_subjects)}
-
     def _build_cache(
         self,
         subject_set: set,
@@ -683,8 +564,8 @@ class DelphiDataset(Dataset):
         4. Scatter into the [N, block_size] result tensors in one assignment.
         5. Compute per-subject max_age with np.maximum.at (one pass per age-domain).
 
-        Continuous domains are still handled per-subject (same as _build_cache_slow)
-        because they are typically absent or very small.
+        Continuous domains are still handled per-subject because they are
+        typically absent or very small.
         """
         sorted_subjects    = sorted(subject_set)
         N                  = len(sorted_subjects)
