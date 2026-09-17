@@ -216,6 +216,17 @@ class TokenDomain:
 
         df = pd.read_csv(path)
 
+        if df.empty:
+          warnings.warn(
+            f"Tokens file {path} is empty (0 rows). Type: '{self.type}'.",
+            UserWarning,
+          )
+          for col in df.columns:
+            if col in ("subject_id", "token_id", "age"):
+                df[col] = df[col].astype("int64")
+            elif col == "value":
+                df[col] = df[col].astype("float64")
+
         if "subject_id" not in df.columns:
             raise ValueError(f"tokens file {path} must contain subject_id")
         if self.type == "categorical" and "token_id" not in df.columns:
@@ -248,7 +259,6 @@ class TokenDomain:
         # Always store on CPU
         return torch.tensor(df.values)
 
-    # ---- filtering -----------------------------------------------------------
 
     def filter_subjects(self, subjects: set) -> "TokenDomain":
         isin = self._as_dataframe.subject_id.isin(subjects).values
