@@ -214,13 +214,79 @@ def get_run_setup_for_run(run_id: str) -> RunSetup:
     return get_run_setup(load_run_params(run_id))
 
 
+
 def get_checkpoint_path(run_id: str) -> Path:
     """
     Return best_model.pt for a run, falling back to the highest-epoch checkpoint.
     Prefers best_model.pt (lowest validation loss) over the latest epoch.
     """
-    artifact_uri = mlflow.get_run(run_id).info.artifact_uri
-    ckpt_dir = Path(unquote(urlparse(unquote(artifact_uri)).path)) / "checkpoints"
+    
+    from urllib.parse import urlparse, unquote
+
+    try:
+        run = mlflow.get_run(run_id)
+    except mlflow.exceptions.MlflowException as e:
+        raise RuntimeError(f"Could not fetch run '{run_id}' from MLflow: {e}") from e
+
+    artifact_uri = run.info.artifact_uri
+    artifact_parsed = urlparse(unquote(artifact_uri))
+
+    if artifact_parsed.scheme not in ("file", ""):
+        raise NotImplementedError(
+            f"artifact_uri has scheme '{artifact_parsed.scheme}' (not 'file'). "
+            f"This approach assumes artifacts on a local filesystem; for a remote "
+            f"tracking server or s3/gcs storage, use "
+            f"mlflow.artifacts.download_artifacts(run_id=run_id) instead. "
+            f"Original artifact_uri: {artifact_uri}"
+        )
+
+    artifact_path = Path(artifact_parsed.path)
+
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if not tracking_uri:
+        raise EnvironmentError(
+            "MLFLOW_TRACKING_URI is not set. It's required to reconstruct the "
+            "artifact path independently of the original filesystem."
+        )
+
+    tracking_parsed = urlparse(unquote(tracking_uri))
+    if tracking_parsed.scheme not in ("file", ""):
+        raise NotImplementedError(
+            f"MLFLOW_TRACKING_URI has scheme '{tracking_parsed.scheme}' "
+            f"(not 'file') -- it points to a tracking server, not a local filesystem. "
+            f"This path-based approach doesn't apply; use "
+            f"mlflow.artifacts.download_artifacts(run_id=run_id) instead. "
+            f"Original MLFLOW_TRACKING_URI: {tracking_uri}"
+        )
+
+    tracking_root = Path(tracking_parsed.path)
+    if not tracking_root.exists():
+        raise FileNotFoundError(
+            f"The path from MLFLOW_TRACKING_URI does not exist on this filesystem: {tracking_root}"
+        )
+
+    parts = artifact_path.parts
+    if "mlruns" not in parts:
+        raise ValueError(
+            f"Could not find 'mlruns' in artifact_uri, unable to relocate the path. "
+            f"artifact_uri: {artifact_uri}"
+        )
+
+    idx = parts.index("mlruns")
+    relative_parts = parts[idx + 1:]  # <experiment_id>/<run_id>/artifacts
+    if not relative_parts:
+        raise ValueError(
+            f"artifact_uri ends right at 'mlruns', with no experiment_id/run_id "
+            f"to reconstruct: {artifact_uri}"
+        )
+
+    ckpt_dir = tracking_root.joinpath(*relative_parts) / "checkpoints"
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(
+            f"Expected checkpoints directory does not exist: {ckpt_dir} "
+            f"(reconstructed from MLFLOW_TRACKING_URI={tracking_uri} "
+            f"+ relative path {'/'.join(relative_parts)})"
+        )
 
     best = ckpt_dir / "best_model.pt"
     if best.exists():
