@@ -32,7 +32,7 @@ from delphi.multi_stream_model import (
     DelphiMultiStreamConfig,
     parse_multi_stream_scheme,
 )
-from utils.trainer import MLFlowLogger, Trainer
+from utils.trainer import MLFlowLogger, Trainer, clone_run_to_new_experiment
 from utils.cv_utils import get_data_partitions
 from utils import load_domain_config, apply_domain_overrides, setup_mlflow, AUTO_BLOCK_SIZE
 
@@ -270,7 +270,7 @@ def get_cli_args():
 
     # ── Architecture ──────────────────────────────────────────────────────────
     parser.add_argument(
-        "--arch", required=True,
+        "--arch", required=False, default=None,
         help=(
             "MultiStream architecture string (2 or more encoder groups). Example: "
             "'MultiStream([hla_alleles,sex]:(h24d240l3),[diseases,lifestyle,sex]:(h24d240l6)):(h24d240l6)'"
@@ -351,6 +351,20 @@ def get_cli_args():
                         default=[], metavar="KEY=VALUE")
     parser.add_argument("--tag", dest="extra_tags", nargs="+", action=_AppendFlat,
                         default=[], metavar="KEY=VALUE")
+    parser.add_argument("--resume_run_id", "--resume-run-id", "--resume_runid", "--resume-runid",
+                        dest="resume_run_id", type=str, default=None,
+                        help="MLflow run_id to resume training from (loads its best/latest "
+                             "checkpoint, optimizer/scheduler state, and subject splits).")
+    parser.add_argument("--resume_from_previous", "--resume-from-previous",
+                        "--resume_from_run", "--resume-from-run",
+                        "--resume_from_runid", "--resume-from-runid",
+                        "--resume_from_run_id", "--resume-from-run-id",
+                        "-r", dest="resume_from_previous",
+                        default=False, action="store_true",
+                        help="Resume training from --resume_run_id instead of starting fresh. "
+                             "--arch/--experiment_name are read from the resumed run if omitted; "
+                             "--no_event_token_rate and --birth_dates_file are NOT stored on "
+                             "MultiStream runs and must be passed again explicitly.")
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     parser.add_argument("--no-warnings", "--no_warnings", dest="no_warnings",
@@ -360,8 +374,13 @@ def get_cli_args():
 
     args = parser.parse_args()
 
-    if args.experiment_name is None and not args.dry_run:
-        parser.error("--experiment_name / -x is required (or --dryrun).")
+    if args.resume_from_previous and not args.resume_run_id:
+        parser.error("--resume_from_previous requires --resume_run_id <RUN_ID>.")
+    if not args.resume_from_previous:
+        if args.arch is None:
+            parser.error("--arch is required unless --resume_from_previous is set.")
+        if args.experiment_name is None and not args.dry_run:
+            parser.error("--experiment_name / -x is required (or --dryrun).")
 
     prefix = args.run_name_prefix or ""
     args.run_name = (prefix + args.run_name_suffix) or None
@@ -380,90 +399,178 @@ if __name__ == "__main__":
 
     args = get_cli_args()
 
-    # ── Resolve attention scheme alias ────────────────────────────────────────
-    attention_scheme = _resolve_attention_scheme(args.attention_scheme)
+    bs_scheduler = None
+    start_epoch = 0
 
-    # ── Domain config ─────────────────────────────────────────────────────────
-    domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
-    domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
-    default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / "tokens")
-    domain_cfg = {
-        k: v for k, v in default_cfg_per_domain.items()
-        if k in domains or k in ("padding", "no_event")
-    }
+    if (train_from_scratch := not args.resume_run_id):
 
-    missing = [k for k in domains if k not in default_cfg_per_domain]
-    if missing:
-        raise ValueError(f"Domains not found in config: {missing}")
+        # ── Resolve attention scheme alias ────────────────────────────────────
+        attention_scheme = _resolve_attention_scheme(args.attention_scheme)
 
-    if args.domain_config_overrides:
-        apply_domain_overrides(domain_cfg, args.domain_config_overrides)
+        # ── Domain config ─────────────────────────────────────────────────────
+        domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
+        domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
+        default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / "tokens")
+        domain_cfg = {
+            k: v for k, v in default_cfg_per_domain.items()
+            if k in domains or k in ("padding", "no_event")
+        }
 
-    # ── DelphiMultiStreamConfig (used for embedding + metadata) ────────────
-    delphi_config = DelphiMultiStreamConfig(
-        domains=domain_cfg,
-        token_dropout=args.token_dropout,
-        block_size=128,
-        seed=args.seed,
-    )
+        missing = [k for k in domains if k not in default_cfg_per_domain]
+        if missing:
+            raise ValueError(f"Domains not found in config: {missing}")
 
-    logging.info("Domain config: %s", Path(domain_config_yaml).relative_to(Path.cwd()))
-    print_config_rich(args.arch, attention_scheme, delphi_config, args,
-                      overrides=args.domain_config_overrides)
+        if args.domain_config_overrides:
+            apply_domain_overrides(domain_cfg, args.domain_config_overrides)
 
-    if args.dry_run:
-        sys.exit(0)
+        # ── DelphiMultiStreamConfig (used for embedding + metadata) ────────
+        delphi_config = DelphiMultiStreamConfig(
+            domains=domain_cfg,
+            token_dropout=args.token_dropout,
+            block_size=128,
+            seed=args.seed,
+        )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    model = DelphiMultiStream.from_scheme_string(
-        arch_str=args.arch,
-        attention_scheme=attention_scheme,
-        config=delphi_config,
-    ).to(DEVICE)
+        logging.info("Domain config: %s", Path(domain_config_yaml).relative_to(Path.cwd()))
+        print_config_rich(args.arch, attention_scheme, delphi_config, args,
+                          overrides=args.domain_config_overrides)
 
-    if not args.no_compile:
-        logging.info("Compiling model with torch.compile (first batch will be slower)...")
-    model = torch.compile(model, disable=args.no_compile)
+        if args.dry_run:
+            sys.exit(0)
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    bs_scheduler = args.batch_size_schedule
-    if bs_scheduler is not None:
-        args.batch_size = bs_scheduler.step(0).batch_size
+        # ── Model ─────────────────────────────────────────────────────────────
+        model = DelphiMultiStream.from_scheme_string(
+            arch_str=args.arch,
+            attention_scheme=attention_scheme,
+            config=delphi_config,
+        ).to(DEVICE)
 
-    dataloaders = get_dataloaders(domain_cfg, model=model, args=args)
+        if not args.no_compile:
+            logging.info("Compiling model with torch.compile (first batch will be slower)...")
+        model = torch.compile(model, disable=args.no_compile)
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
-    lr = args.lr if args.lr is not None else 1e-4
-    optim_config = OptimConfig(
-        learning_rate  = lr,
-        min_lr         = args.min_lr if args.min_lr is not None else lr / 10,
-        weight_decay   = args.weight_decay,
-        beta1          = args.beta1,
-        beta2          = args.beta2,
-        grad_clip      = args.grad_clip,
-        schedule       = args.schedule,
-        warmup_iters   = args.warmup_iters,
-        lr_decay_iters = args.lr_decay_iters,
-    )
-    optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+        # ── Data ──────────────────────────────────────────────────────────────
+        bs_scheduler = args.batch_size_schedule
+        if bs_scheduler is not None:
+            args.batch_size = bs_scheduler.step(0).batch_size
 
-    # ── MLflow ────────────────────────────────────────────────────────────────
-    logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
-    mlflow.log_artifact(domain_config_yaml)
+        dataloaders = get_dataloaders(domain_cfg, model=model, args=args)
 
-    logged_params = {
-        "arch":                       args.arch,
-        "attention_scheme":           attention_scheme,
-        "test_fold":                  args.test_fold,
-        "batch_size":                 args.batch_size,
-        "batch_size_schedule":        args.batch_size_schedule,
-        "learning_rate":              lr,
-        "seed":                       args.seed,
-        "optim_config":               optim_config,
-        "max_epochs":                 args.max_epochs,
-        "min_epochs":                 args.min_epochs,
-        "patience":                   args.patience,
-    }
+        # ── Optimizer ─────────────────────────────────────────────────────────
+        lr = args.lr if args.lr is not None else 1e-4
+        optim_config = OptimConfig(
+            learning_rate  = lr,
+            min_lr         = args.min_lr if args.min_lr is not None else lr / 10,
+            weight_decay   = args.weight_decay,
+            beta1          = args.beta1,
+            beta2          = args.beta2,
+            grad_clip      = args.grad_clip,
+            schedule       = args.schedule,
+            warmup_iters   = args.warmup_iters,
+            lr_decay_iters = args.lr_decay_iters,
+        )
+        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+
+        # ── MLflow ────────────────────────────────────────────────────────────
+        logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=args.run_name)
+        mlflow.log_artifact(domain_config_yaml)
+
+        logged_params = {
+            "arch":                       args.arch,
+            "attention_scheme":           attention_scheme,
+            "test_fold":                  args.test_fold,
+            "batch_size":                 args.batch_size,
+            "batch_size_schedule":        args.batch_size_schedule,
+            "learning_rate":              lr,
+            "seed":                       args.seed,
+            "optim_config":               optim_config,
+            "max_epochs":                 args.max_epochs,
+            "min_epochs":                 args.min_epochs,
+            "patience":                   args.patience,
+            # Not part of DelphiMultiStreamConfig (unlike DelphiConfig, which logs these
+            # "for free" via Trainer's automatic self.logger.log_params(self.model.config))
+            # — logged explicitly here so config_from_runid_multistream can recover them
+            # on resume instead of requiring the caller to re-supply them from memory.
+            "no_event_token_rate":            args.no_event_token_rate,
+            "no_event_token_insertion_mode":  args.no_event_token_insertion_mode,
+            "date_cutoff":                    args.date_cutoff,
+            "birth_dates_file":               args.birth_dates_file,
+        }
+
+    else:
+
+        ################################ FROM PREVIOUS RUN ################################
+        from utils.run_loader import config_from_runid_multistream
+
+        logging.info(
+            "Resuming from MLflow run %s — no_event_token_rate=%s, "
+            "no_event_token_insertion_mode=%s, birth_dates_file=%s (these are NOT stored "
+            "on MultiStream runs; make sure they match the original submission).",
+            args.resume_run_id, args.no_event_token_rate,
+            args.no_event_token_insertion_mode, args.birth_dates_file,
+        )
+
+        model, \
+        dataloaders, \
+        optim_config, optimizer_state, scheduler_state, \
+        start_epoch, \
+        logged_params, previous_run_name = config_from_runid_multistream(
+            args.resume_run_id,
+            no_event_token_rate=args.no_event_token_rate,
+            no_event_token_insertion_mode=args.no_event_token_insertion_mode,
+            birth_dates_file=args.birth_dates_file,
+        )
+
+        bs_scheduler = logged_params.pop("batch_size_scheduler", None)
+        if args.batch_size_schedule is not None:
+            bs_scheduler = args.batch_size_schedule
+            new_bs = bs_scheduler.step(start_epoch).batch_size
+            dataloaders.train.set_batch_size(new_bs)
+            logging.info("batch_size_schedule overridden from CLI: %s (batch_size at epoch %d: %d)",
+                         bs_scheduler, start_epoch, new_bs)
+        elif bs_scheduler is not None:
+            logging.info("batch_size_schedule restored from run params: %s", bs_scheduler)
+        else:
+            logging.info("No batch_size_schedule — using fixed batch_size=%d", logged_params.get("batch_size", "?"))
+
+        if args.lr is not None:
+            optim_config.learning_rate = args.lr
+            optim_config.min_lr = args.min_lr if args.min_lr is not None else args.lr / 10
+
+        model = model.to(DEVICE)
+        if not args.no_compile:
+            logging.info("Compiling model with torch.compile (first batch will be slower)...")
+        model = torch.compile(model, disable=args.no_compile)
+        optimizer, scheduler = configure_optimizers(model=model, cfg=optim_config, device_type=DEVICE)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+        if args.lr is not None:
+            # Keep position in the cosine schedule (last_epoch) but rescale to new peak LR.
+            old_base_lr = scheduler.base_lrs[0]
+            scheduler.base_lrs = [args.lr] * len(scheduler.base_lrs)
+            current_lrs = scheduler.get_lr()
+            for pg, lr in zip(optimizer.param_groups, current_lrs):
+                pg['lr'] = lr
+            logging.info(
+                "Learning rate peak changed: %.2e → %.2e; "
+                "current LR at schedule step %d: %.2e (min_lr=%.2e)",
+                old_base_lr, args.lr, scheduler.last_epoch, current_lrs[0], optim_config.min_lr,
+            )
+
+        if args.experiment_name is None:
+            run_info = mlflow.get_run(args.resume_run_id)
+            args.experiment_name = mlflow.get_experiment(run_info.info.experiment_id).name
+
+        new_run_id = clone_run_to_new_experiment(args.resume_run_id, args.experiment_name)
+        logger = MLFlowLogger(experiment_name=args.experiment_name, run_name=previous_run_name, autostart=False)
+        logger.start(resume_run_id=new_run_id)
+
+        print(f"Resuming from MLflow run {args.resume_run_id} ...")
+
+    # —————————————————————————————————————————————————————————————————————————
 
     logger.log_run_metadata(cwd=DELPHI_DIR)
     if args.extra_params:
@@ -496,6 +603,7 @@ if __name__ == "__main__":
         use_rich=not args.no_rich,
         optim_config=optim_config,
         batch_size_scheduler=bs_scheduler,
+        start_epoch=start_epoch,
     )
 
     trainer.train(max_epochs=args.max_epochs, min_epochs=args.min_epochs, patience=args.patience)

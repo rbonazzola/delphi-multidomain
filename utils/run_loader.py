@@ -409,3 +409,221 @@ def config_from_runid(runid: str):
         optimizer_state, scheduler_state,
         start_epoch, logged_params, previous_run_name,
     )
+
+
+def config_from_runid_multistream(runid: str, no_event_token_rate: float | None = None,
+                                   no_event_token_insertion_mode: str | None = None,
+                                   birth_dates_file: str | None = None):
+    """
+    Reconstruct a DelphiMultiStream model + all three dataloaders from a run for
+    training resumption. Mirrors config_from_runid, adapted for the two-stream
+    MultiStream architecture built by train_multi_stream.py, which logs a
+    sparser param set than train.py:
+
+    - No 'domain_list' param is logged, and the 'domains' param routinely
+      exceeds MLflow's 6000-char param limit on ESM2 runs (truncated,
+      unparseable) — domains are instead reconstructed from the run's own
+      logged domain_config_yaml artifact, filtered to the names embedded in
+      the 'arch' param's bracketed stream groups (same approach used in
+      auc/compute_aucs_from_run.py's load_run() for the identical issue).
+    - 'no_event_token_rate', 'no_event_token_insertion_mode', 'date_cutoff',
+      and 'birth_dates_file' are logged explicitly as of the fix that added
+      them to train_multi_stream.py's logged_params (previously they weren't
+      logged at all, unlike train.py, where they ride along "for free" via
+      DelphiConfig fields that Trainer auto-logs). For runs predating that
+      fix, these params won't be present — pass them explicitly as arguments
+      in that case; the caller-supplied value is used only as a fallback when
+      the corresponding MLflow param is missing, the logged value always wins
+      when both are available.
+
+    Returns: model, dataloaders, optim_config,
+             optimizer_state, scheduler_state,
+             start_epoch, logged_params, previous_run_name
+    """
+    import mlflow
+    from delphi.multi_stream_model import DelphiMultiStream, DelphiMultiStreamConfig
+    from delphi.optim import OptimConfig
+    from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
+    from utils.mlflow_utils import get_checkpoint_path
+    from utils.utils import load_domain_config
+    from utils.ckpt_utils import strip_compiled_prefix
+
+    VAL_BATCH_SIZE = 256
+
+    runinfo = mlflow.get_run(runid)
+    params = dict(runinfo.data.params)
+
+    batch_size = int(params.pop("batch_size", 32))
+    test_fold  = params.pop("test_fold", 0)
+    params.pop("learning_rate", None)
+    params.pop("ema_alpha", None)
+
+    # Prefer the value logged on the run itself (present for runs submitted after the
+    # logged_params fix); fall back to the caller-supplied argument for older runs that
+    # predate it. Raise a clear error rather than silently defaulting if neither is
+    # available — a wrong no_event_token_rate silently corrupts the resumed dataset.
+    logged_no_event_rate = params.pop("no_event_token_rate", None)
+    no_event_token_rate = float(logged_no_event_rate) if logged_no_event_rate is not None else no_event_token_rate
+    if no_event_token_rate is None:
+        raise ValueError(
+            f"Run {runid} predates logging 'no_event_token_rate' and none was passed "
+            "explicitly — pass no_event_token_rate=<value> matching the original submission."
+        )
+
+    logged_insertion_mode = params.pop("no_event_token_insertion_mode", None)
+    no_event_token_insertion_mode = logged_insertion_mode or no_event_token_insertion_mode or "random"
+
+    logged_birth_dates_file = params.pop("birth_dates_file", None)
+    birth_dates_file = logged_birth_dates_file or birth_dates_file
+    params.pop("date_cutoff", None)  # authoritative copy comes from checkpoint metadata below
+
+    bs_schedule_str = params.pop("batch_size_schedule", None)
+    bs_scheduler = (
+        BatchSizeScheduler.from_string(bs_schedule_str)
+        if bs_schedule_str and bs_schedule_str != "None"
+        else None
+    )
+
+    arch_str = params["arch"]
+    try:
+        attention_scheme = ast.literal_eval(params["attention_scheme"])
+    except (ValueError, SyntaxError):
+        attention_scheme = params["attention_scheme"]
+
+    ckpt_path = get_checkpoint_path(runid)
+    logging.info("Loading checkpoint: %s", ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
+    date_cutoff = ckpt.get("metadata", {}).get("date_cutoff", None)
+
+    optim_config_raw = params.pop("optim_config")
+    if isinstance(optim_config_raw, str):
+        m = re.match(r"OptimConfig\((.*)\)$", optim_config_raw, re.DOTALL)
+        if m:
+            optim_kwargs = dict(re.findall(r"(\w+)=([^,)]+)", m.group(1)))
+            optim_kwargs = {k: ast.literal_eval(v) for k, v in optim_kwargs.items()}
+            optim_config = OptimConfig(**optim_kwargs)
+        else:
+            raise ValueError(f"Cannot parse optim_config string: {optim_config_raw!r}")
+    else:
+        optim_config = optim_config_raw
+
+    # ── domains: reconstruct from the run's own domain_config_yaml artifact,
+    #    filtered to the domain names embedded in the arch string.
+    client = mlflow.tracking.MlflowClient()
+    yaml_artifacts = [a.path for a in client.list_artifacts(runid) if a.path.endswith(".yaml")]
+    if len(yaml_artifacts) != 1:
+        raise ValueError(f"Expected exactly one domain config yaml artifact for run {runid}, got {yaml_artifacts}")
+    yaml_path = DELPHI_DIR / "config" / Path(yaml_artifacts[0]).name
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Expected local domain config at {yaml_path} (from run {runid}'s logged artifact)")
+
+    domain_names = sorted(set(
+        name.strip()
+        for group in re.findall(r"\[([^\]]+)\]", arch_str)
+        for name in group.split(",")
+    ))
+    root_path = DELPHI_DIR / "data" / "transforms"
+    default_cfg_per_domain = load_domain_config(yaml_path, root_path / "tokens")
+    domain_cfg = {
+        k: v for k, v in default_cfg_per_domain.items()
+        if k in domain_names or k in ("padding", "no_event")
+    }
+    missing = [d for d in domain_names if d not in default_cfg_per_domain]
+    if missing:
+        raise ValueError(f"Domains in arch string not found in {yaml_path}: {missing}")
+
+    delphi_config = DelphiMultiStreamConfig(
+        domains=domain_cfg,
+        token_dropout=float(params.get("token_dropout", 0.1)),
+        block_size=128,
+        seed=int(params.get("seed", 142)),
+    )
+
+    model = DelphiMultiStream.from_scheme_string(
+        arch_str=arch_str,
+        attention_scheme=attention_scheme,
+        config=delphi_config,
+    )
+    state_dict = strip_compiled_prefix(ckpt["state_dict"])
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint state_dict mismatch resuming run {runid}: "
+            f"missing={missing_keys} unexpected={unexpected_keys}"
+        )
+
+    continuous_domains = {
+        dname: cfg.n_latent_tokens or 1
+        for dname, cfg in domain_cfg.items()
+        if cfg.type == "continuous"
+    }
+
+    _ds_kwargs = dict(
+        root=root_path,
+        domains_cfg=domain_cfg,
+        domain_to_int=model.domain_to_int,
+        block_size=128,
+        exclusions=[],
+        required_domains=["diseases"],
+        no_event_token_rate=no_event_token_rate,
+        no_event_insertion_mode=no_event_token_insertion_mode,
+        continuous_domains=continuous_domains,
+        age_domains=["diseases", "death"],
+        date_cutoff=date_cutoff,
+        birth_dates_file=birth_dates_file,
+    )
+
+    train_dataset = DelphiDataset(subjects=ckpt["metadata"]["train_ids"], **_ds_kwargs)  # type: ignore[arg-type]
+    valid_dataset = DelphiDataset(subjects=ckpt["metadata"]["valid_ids"], **_ds_kwargs)  # type: ignore[arg-type]
+    test_dataset  = DelphiDataset(subjects=ckpt["metadata"]["test_ids"],  **_ds_kwargs)  # type: ignore[arg-type]
+
+    age_sampler = AgeSampler(
+        insertion_mode=no_event_token_insertion_mode,
+        token_rate=no_event_token_rate,
+        seed=delphi_config.seed,
+    )
+
+    domain_dropout = {
+        model.domain_to_int[dname]: (cfg.dropout_mode, cfg.dropout_rate, cfg.token_dropout_rate, cfg.parent or dname)
+        for dname, cfg in domain_cfg.items()
+        if cfg.dropout_mode is not None and cfg.dropout_rate > 0 and dname in model.domain_to_int
+    }
+
+    collate = DelphiCollateFn(
+        age_sampler=age_sampler,
+        block_size=128,
+        domain_to_int=model.domain_to_int,
+        domain_offsets=model.domain_offsets,
+        padding_domain_id=model.domain_to_int["padding"],
+        no_event_domain_id=model.domain_to_int["no_event"],
+        continuous_domains=continuous_domains,
+        domain_dropout=domain_dropout,
+    )
+
+    train_batch_size = (
+        bs_scheduler.step(start_epoch).batch_size if bs_scheduler is not None else batch_size
+    )
+    dataloaders = DataModule(
+        FlexibleDataLoader(train_dataset, batch_size=train_batch_size, shuffle=True,  pin_memory=True, collate_fn=collate),
+        DataLoader(valid_dataset,         batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
+        DataLoader(test_dataset,          batch_size=VAL_BATCH_SIZE,   shuffle=False, pin_memory=True, collate_fn=collate),
+    )
+
+    previous_run_name = runinfo.data.tags.get("mlflow.runName", None)
+    logged_params = {
+        "arch": arch_str,
+        "attention_scheme": attention_scheme,
+        "test_fold": test_fold,
+        "batch_size": batch_size,
+        "batch_size_scheduler": bs_scheduler,
+    }
+
+    optimizer_state = ckpt.get("optimizer_state", None)
+    scheduler_state = ckpt.get("scheduler_state", None)
+
+    return (
+        model, dataloaders, optim_config,
+        optimizer_state, scheduler_state,
+        start_epoch, logged_params, previous_run_name,
+    )
