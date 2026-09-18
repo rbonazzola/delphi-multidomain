@@ -324,6 +324,54 @@ class MLFlowLogger:
         uri = mlflow.get_artifact_uri("checkpoints")
         return Path(self._strip_file_prefix(uri)) / filename
 
+    def _checkpoint_vallosses(self):
+        """
+        List (val_loss, path) for every checkpoint{N}__valloss_{loss}__{timestamp}.pt
+        file currently on disk for the active run's checkpoints artifact dir, sorted
+        ascending (best first). Empty list if the dir doesn't exist yet. Read-only —
+        callers decide what to do with the listing (prune, or just peek before saving).
+        """
+        import re
+        ckpt_dir = Path(self._strip_file_prefix(mlflow.get_artifact_uri("checkpoints")))
+        if not ckpt_dir.exists():
+            return []
+        pattern = re.compile(r"valloss_([\d.]+)")
+        candidates = []
+        for p in ckpt_dir.glob("epoch*__valloss_*.pt"):
+            m = pattern.search(p.name)
+            if m:
+                candidates.append((float(m.group(1)), p))
+        candidates.sort(key=lambda t: t[0])  # ascending val_loss = best first
+        return candidates
+
+    def would_enter_top_k(self, val_loss, keep_top_k):
+        """
+        True if val_loss would rank among the keep_top_k lowest currently on disk
+        (or fewer than keep_top_k are saved yet) — i.e. whether it's worth the cost
+        of serializing and saving a checkpoint for this epoch at all, before doing so.
+        """
+        candidates = self._checkpoint_vallosses()
+        if len(candidates) < keep_top_k:
+            return True
+        worst_of_top_k = candidates[keep_top_k - 1][0]
+        return val_loss < worst_of_top_k
+
+    def prune_checkpoints(self, keep_top_k):
+        """
+        Delete all but the keep_top_k lowest-val_loss checkpoint files
+        (epoch{N}__valloss_{loss}__{timestamp}.pt) for the active run, keeping only
+        the best ones on disk instead of accumulating one per saved epoch for the
+        whole run. Leaves best_model.pt (a copy of the current best, kept in sync by
+        save_model's symlink_as logic) and any periodic checkpoints
+        (epoch{N}__periodic__{timestamp}.pt) untouched.
+
+        Relies on the artifact store being local-filesystem-backed (true for this
+        project's MLflow setup) — deletes the underlying file directly, since MLflow's
+        tracking API has no first-class "delete one artifact" operation.
+        """
+        for _, p in self._checkpoint_vallosses()[keep_top_k:]:
+            p.unlink(missing_ok=True)
+
 
 # ———————————————————————————————————————————————————————————————————————————————
 
@@ -349,12 +397,20 @@ class Trainer(BaseTrainer):
           baseline_incidence_path=None,
           token_loss_alpha=0.0,
           token_loss_alpha_scheduler=None,
+          keep_top_k_checkpoints=5,
         ):
 
         self.model           = model
         self.optimizer       = optimizer
         self.scheduler       = scheduler
         self.early_stopper   = EarlyStopping(patience=patience, min_delta=0.001, mode='min')
+        # Default 5: tracks the true top-5 checkpoints by val_loss across ALL epochs
+        # (not just epochs that set a new record) — a non-improving epoch is still
+        # saved (and older worse ones pruned) if its val_loss would rank in the
+        # current top-k, checked before serializing to skip the write when it
+        # wouldn't. Pass None explicitly to keep every "on improvement" checkpoint
+        # unbounded (the original, pre-top-k behavior).
+        self.keep_top_k_checkpoints = keep_top_k_checkpoints
 
         from data.dataset import DataModule
         if isinstance(dataloaders, DataModule):
@@ -638,6 +694,26 @@ class Trainer(BaseTrainer):
                         symlink_as="best_model.pt",
                     )
                     _print(f"New best model → {ckpt_uri}")
+                    if self.keep_top_k_checkpoints is not None:
+                        self.logger.prune_checkpoints(self.keep_top_k_checkpoints)
+                elif self.keep_top_k_checkpoints is not None:
+                    # Non-improving epoch, but its val_loss might still beat some
+                    # already-saved checkpoint from earlier in training (val_loss isn't
+                    # monotonic epoch-to-epoch even though the *best-so-far* is) — check
+                    # before paying the serialization cost, so a true top-K over ALL
+                    # epochs is kept, not just among epochs that happened to set a new
+                    # record when they ran. No symlink_as here: best_model.pt only
+                    # tracks the single global best, updated in the `if improved` branch.
+                    if self.logger.would_enter_top_k(val_loss_val, self.keep_top_k_checkpoints):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        ckpt_filepath = f"epoch{epoch}__valloss_{val_loss_val:.4f}__{timestamp}.pt"
+                        ckpt_uri = self.logger.save_model(
+                            self.model, self.optimizer, self.scheduler,
+                            metadata=ckpt_metadata,
+                            filename=ckpt_filepath,
+                        )
+                        _print(f"Top-{self.keep_top_k_checkpoints} checkpoint (non-record) → {ckpt_uri}")
+                        self.logger.prune_checkpoints(self.keep_top_k_checkpoints)
 
                 if self.checkpoint_every and (epoch % self.checkpoint_every == 0):
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -944,12 +1020,21 @@ class Trainer(BaseTrainer):
                 self.time_ema = time_val if self.time_ema is None else \
                     (1 - self.ema_alpha) * self.time_ema + self.ema_alpha * time_val
 
+            # Snapshot as plain Python floats, not CUDA tensors: self.train_outputs
+            # lives for the whole epoch (cleared only in epoch_end()), so keeping a
+            # live tensor reference per training step here (thousands per epoch)
+            # fragments the CUDA caching allocator over the course of the epoch and
+            # can trigger OOM well before nominal memory usage is exhausted, at an
+            # unpredictable point that gets worse with more steps per epoch (e.g.
+            # smaller batch_size).
+            ce_val_item = ce_val.item()
+            time_val_item = time_val.item()
             self.train_outputs.append({
-                'train_ce_loss': ce_val,
-                'train_time_loss': time_val,
-                'train_ce_ema_loss': self.ce_ema,
-                'train_time_ema_loss': self.time_ema,
-                'train_total': ce_val + time_val,
+                'train_ce_loss': ce_val_item,
+                'train_time_loss': time_val_item,
+                'train_ce_ema_loss': self.ce_ema.item(),
+                'train_time_ema_loss': self.time_ema.item(),
+                'train_total': ce_val_item + time_val_item,
             })
 
             if eval_every is not None and (i % eval_every) == 0:
@@ -960,8 +1045,8 @@ class Trainer(BaseTrainer):
             accum_pos = (i % self.grad_accum_steps) + 1
             if pbar:
                 postfix = {
-                    "ce": f"{current_loss['train_ce_loss'].item():.3f} ({current_loss['train_ce_ema_loss'].item():.3f})",
-                    "dt": f"{current_loss['train_time_loss'].item():.1f} ({current_loss['train_time_ema_loss'].item():.1f})",
+                    "ce": f"{current_loss['train_ce_loss']:.3f} ({current_loss['train_ce_ema_loss']:.3f})",
+                    "dt": f"{current_loss['train_time_loss']:.1f} ({current_loss['train_time_ema_loss']:.1f})",
                 }
                 if self.grad_accum_steps > 1:
                     postfix["accum"] = f"{accum_pos}/{self.grad_accum_steps}"
@@ -973,7 +1058,7 @@ class Trainer(BaseTrainer):
                 accum_str = f" [{accum_pos}/{self.grad_accum_steps}]" if self.grad_accum_steps > 1 else ""
                 _progress.update(_task_id, description=(
                     f"[green]Ep {self.current_epoch:>4d}  train  "
-                    f"ce={current_loss['train_ce_ema_loss'].item():.3f}{accum_str}"
+                    f"ce={current_loss['train_ce_ema_loss']:.3f}{accum_str}"
                 ))
 
             if (n_batches is not None) and (i == n_batches):

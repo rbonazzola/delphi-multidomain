@@ -335,6 +335,12 @@ def get_cli_args():
     parser.add_argument("--use_amp", "--amp", dest="use_amp", default=False, action="store_true")
     parser.add_argument("--checkpoint_every", "--checkpoint-every", dest="checkpoint_every",
                         default=None, type=int)
+    parser.add_argument("--keep_top_k_checkpoints", "--keep-top-k-checkpoints",
+                        dest="keep_top_k_checkpoints", default=5, type=int,
+                        help="Keep only the k lowest-val_loss checkpoints on disk across the "
+                             "whole run (not just epochs that set a new record). Pass -1 (or "
+                             "any value <=0) for the old unbounded behavior — one file per "
+                             "improving epoch for the whole run, never pruned. Default: 5.")
 
     # ── Evaluation ────────────────────────────────────────────────────────────
     parser.add_argument("--compute_aucs", "--auc", dest="compute_aucs", default=False, action="store_true")
@@ -389,6 +395,9 @@ def get_cli_args():
         args.extra_params = _parse_kv_list(args.extra_params, "--param")
     if args.extra_tags:
         args.extra_tags = _parse_kv_list(args.extra_tags, "--tag")
+
+    if args.keep_top_k_checkpoints is not None and args.keep_top_k_checkpoints <= 0:
+        args.keep_top_k_checkpoints = None  # opt-out: keep every checkpoint, unbounded
 
     return args
 
@@ -596,6 +605,7 @@ if __name__ == "__main__":
         log_loss_per_disease=args.log_loss_per_disease,
         baseline_incidence_path=args.baseline_incidence_path,
         checkpoint_every=args.checkpoint_every,
+        keep_top_k_checkpoints=args.keep_top_k_checkpoints,
         logger=logger,
         mlflow_params=logged_params,
         use_tqdm=args.no_rich,
