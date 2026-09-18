@@ -33,14 +33,46 @@ class LinearProjector(nn.Module):
     """
     Projects a continuous input vector to (n_latent_tokens, n_embd).
     input_size -> n_latent_tokens * n_embd, then unflatten.
+
+    rank: if set, factorizes the single full-rank Linear into two smaller ones
+    (input_size -> rank -> n_latent_tokens*n_embd, no bias/activation between them),
+    capping the projection's rank at `rank` instead of min(input_size, n_latent_tokens*n_embd).
+    None (default) keeps the original single-layer, full-rank behavior.
     """
 
-    def __init__(self, input_size: int, n_latent_tokens: int, n_embd: int):
+    def __init__(self, input_size: int, n_latent_tokens: int, n_embd: int, rank: int | None = None):
         super().__init__()
         self.n_latent_tokens = n_latent_tokens
         self.n_embd = n_embd
+        self.rank = rank
+        out_size = n_latent_tokens * n_embd
+        if rank is None:
+            layers = [nn.Linear(input_size, out_size, bias=False)]
+        else:
+            ceiling = min(input_size, out_size)
+            if rank >= ceiling:
+                logging.warning(
+                    "LinearProjector: rank=%d >= min(input_size=%d, out_size=%d) — "
+                    "factorization adds no rank constraint, just extra parameters/compute. "
+                    "Try rank<=%d for an actual constraint, or omit `rank` for full-rank "
+                    "(single Linear layer, fewer parameters than any factorized rank>=%d).",
+                    rank, input_size, out_size, ceiling - 1, ceiling,
+                )
+            elif rank < n_latent_tokens:
+                logging.warning(
+                    "LinearProjector: rank=%d < n_latent_tokens=%d — all %d output tokens are "
+                    "linear combinations of the same %d-dim bottleneck, so they can't vary "
+                    "independently of each other by construction (not just by what training "
+                    "learns). Consider rank>=n_latent_tokens=%d if the %d tokens are meant to "
+                    "carry distinct information.",
+                    rank, n_latent_tokens, n_latent_tokens, rank, n_latent_tokens, n_latent_tokens,
+                )
+            layers = [
+                nn.Linear(input_size, rank, bias=False),
+                nn.Linear(rank, out_size, bias=False),
+            ]
         self.projector = nn.Sequential(
-            nn.Linear(input_size, n_latent_tokens * n_embd, bias=False),
+            *layers,
             nn.Unflatten(dim=-1, unflattened_size=(n_latent_tokens, n_embd)),
         )
 
@@ -228,6 +260,7 @@ class MultiDomainEmbedding(nn.Module):
                         input_size=dcfg.input_size,
                         n_latent_tokens=n_latent,
                         n_embd=n_embd,
+                        rank=dcfg.projector_rank,
                     )
                 elif dcfg.projector.lower() == "mlp":
                     self.projectors[dname] = MLPProjector(

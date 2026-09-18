@@ -75,6 +75,7 @@ class DomainConfig:
     n_layers:   Optional[int] = None
     n_hidden:   Optional[int] = None
     input_size: Optional[int] = None
+    projector_rank: Optional[int] = None  # bottleneck dim for a low-rank LinearProjector; None = full rank
     pretrained_path: Optional[str] = None
     freeze: bool = False
     path: Optional[str] = None
