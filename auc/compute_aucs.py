@@ -66,25 +66,40 @@ def main():
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--n_jobs", type=int, default=8, help="Parallel jobs for AUC computation")
-    parser.add_argument("--output_file", type=str, default="aucs.csv")
+    parser.add_argument("--output_file", type=str, default=None,
+                        help="Filename for the AUC results. Defaults to 'aucs.csv' for "
+                             "--split test, 'aucs_val.csv' for --split val, and both "
+                             "(one per split) for --split both.")
+    parser.add_argument("--split", choices=["test", "val", "both"], default="test",
+                        help="Which split to evaluate on (default: test, matching the "
+                             "original behavior). 'both' computes and logs both.")
     parser.add_argument("--tokens_dir", type=str, default=None,
                         help="Load domain tokens from this folder instead of the run's own "
                              "config (each domain under <tokens_dir>/<domain_name>/)")
     parser.add_argument("--subjects", type=str, default=None,
                         help="Path to a subject ids file, to evaluate on instead of the "
                              "run's own stored test split")
+    parser.add_argument("--domain_config_yaml", type=str, default=None,
+                        help="Load the domain config from this local YAML instead of the "
+                             "run's MLflow 'domains' param. Needed for ESM2 pretrained-"
+                             "embedding runs, whose resolved 'domains' param routinely "
+                             "exceeds MLflow's 6000-char truncation limit and silently "
+                             "reconstructs a corrupted model otherwise.")
     args = parser.parse_args()
+
+    splits = ["val", "test"] if args.split == "both" else [args.split]
+    default_output_files = {"test": "aucs.csv", "val": "aucs_val.csv"}
 
     model, loaders, run_params = reconstruct_from_run(
         args.runid,
-        split="test",
+        split=splits,
         block_size=args.block_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         tokens_path=args.tokens_dir,
         subjects=args.subjects,
+        domain_config_yaml=args.domain_config_yaml,
     )
-    test_loader = loaders["test"]
 
     from utils.trainer import MLFlowLogger
 
@@ -98,16 +113,18 @@ def main():
     )
     logger.start(resume_run_id=args.runid)
     try:
-        auc_df = evaluate_aucs(
-            model,
-            test_loader,
-            block_size=model.block_size,
-            run_id=args.runid,
-            n_jobs=args.n_jobs,
-            logger=logger,
-            output_file=args.output_file,
-        )
-        logging.info(f"Done. {len(auc_df)} AUC rows computed.")
+        for split in splits:
+            output_file = args.output_file if (args.output_file and len(splits) == 1) else default_output_files[split]
+            auc_df = evaluate_aucs(
+                model,
+                loaders[split],
+                block_size=model.block_size,
+                run_id=args.runid,
+                n_jobs=args.n_jobs,
+                logger=logger,
+                output_file=output_file,
+            )
+            logging.info(f"Done ({split}). {len(auc_df)} AUC rows computed.")
     finally:
         logger.end()
 
