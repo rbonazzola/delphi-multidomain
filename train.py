@@ -779,42 +779,63 @@ if __name__ == "__main__":
     
     if args.compute_aucs:
 
-        from auc.aucs import evaluate_aucs
+        from auc.aucs import evaluate_aucs, compute_freqbin_consensus
         import copy
         model.eval()
 
         # evaluate_aucs requires fixed T across all batches; swap collate to use
         # block_size=128 instead of "auto" so torch.cat on embeddings doesn't fail.
-        # dataloaders[2] is a FlexibleDataLoader (fresh training) or a plain
-        # DataLoader (resumed via config_from_runid) — they store collate_fn/
+        # dataloaders[1]/[2] are FlexibleDataLoaders (fresh training) or plain
+        # DataLoaders (resumed via config_from_runid) — they store collate_fn/
         # num_workers under different attribute names.
-        test_loader_src = dataloaders[2]
-        collate_fn = getattr(test_loader_src, "_collate_fn", None) or test_loader_src.collate_fn
-        num_workers = getattr(test_loader_src, "_num_workers", None)
-        if num_workers is None:
-            num_workers = test_loader_src.num_workers
+        def _make_eval_loader(loader_src):
+            collate_fn = getattr(loader_src, "_collate_fn", None) or loader_src.collate_fn
+            num_workers = getattr(loader_src, "_num_workers", None)
+            if num_workers is None:
+                num_workers = loader_src.num_workers
+            auc_collate = copy.copy(collate_fn)
+            auc_collate.block_size = 128
+            return DataLoader(
+                loader_src.dataset,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                collate_fn=auc_collate,
+            )
 
-        auc_collate = copy.copy(collate_fn)
-        auc_collate.block_size = 128
-        test_loader = DataLoader(
-            test_loader_src.dataset,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            collate_fn=auc_collate,
-        )
+        eval_loaders = {
+            "test": _make_eval_loader(dataloaders[2]),
+            "val": _make_eval_loader(dataloaders[1]),
+        }
         del dataloaders
-    
-        auc_df = evaluate_aucs(
-            model,
-            test_loader,
-            block_size=cache_block_size,
-            run_id=logger.active_run.info.run_id,
-            n_jobs=8,
-            logger=logger,
-        )
-        logging.info("AUCs:\n%s", pformat(auc_df, sort_dicts=False))
+
+        # "aucs.csv" kept as the test filename for backward compatibility with
+        # existing consumers (e.g. mlflow-utils/check_missing_artifact.py).
+        auc_filenames = {"test": "aucs.csv", "val": "aucs_val.csv"}
+        freqbin_filenames = {"test": "freqbin20.csv", "val": "freqbin20_val.csv"}
+        auc_dfs = {}
+        for split, loader in eval_loaders.items():
+            auc_dfs[split] = evaluate_aucs(
+                model,
+                loader,
+                block_size=cache_block_size,
+                run_id=logger.active_run.info.run_id,
+                n_jobs=8,
+                logger=logger,
+                output_file=auc_filenames[split],
+            )
+            logging.info("%s AUCs:\n%s", split, pformat(auc_dfs[split], sort_dicts=False))
+
+            freqbin_df = compute_freqbin_consensus(auc_dfs[split])
+            logger.log_df_as_artifact(freqbin_df, filename=freqbin_filenames[split], artifact_path="aucs")
+            logging.info(
+                "%s freq-bin consensus (mean over %d bins): %.4f\n%s",
+                split, len(freqbin_df), freqbin_df["auc_simple_mean"].mean(),
+                freqbin_df.to_string(index=False),
+            )
+
+        auc_df = auc_dfs["test"]
 
         diseases_domain = "diseases"
         if diseases_domain in model.config.domains:

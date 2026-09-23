@@ -653,6 +653,7 @@ if __name__ == "__main__":
         # "aucs.csv" kept as the test filename for backward compatibility with
         # existing consumers (e.g. mlflow-utils/check_missing_artifact.py).
         auc_filenames = {"test": "aucs.csv", "val": "aucs_val.csv"}
+        freqbin_filenames = {"test": "freqbin20.csv", "val": "freqbin20_val.csv"}
         auc_dfs = {}
         for split, loader in eval_loaders.items():
             auc_dfs[split] = evaluate_aucs(
@@ -665,6 +666,15 @@ if __name__ == "__main__":
                 output_file=auc_filenames[split],
             )
             logging.info("%s AUCs:\n%s", split, pformat(auc_dfs[split], sort_dicts=False))
+
+            from auc.aucs import compute_freqbin_consensus
+            freqbin_df = compute_freqbin_consensus(auc_dfs[split])
+            logger.log_df_as_artifact(freqbin_df, filename=freqbin_filenames[split], artifact_path="aucs")
+            logging.info(
+                "%s freq-bin consensus (mean over %d bins): %.4f\n%s",
+                split, len(freqbin_df), freqbin_df["auc_simple_mean"].mean(),
+                freqbin_df.to_string(index=False),
+            )
 
         auc_df = auc_dfs["test"]
 
