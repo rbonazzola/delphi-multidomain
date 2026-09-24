@@ -1,4 +1,5 @@
 import copy
+import signal
 import time
 import pandas as pd
 from typing import List, Dict, Union
@@ -485,6 +486,31 @@ class Trainer(BaseTrainer):
 
         # Inverse-frequency token weights for loss reweighting
         self._token_weights = self._build_token_weights(self._current_alpha)
+
+        self._register_timeout_signal_handler()
+
+    def _register_timeout_signal_handler(self):
+        """SLURM sends SIGTERM some grace period before SIGKILL when a job hits its walltime.
+        A run killed mid-training otherwise leaves no trace of *why* it's missing/incomplete —
+        this project has repeatedly had to reconstruct that after the fact by cross-referencing
+        `sacct` (which eventually purges old job records) or by comparing epoch counts against
+        sibling folds. Tag it directly on the MLflow run instead, so it's a permanent, queryable
+        fact (see utils/resolve_runs.py, which auto-excludes `timeout_truncated=true` runs).
+        Best-effort: if the tag write itself fails or the grace period is too short to complete
+        it, this is no worse than the previous no-signal-handler behavior.
+        """
+        def _handle_sigterm(signum, frame):
+            try:
+                self.logger.log_tags({
+                    "terminated_by_signal": "SIGTERM",
+                    "terminated_at_epoch": str(self.current_epoch),
+                })
+            except Exception:
+                pass
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
 
     def _setup_baseline_cce(self, model, incidence_path: str):
         from delphi.model import Delphi
