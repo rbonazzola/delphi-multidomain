@@ -395,7 +395,7 @@ def config_from_runid(runid: str):
     state_dict = strip_compiled_prefix(ckpt["state_dict"])
     model.load_state_dict(state_dict, strict=False)
 
-    root_path = DELPHI_DIR / "data" / "transforms"
+    root_path = DELPHI_DIR / (runinfo.data.params.get("data_root") or "data/transforms")  # synthetic-cohort runs log their own
     continuous_domains = {
         dname: cfg.n_latent_tokens or 1
         for dname, cfg in delphi_cfg.domains.items()
@@ -526,6 +526,7 @@ def config_from_runid_multistream(runid: str, no_event_token_rate: float | None 
     logged_birth_dates_file = params.pop("birth_dates_file", None)
     birth_dates_file = logged_birth_dates_file or birth_dates_file
     params.pop("date_cutoff", None)  # authoritative copy comes from checkpoint metadata below
+    data_root = params.pop("data_root", None) or "data/transforms"  # synthetic-cohort runs log their own
 
     bs_schedule_str = params.pop("batch_size_schedule", None)
     bs_scheduler = (
@@ -573,7 +574,7 @@ def config_from_runid_multistream(runid: str, no_event_token_rate: float | None 
         for group in re.findall(r"\[([^\]]+)\]", arch_str)
         for name in group.split(",")
     ))
-    root_path = DELPHI_DIR / "data" / "transforms"
+    root_path = DELPHI_DIR / data_root
     default_cfg_per_domain = load_domain_config(yaml_path, root_path / "tokens")
     domain_cfg = {
         k: v for k, v in default_cfg_per_domain.items()

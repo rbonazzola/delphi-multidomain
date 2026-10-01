@@ -174,8 +174,9 @@ def get_continuous_domains(domain_cfg):
 
 
 def get_dataloaders(domain_cfg, model, args):
+    data_root = DELPHI_DIR / args.data_root
     train_ids, val_ids, test_ids = get_data_partitions(
-        "./data/transforms/subject_lists", fold=args.test_fold
+        str(data_root / "subject_lists"), fold=args.test_fold
     )
 
     if args.subjects is not None:
@@ -188,7 +189,7 @@ def get_dataloaders(domain_cfg, model, args):
     cache_block_size = AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
 
     dataset_kwargs = dict(
-        root=root_path,
+        root=data_root,
         domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
         block_size=cache_block_size,
@@ -308,6 +309,9 @@ def get_cli_args():
     parser.add_argument("--no_event_token_insertion_mode", "--no-event-token-insertion-mode",
                         dest="no_event_token_insertion_mode", default="random", type=str)
     parser.add_argument("--subjects", default=None, type=str)
+    parser.add_argument("--data_root", "--data-root", dest="data_root", default="data/transforms",
+                        help="Directory with tokens/<domain>/ and subject_lists/ (e.g. a synthetic cohort "
+                             "from generate_synthetic_cohort.py). Relative to the repo root.")
     parser.add_argument("--date_cutoff", "--date-cutoff", dest="date_cutoff", default=None)
     parser.add_argument("--birth_dates_file", "--birth-dates-file", dest="birth_dates_file", default=None)
     parser.add_argument("--test_fold", "--test-fold", dest="test_fold", default=1, type=int)
@@ -419,7 +423,7 @@ if __name__ == "__main__":
         # ── Domain config ─────────────────────────────────────────────────────
         domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
-        default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / "tokens")
+        default_cfg_per_domain = load_domain_config(domain_config_yaml, DELPHI_DIR / args.data_root / "tokens")
         domain_cfg = {
             k: v for k, v in default_cfg_per_domain.items()
             if k in domains or k in ("padding", "no_event")
@@ -504,6 +508,7 @@ if __name__ == "__main__":
             "no_event_token_insertion_mode":  args.no_event_token_insertion_mode,
             "date_cutoff":                    args.date_cutoff,
             "birth_dates_file":               args.birth_dates_file,
+            "data_root":                      args.data_root,
         }
 
     else:
