@@ -109,7 +109,13 @@ def apply_domain_overrides(domain_cfg: dict, overrides: list[str]) -> dict:
     ``null`` → None, plain strings stay as str.
 
     Raises ``ValueError`` for unknown domains or unknown DomainConfig fields.
+
+    A single element may hold several whitespace-separated overrides. sarray_params passes a
+    TSV cell like "no_event.predict=True diseases.dropout_rate=0.0" as ONE argument; without
+    this split, everything after the first "=" became the value of the first override, and the
+    other overrides were silently dropped.
     """
+    overrides = [tok for override in overrides for tok in override.split()]
     for override in overrides:
         if "=" not in override or "." not in override.split("=", 1)[0]:
             raise ValueError(
