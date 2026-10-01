@@ -58,8 +58,3 @@ genetic_pcs:
   input_size: 40
   n_latent_tokens: 5
 
-rare_variants:
-  projector: embed
-  path: rare_variants
-  at_birth: true
-

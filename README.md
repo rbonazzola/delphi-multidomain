@@ -7,7 +7,7 @@
 This repository extends the **Delphi** core codebase to support **multi-domain longitudinal data**, beyond standard diagnosis codes.
 
 It focuses on:
-- Adding heterogeneous domains (e.g. diseases, drugs, lifestyle, HLA alleles, rare variants).
+- Adding heterogeneous domains (e.g. diseases, drugs, lifestyle, HLA alleles).
 - Defining **custom attention policies** within and across domains.
 - Scaling experiments via **Slurm job arrays** while tracking models with MLflow.
 
@@ -95,7 +95,7 @@ Each domain can declare a `group` name used for compact display in logs and run 
 | `core` | diseases, death, lifestyle, sex |
 | `drugs` | cv_drugs, ns_drugs |
 | `hla` | hla_alleles |
-| *(none)* | rare_variants, genetic_pcs — shown by their own name |
+| *(none)* | genetic_pcs — shown by its own name |
 
 You can override or add groups via `--dcfg` or in a child config that extends the default.
 
@@ -221,7 +221,7 @@ Add your own aliases to that file to avoid repeating long scheme strings across 
 #### Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)
 
 For instance:
-`"[sex,diseases,lifestyle,death,hla_alleles,rare_variants]:causal(mask_ties=True)"`
+`"[sex,diseases,lifestyle,death,hla_alleles]:causal(mask_ties=True)"`
 
 The corresponding attention matrix:
 
@@ -273,11 +273,11 @@ ensuring temporal consistency while allowing conditioning on static information.
 
 ```bash
 python train.py \
-  --domains diseases,death,lifestyle,sex,rare_variants \
-  --attention_scheme "[sex,diseases,lifestyle,death,rare_variants]:causal(mask_ties=True)" \
+  --domains diseases,death,lifestyle,sex \
+  --attention_scheme "[sex,diseases,lifestyle,death]:causal(mask_ties=True)" \
   --n_layer 12 \
   --n_embd 240 \
-  --experiment_name rare_variants \
+  --experiment_name example \
   --run_name_prefix fold1 \
   --batch_size_schedule "10:32,10:64,*:256x4" \
   --eval_batch_size 512
