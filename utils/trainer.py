@@ -253,7 +253,9 @@ class MLFlowLogger:
         return urlparse(uri).path if uri.startswith("file://") else uri
 
     def build_state_dict(self, model, optimizer, scheduler=None, metadata=None):
+        from utils.ckpt_utils import model_spec
         return {
+            "model_spec": model_spec(model),
             "state_dict": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler else None,
@@ -398,6 +400,7 @@ class Trainer(BaseTrainer):
           token_loss_alpha=0.0,
           token_loss_alpha_scheduler=None,
           keep_top_k_checkpoints=5,
+          data_config=None,
         ):
 
         self.model           = model
@@ -411,6 +414,9 @@ class Trainer(BaseTrainer):
         # wouldn't. Pass None explicitly to keep every "on improvement" checkpoint
         # unbounded (the original, pre-top-k behavior).
         self.keep_top_k_checkpoints = keep_top_k_checkpoints
+        # How the dataloaders were built (data_root, no-event sampling, date_cutoff, ...),
+        # stored in every checkpoint's metadata so evaluation can rebuild them identically.
+        self.data_config = dict(data_config or {})
 
         from data.dataset import DataModule
         if isinstance(dataloaders, DataModule):
@@ -680,7 +686,8 @@ class Trainer(BaseTrainer):
                     "n_params": sum(p.numel() for p in self.model.parameters()),
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "attention_scheme": getattr(self.model.config, "attention_scheme", None),
-                    "date_cutoff": None,
+                    "date_cutoff": self.data_config.get("date_cutoff"),
+                    "data_config": self.data_config,
                 } | self.get_subject_ids_per_partition()
 
                 if improved:

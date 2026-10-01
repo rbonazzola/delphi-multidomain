@@ -350,6 +350,12 @@ def main():
         use_amp=args.use_amp,
         use_rich=not args.no_rich,
         optim_config=optim_config,
+        data_config={
+            "data_root": "data/transforms",
+            "required_domains": ["sex"],
+            "no_event_token_rate": args.no_event_token_rate,
+            "no_event_token_insertion_mode": args.no_event_token_insertion_mode,
+        },
     )
 
     trainer.train(max_epochs=args.max_epochs, min_epochs=args.min_epochs, patience=args.patience)
