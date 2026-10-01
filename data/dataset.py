@@ -56,6 +56,7 @@ class DelphiBatch:
     continuous_data: Dict[str, torch.Tensor]           # {name: [B, dim]}
     continuous_positions: Dict[str, torch.Tensor]      # {name: [B, n_latent]}
     eval_mask: Optional[torch.Tensor] = None          # [B, T]  bool; True = post-cutoff (exclude from loss)
+    cutoff_ages: Optional[torch.Tensor] = None        # [B]     float; age (days) at date_cutoff, inf if birth date unknown
 
     def to(self, device: Union[str, torch.device]) -> "DelphiBatch":
         """Move all tensors to device."""
@@ -71,6 +72,7 @@ class DelphiBatch:
                 k: v.to(device) for k, v in self.continuous_positions.items()
             },
             eval_mask=self.eval_mask.to(device) if self.eval_mask is not None else None,
+            cutoff_ages=self.cutoff_ages.to(device) if self.cutoff_ages is not None else None,
         )
 
     @property
@@ -828,6 +830,8 @@ class DelphiDataset(Dataset):
         }
         if self._eval_mask is not None:
             item["eval_mask"] = self._eval_mask[index].clone()
+        if self._cutoff_ages is not None:
+            item["cutoff_age"] = self._cutoff_ages[index].clone()
         return item
 
 
@@ -912,6 +916,8 @@ class DelphiCollateFn:
         real_counts = torch.stack([item["real_count"] for item in batch])       # [B]
         max_ages = torch.stack([item["max_age"] for item in batch])             # [B]
         subject_ids = torch.stack([item["subject_id"] for item in batch])       # [B]
+        has_cutoff_age = "cutoff_age" in batch[0]
+        cutoff_ages = torch.stack([item["cutoff_age"] for item in batch]) if has_cutoff_age else None  # [B]
 
         # Stack continuous data
         continuous_data = {}
@@ -1065,6 +1071,7 @@ class DelphiCollateFn:
             continuous_data=continuous_data,
             continuous_positions=continuous_positions,
             eval_mask=eval_mask,
+            cutoff_ages=cutoff_ages,
         )
 
 
