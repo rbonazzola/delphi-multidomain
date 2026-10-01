@@ -252,6 +252,9 @@ def get_cli_args():
     parser.add_argument("--lr_decay_iters", "--lr-decay-iters", dest="lr_decay_iters", default=10000, type=int)
     parser.add_argument("--test_fold", "--test-fold",       dest="test_fold",      default=1,     type=int)
     parser.add_argument("--subjects",                                               default=None,  type=str)
+    parser.add_argument("--data_root", "--data-root", dest="data_root", default="data/transforms", type=str,
+                        help="Directory with tokens/<domain>/ and subject_lists/ (e.g. a synthetic cohort "
+                             "from generate_synthetic_cohort.py). Relative to the repo root.")
     parser.add_argument("--date_cutoff", "--date-cutoff",   dest="date_cutoff",    default=None,  type=str,
                         help="ISO date (YYYY-MM-DD). Tokens after this date are marked via eval_mask.")
     parser.add_argument("--birth_dates_file", "--birth-dates-file", dest="birth_dates_file", default=None, type=str,
@@ -456,8 +459,9 @@ def get_dataloaders(
     seed=42,
     subjects_include_list=None,
 ):
+    data_root = DELPHI_DIR / args.data_root
     train_ids, val_ids, test_ids = get_data_partitions(
-        "./data/transforms/subject_lists", fold=test_fold
+        str(data_root / "subject_lists"), fold=test_fold
     )
     
     if subjects_include_list is not None:
@@ -473,7 +477,7 @@ def get_dataloaders(
     cache_block_size = AUTO_BLOCK_SIZE if block_size == "auto" else block_size
 
     dataset_kwargs = dict(
-        root=root_path,
+        root=data_root,
         domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
         block_size=cache_block_size,
@@ -561,7 +565,7 @@ if __name__ == "__main__":
         args.attention_scheme = parse_attention_scheme(args.attention_scheme)
         domains = [d for d in args.domains.split(",") if d not in ("padding", "no_event")]
         domain_config_yaml = DELPHI_DIR / args.domain_config_yaml
-        default_cfg_per_domain = load_domain_config(domain_config_yaml, root_path / 'tokens')
+        default_cfg_per_domain = load_domain_config(domain_config_yaml, DELPHI_DIR / args.data_root / 'tokens')
 
         # Expand group aliases (e.g. "core" → ["diseases", "death", "lifestyle", "sex"])
         group_to_domains = {}
@@ -668,6 +672,7 @@ if __name__ == "__main__":
             "domain_list": ",".join(domains),
             "token_loss_alpha": args.token_loss_alpha,
             "token_loss_alpha_schedule": args.token_loss_alpha_schedule,
+            "data_root": args.data_root,
         }
         for dname, cfg in domain_cfg.items():
             if cfg.dropout_mode is not None and cfg.dropout_rate > 0:
@@ -774,7 +779,7 @@ if __name__ == "__main__":
         token_loss_alpha=args.token_loss_alpha,
         token_loss_alpha_scheduler=args.token_loss_alpha_schedule,
         data_config={
-            "data_root": "data/transforms",
+            "data_root": args.data_root,
             "required_domains": ["diseases"],
             "no_event_token_rate": args.no_event_token_rate,
             "no_event_token_insertion_mode": args.no_event_token_insertion_mode,
