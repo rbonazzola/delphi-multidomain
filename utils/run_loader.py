@@ -70,10 +70,9 @@ def reconstruct_from_run(
     loaders      : dict[str, DataLoader] — one entry per requested split.
     run_params   : dict — raw MLflow params.
     """
-    from delphi.model import Delphi, DelphiConfig
     from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
-    from utils.mlflow_utils import get_checkpoint_path, load_run_params, parse_domains_param
-    from utils.ckpt_utils import strip_compiled_prefix
+    from utils.mlflow_utils import get_checkpoint_path, load_run_params
+    from utils.ckpt_utils import load_model_from_checkpoint
 
     if device is None:
         device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
@@ -102,23 +101,6 @@ def reconstruct_from_run(
             if metadata.get(key) is None:
                 raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
 
-    if domain_config_yaml is not None:
-        from utils.utils import load_domain_config
-        tokens_root = Path(tokens_path).resolve() if tokens_path else DELPHI_DIR / "data" / "transforms" / "tokens"
-        domain_cfg = load_domain_config(domain_config_yaml, tokens_path=tokens_root)
-    else:
-        domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
-
-    if tokens_path is not None:
-        # Must be absolute: DelphiDataset only uses a domain's `path` as-is when
-        # it's absolute, otherwise it re-joins it under root/"tokens"/... -- a
-        # relative tokens_path here would silently double that prefix.
-        tokens_root = Path(tokens_path).resolve()
-        for dname, dcfg in domain_cfg.items():
-            if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
-                continue
-            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
-
     stored_block_size = params.get("block_size", "96")
     if block_size is not None:
         bs = block_size
@@ -131,33 +113,41 @@ def reconstruct_from_run(
     else:
         bs = int(stored_block_size)
 
-    attn_scheme = params.get("attention_scheme", ["all:causal(mask_ties=True)"])
-    n_layer = int(params.get("n_layer", 12))
-    if isinstance(attn_scheme, str):
-        attn_scheme = [attn_scheme]
-    if len(attn_scheme) == 1:
-        attn_scheme = n_layer * attn_scheme
-
-    delphi_config = DelphiConfig(
-        n_embd=int(params.get("n_embd", 120)),
-        n_layer=n_layer,
-        n_head=int(params.get("n_head", 6)),
-        domains=domain_cfg,
-        attention_scheme=attn_scheme,
-        block_size=bs,
-        token_dropout=float(params.get("token_dropout", 0.1)),
-        no_event_token_rate=float(params.get("no_event_token_rate", 2.0)),
-        no_event_token_insertion_mode=params.get("no_event_token_insertion_mode", "random"),
-        seed=int(params.get("seed", 42)),
-    )
-
-    model = Delphi(delphi_config)
-    state_dict = strip_compiled_prefix(ckpt["state_dict"])
-    model.load_state_dict(state_dict, strict=False)
+    if ckpt.get("model_spec") is not None and domain_config_yaml is None:
+        # Self-contained checkpoint: the exact construction config is stored in it,
+        # no need to parse (possibly truncated) MLflow params.
+        if tokens_path is not None:
+            # Redirect before building: the run's own data (e.g. a synthetic cohort)
+            # may not exist here at all, only a folder sharing its vocabulary.
+            ckpt = {**ckpt, "model_spec": _spec_with_tokens_path(ckpt["model_spec"], tokens_path)}
+        model = load_model_from_checkpoint(ckpt, block_size=bs)
+        domain_cfg = _model_config(model).domains
+    else:
+        model, domain_cfg = _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, tokens_path)
     model = model.to(device)
     model.eval()
 
+    if tokens_path is not None:
+        # Must be absolute: DelphiDataset only uses a domain's `path` as-is when
+        # it's absolute, otherwise it re-joins it under root/"tokens"/... -- a
+        # relative tokens_path here would silently double that prefix.
+        tokens_root = Path(tokens_path).resolve()
+        for dname, dcfg in domain_cfg.items():
+            if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
+                continue
+            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
+
     logging.info("Model loaded: %d parameters", sum(p.numel() for p in model.parameters()))
+
+    # DelphiConfig carries the no-event sampling settings; DelphiMultiStreamConfig doesn't,
+    # so for MultiStream they come from the checkpoint's data_config.
+    model_cfg = _model_config(model)
+    data_config = metadata.get("data_config", {})
+    no_event_token_rate = data_config.get("no_event_token_rate", getattr(model_cfg, "no_event_token_rate", 2.0))
+    no_event_insertion_mode = data_config.get(
+        "no_event_token_insertion_mode", getattr(model_cfg, "no_event_token_insertion_mode", "random")
+    )
+    seed = model_cfg.seed
 
     continuous_domains = {
         dname: cfg.n_latent_tokens or 1
@@ -168,9 +158,9 @@ def reconstruct_from_run(
     root_path = DELPHI_DIR / "data" / "transforms"
 
     age_sampler = AgeSampler(
-        insertion_mode=delphi_config.no_event_token_insertion_mode,
-        token_rate=delphi_config.no_event_token_rate,
-        seed=delphi_config.seed,
+        insertion_mode=no_event_insertion_mode,
+        token_rate=no_event_token_rate,
+        seed=seed,
     )
 
     collate = DelphiCollateFn(
@@ -196,8 +186,8 @@ def reconstruct_from_run(
             subjects=split_subjects,
             exclusions=[],
             required_domains=["diseases"],
-            no_event_token_rate=delphi_config.no_event_token_rate,
-            no_event_insertion_mode=delphi_config.no_event_token_insertion_mode,
+            no_event_token_rate=no_event_token_rate,
+            no_event_insertion_mode=no_event_insertion_mode,
             continuous_domains=continuous_domains,
             age_domains=["diseases", "death"],
             date_cutoff=date_cutoff,
@@ -213,6 +203,66 @@ def reconstruct_from_run(
         )
 
     return model, loaders, params
+
+
+def _spec_with_tokens_path(spec: dict, tokens_path) -> dict:
+    """Copy of a model_spec with every domain's data path moved to tokens_path/<folder>."""
+    import copy
+    spec = copy.deepcopy(spec)
+    tokens_root = Path(tokens_path).resolve()
+    for dcfg in spec["config"]["domains"].values():
+        if dcfg.get("path"):
+            dcfg["path"] = str(tokens_root / Path(dcfg["path"]).name)
+    return spec
+
+
+def _model_config(model):
+    """The model's config dataclass: DelphiConfig (Delphi) or DelphiMultiStreamConfig."""
+    return getattr(model, "config", None) or model._config
+
+
+def _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, tokens_path):
+    """
+    Legacy path for checkpoints saved before "model_spec" was stored in them:
+    rebuild a (single-trunk) Delphi from the run's MLflow params, whose 'domains'
+    value may be truncated at MLflow's 6000-char limit (then recovered from the
+    run's config artifact, or from an explicit domain_config_yaml).
+    """
+    from delphi.model import Delphi, DelphiConfig
+    from utils.mlflow_utils import parse_domains_param
+    from utils.ckpt_utils import strip_compiled_prefix
+
+    if domain_config_yaml is not None:
+        from utils.utils import load_domain_config
+        tokens_root = Path(tokens_path).resolve() if tokens_path else DELPHI_DIR / "data" / "transforms" / "tokens"
+        domain_cfg = load_domain_config(domain_config_yaml, tokens_path=tokens_root)
+    else:
+        domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
+
+    attn_scheme = params.get("attention_scheme", ["all:causal(mask_ties=True)"])
+    n_layer = int(params.get("n_layer", 12))
+    if isinstance(attn_scheme, str):
+        attn_scheme = [attn_scheme]
+    if len(attn_scheme) == 1:
+        attn_scheme = n_layer * attn_scheme
+
+    delphi_config = DelphiConfig(
+        n_embd=int(params.get("n_embd", 120)),
+        n_layer=n_layer,
+        n_head=int(params.get("n_head", 6)),
+        domains=domain_cfg,
+        attention_scheme=attn_scheme,
+        block_size=bs,
+        token_dropout=float(params.get("token_dropout", 0.1)),
+        no_event_token_rate=float(params.get("no_event_token_rate", 2.0)),
+        no_event_token_insertion_mode=params.get("no_event_token_insertion_mode", "random"),
+        seed=int(params.get("seed", 42)),
+    )
+
+    model = Delphi(delphi_config)
+    state_dict = strip_compiled_prefix(ckpt["state_dict"])
+    model.load_state_dict(state_dict, strict=False)
+    return model, domain_cfg
 
 
 def reconstruct_model(run_id: str):
