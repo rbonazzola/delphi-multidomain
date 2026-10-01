@@ -136,20 +136,43 @@ def _extract_domain_dict(domains_str: str, domain_name: str) -> dict:
     return ast.literal_eval(snippet)
 
 
-def _detect_hla_encoding(domains_str: str) -> tuple[str, list, dict]:
-    """Returns (encoding_label, hla_domain_names, representative_domain_dict), reading
-    only domain key names + one targeted domain dict from the raw `domains` param
-    string (see _extract_domain_dict for why not the full parse)."""
-    keys = re.findall(r"'(\w+)':\s*\{", domains_str)
+def parse_domain_param(value: str) -> dict:
+    """Parse one `domains.<name>` param (see utils.ckpt_utils.domain_params) into a dict of
+    its non-default DomainConfig fields, e.g. "freeze=True dropout_rate=0.1" ->
+    {"freeze": True, "dropout_rate": 0.1}. "default" -> {}."""
+    if value == "default":
+        return {}
+    out = {}
+    for item in value.split():
+        k, v = item.split("=", 1)
+        try:
+            out[k] = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            out[k] = v
+    return out
 
-    if "hla_alleles" in keys:
-        d = _extract_domain_dict(domains_str, "hla_alleles")
+
+def domain_params_from_run_params(params: dict) -> Optional[dict]:
+    """{domain_name: non-default-fields dict} from a run's `domains.*` params, or None for
+    runs logged before those params existed."""
+    from utils.ckpt_utils import DOMAIN_PARAM_PREFIX
+    doms = {k[len(DOMAIN_PARAM_PREFIX):]: parse_domain_param(v)
+            for k, v in params.items() if k.startswith(DOMAIN_PARAM_PREFIX)}
+    return doms or None
+
+
+def _detect_hla_encoding(domain_names: list, get_domain) -> tuple[str, list, dict]:
+    """Returns (encoding_label, hla_domain_names, representative_domain_dict), given the
+    run's domain names and a get_domain(name) -> dict accessor (backed either by the
+    `domains.*` params or by brace-matching the raw `domains` param, see get_run_setup)."""
+    if "hla_alleles" in domain_names:
+        d = get_domain("hla_alleles")
         encoding = "1field" if d.get("token_value_column") == "allele_1field" else "2field"
         return encoding, ["hla_alleles"], d
 
-    hla_loci = [k for k in keys if k.startswith("hla_") and k != "hla_alleles"]
+    hla_loci = [k for k in domain_names if k.startswith("hla_") and k != "hla_alleles"]
     if hla_loci:
-        d = _extract_domain_dict(domains_str, hla_loci[0])
+        d = get_domain(hla_loci[0])
         encoding = "esm2_pca" if "pca" in str(d.get("pretrained_path") or "") else "esm2_raw"
         return encoding, hla_loci, d
 
@@ -176,11 +199,18 @@ def _hla_attention(attention_scheme, hla_domains: list) -> Optional[str]:
 def get_run_setup(params: dict) -> RunSetup:
     """Decode a run's MLflow params (as returned by load_run_params) into a RunSetup.
 
-    Reads `params["domains"]` (the resolved, post-override DomainConfig dict — the
-    ground truth for what actually ran) rather than the domain_config_yaml path or
-    run_name, so it works regardless of --dcfg overrides or naming conventions.
+    Reads the resolved, post-override domain config (the ground truth for what
+    actually ran) rather than the domain_config_yaml path or run_name, so it works
+    regardless of --dcfg overrides or naming conventions: from the per-domain `domains.*`
+    params when present, else (older runs) by brace-matching the raw `domains` param.
     """
-    domains_str = params["domains"]
+    doms = domain_params_from_run_params(params)
+    if doms is not None:
+        domain_names, get_domain = list(doms), doms.__getitem__
+    else:
+        domains_str = params["domains"]
+        domain_names = re.findall(r"'(\w+)':\s*\{", domains_str)
+        get_domain = lambda name: _extract_domain_dict(domains_str, name)
 
     attention_scheme = params.get("attention_scheme")
     if isinstance(attention_scheme, str):
@@ -189,7 +219,7 @@ def get_run_setup(params: dict) -> RunSetup:
         except (ValueError, SyntaxError):
             attention_scheme = [attention_scheme]
 
-    encoding, hla_domains, hla_cfg = _detect_hla_encoding(domains_str)
+    encoding, hla_domains, hla_cfg = _detect_hla_encoding(domain_names, get_domain)
     dropout_mode = hla_cfg.get("dropout_mode")
     dropout_rate = hla_cfg.get("dropout_rate") or 0.0
     attention = _hla_attention(attention_scheme, hla_domains)

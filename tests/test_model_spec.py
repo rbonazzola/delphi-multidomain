@@ -89,3 +89,30 @@ def test_config_overrides_and_compiled_model():
 
 def test_unknown_model_returns_none():
     assert model_spec(torch.nn.Linear(2, 2)) is None
+
+
+def test_domain_params_roundtrip_and_run_setup():
+    """domains.* params carry exactly the non-default fields, parse back, and decode to the
+    same RunSetup as the legacy brace-matching of the raw `domains` param."""
+    from dataclasses import asdict
+
+    from utils.ckpt_utils import domain_params
+    from utils.mlflow_utils import domain_params_from_run_params, get_run_setup
+
+    model = _delphi()
+    params = domain_params(model)
+    assert domain_params(_save_and_load(model)["model_spec"]) == params  # from a checkpoint's spec
+    assert domain_params(None) == {}
+
+    assert "domains.padding" not in params
+    assert set(params) == {f"domains.{d}" for d in model.config.domains if d != "padding"}
+    doms = domain_params_from_run_params(params)
+    assert doms["hla_alleles"]["dropout_mode"] == "block"
+    assert doms["hla_alleles"]["dropout_rate"] == 0.2
+    assert doms["diseases"]["predict"] is True
+    assert "freeze" not in doms["diseases"]  # default fields are omitted
+
+    base = {"attention_scheme": ["[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"], "n_embd": "16", "n_head": "2", "n_layer": "2"}
+    legacy = get_run_setup(base | {"domains": str(asdict(model.config)["domains"])})
+    assert get_run_setup(base | params) == legacy
+    assert legacy.label() == "2field__drop20__bidir"

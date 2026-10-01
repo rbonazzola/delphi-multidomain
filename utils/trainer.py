@@ -640,7 +640,9 @@ class Trainer(BaseTrainer):
         eval_every = None if self.n_validations_per_epoch <= 1 else \
                      max(1, n_batches_epoch // self.n_validations_per_epoch)
 
+        from utils.ckpt_utils import domain_params
         self.logger.log_params(self.model.config)
+        self.logger.log_params(domain_params(self.model))
         self.logger.log_params(self.additional_mlflow_params)
 
         if self.batch_size_scheduler is not None:

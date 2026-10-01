@@ -160,6 +160,40 @@ def model_spec(model) -> dict | None:
     return {"version": MODEL_SPEC_VERSION, **spec}
 
 
+DOMAIN_PARAM_PREFIX = "domains."
+
+
+def domain_params(model_or_spec) -> dict:
+    """
+    One compact MLflow param per domain (domains.<name>), derived from model_spec(model)
+    -- or directly from a model_spec dict, e.g. a checkpoint's ckpt["model_spec"], so
+    older runs can be backfilled without building the model:
+    {"domains.hla_a": "projector=pretrained freeze=True ...", ...}.
+
+    Each value lists only the fields that differ from DomainConfig's defaults, as
+    space-separated `field=value` pairs (the --dcfg syntax), so it stays far below
+    MLflow's 6000-char limit -- unlike the full `domains` param -- and runs can be
+    compared with a single mlflow.search_runs call. A domain with no non-default
+    field is logged as "default"; a domain absent from the run has no column (NA).
+    Parse back with utils.mlflow_utils.parse_domain_param. Relies on DomainConfig
+    defaults never changing (add new fields instead); the checkpoint's model_spec
+    remains the complete record.
+    """
+    from delphi.model import DomainConfig
+
+    spec = model_or_spec if isinstance(model_or_spec, dict) or model_or_spec is None else model_spec(model_or_spec)
+    if spec is None:
+        return {}
+    defaults = {f.name: f.default for f in dc_fields(DomainConfig)}
+    params = {}
+    for name, dcfg in spec["config"]["domains"].items():
+        if name == "padding":
+            continue
+        items = [f"{k}={v}" for k, v in dcfg.items() if k in defaults and v != defaults[k]]
+        params[f"{DOMAIN_PARAM_PREFIX}{name}"] = " ".join(items) or "default"
+    return params
+
+
 def _domain_configs_from_spec(domains: dict, repo_dir: Path) -> dict:
     from delphi.model import DomainConfig
 
