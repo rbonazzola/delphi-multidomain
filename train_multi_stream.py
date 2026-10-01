@@ -620,7 +620,7 @@ if __name__ == "__main__":
         batch_size_scheduler=bs_scheduler,
         start_epoch=start_epoch,
         data_config={
-            "data_root": "data/transforms",
+            "data_root": args.data_root,
             "required_domains": ["diseases"],
             "no_event_token_rate": args.no_event_token_rate,
             "no_event_token_insertion_mode": args.no_event_token_insertion_mode,

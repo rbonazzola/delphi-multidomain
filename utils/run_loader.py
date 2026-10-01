@@ -155,7 +155,12 @@ def reconstruct_from_run(
         if cfg.type == "continuous"
     }
 
-    root_path = DELPHI_DIR / "data" / "transforms"
+    data_root = (
+        data_config.get("data_root")
+        or params.get("data_root")
+        or "data/transforms"
+    )
+    root_path = DELPHI_DIR / data_root
 
     age_sampler = AgeSampler(
         insertion_mode=no_event_insertion_mode,
