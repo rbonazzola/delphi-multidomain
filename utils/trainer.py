@@ -179,6 +179,7 @@ class EarlyStopping:
 
 class NullLogger:
     def log_params(self, params):      pass
+    def log_dict(self, dictionary, artifact_file): pass
     def log_tags(self, tags):          pass
     def log_metrics(self, metrics, step=None): pass
     def log_artifact(self, path, artifact_path=None): pass
@@ -223,6 +224,9 @@ class MLFlowLogger:
 
     def log_params(self, params):
         mlflow.log_params(params)
+
+    def log_dict(self, dictionary, artifact_file):
+        mlflow.log_dict(dictionary, artifact_file)
 
     def log_tags(self, tags):
         mlflow.set_tags(tags)
@@ -640,9 +644,12 @@ class Trainer(BaseTrainer):
         eval_every = None if self.n_validations_per_epoch <= 1 else \
                      max(1, n_batches_epoch // self.n_validations_per_epoch)
 
-        from utils.ckpt_utils import domain_params
+        from utils.ckpt_utils import MODEL_SPEC_ARTIFACT, domain_params, model_spec
         self.logger.log_params(self.model.config)
-        self.logger.log_params(domain_params(self.model))
+        spec = model_spec(self.model)
+        if spec is not None:
+            self.logger.log_dict(spec, MODEL_SPEC_ARTIFACT)
+            self.logger.log_params(domain_params(spec))
         self.logger.log_params(self.additional_mlflow_params)
 
         if self.batch_size_scheduler is not None:

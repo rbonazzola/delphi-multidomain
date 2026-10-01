@@ -116,3 +116,41 @@ def test_domain_params_roundtrip_and_run_setup():
     legacy = get_run_setup(base | {"domains": str(asdict(model.config)["domains"])})
     assert get_run_setup(base | params) == legacy
     assert legacy.label() == "2field__drop20__bidir"
+
+
+def test_model_spec_artifact_roundtrip_and_checkpoint_fallback(tmp_path, monkeypatch):
+    """The spec logged as a json artifact (as Trainer does) is read back by
+    load_model_spec without touching the checkpoint, rebuilds the same model, and
+    runs without the artifact fall back to the checkpoint's copy."""
+    import mlflow
+
+    from utils.ckpt_utils import MODEL_SPEC_ARTIFACT, model_from_spec
+    from utils.mlflow_utils import get_artifacts_dir, load_model_spec
+    from utils.trainer import MLFlowLogger
+
+    tracking = tmp_path / "mlruns"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", str(tracking))
+    mlflow.set_tracking_uri(str(tracking))
+
+    model = _delphi()
+    spec = model_spec(model)
+
+    logger = MLFlowLogger("spec_test", run_name="with_json")
+    logger.log_dict(spec, MODEL_SPEC_ARTIFACT)
+    with_json = logger.active_run.info.run_id
+    logger.end()
+
+    loaded = load_model_spec(with_json, fallback_to_checkpoint=False)
+    assert loaded == spec
+    rebuilt = model_from_spec(loaded)
+    assert rebuilt.state_dict().keys() == model.state_dict().keys()
+
+    logger = MLFlowLogger("spec_test", run_name="ckpt_only")
+    ckpt_only = logger.active_run.info.run_id
+    logger.end()
+    ckpt_dir = get_artifacts_dir(ckpt_only) / "checkpoints"
+    ckpt_dir.mkdir(parents=True)
+    torch.save({"model_spec": spec, "state_dict": {}}, ckpt_dir / "best_model.pt")
+
+    assert load_model_spec(ckpt_only, fallback_to_checkpoint=False) is None
+    assert load_model_spec(ckpt_only) == spec

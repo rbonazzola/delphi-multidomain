@@ -160,6 +160,14 @@ def model_spec(model) -> dict | None:
     return {"version": MODEL_SPEC_VERSION, **spec}
 
 
+# The same spec is stored three times, each for a different reader:
+#   1. in every checkpoint (ckpt["model_spec"])  -- rebuild the model from the .pt alone
+#   2. as the run artifact MODEL_SPEC_ARTIFACT    -- read a run's full config without
+#      loading a checkpoint (utils.mlflow_utils.load_model_spec)
+#   3. as compact `domains.<name>` MLflow params  -- compare many runs with one
+#      mlflow.search_runs call (domain_params below)
+# All three are written from the same model_spec() call, never edited afterwards.
+MODEL_SPEC_ARTIFACT = "config/model_spec.json"
 DOMAIN_PARAM_PREFIX = "domains."
 
 

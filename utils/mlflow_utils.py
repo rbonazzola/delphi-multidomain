@@ -245,12 +245,29 @@ def get_run_setup_for_run(run_id: str) -> RunSetup:
 
 
 
-def get_checkpoint_path(run_id: str) -> Path:
+def load_model_spec(run_id: str, fallback_to_checkpoint: bool = True) -> Optional[dict]:
+    """A run's full model_spec (see utils.ckpt_utils.model_spec), read from its small
+    MODEL_SPEC_ARTIFACT json instead of the checkpoint. For runs without that artifact,
+    falls back to loading the best checkpoint (slow) unless fallback_to_checkpoint=False.
+    Returns None if neither has it (runs predating model specs, not backfilled)."""
+    import json
+    from utils.ckpt_utils import MODEL_SPEC_ARTIFACT
+
+    path = get_artifacts_dir(run_id) / MODEL_SPEC_ARTIFACT
+    if path.exists():
+        return json.loads(path.read_text())
+    if not fallback_to_checkpoint:
+        return None
+    ckpt = torch.load(get_checkpoint_path(run_id), map_location="cpu", weights_only=False)
+    return ckpt.get("model_spec")
+
+
+def get_artifacts_dir(run_id: str) -> Path:
     """
-    Return best_model.pt for a run, falling back to the highest-epoch checkpoint.
-    Prefers best_model.pt (lowest validation loss) over the latest epoch.
+    The run's artifacts directory on this filesystem: the logged artifact_uri,
+    relocated under $MLFLOW_TRACKING_URI (it may have been logged on another
+    machine, or before the mlruns directory was moved).
     """
-    
     from urllib.parse import urlparse, unquote
 
     try:
@@ -310,12 +327,19 @@ def get_checkpoint_path(run_id: str) -> Path:
             f"to reconstruct: {artifact_uri}"
         )
 
-    ckpt_dir = tracking_root.joinpath(*relative_parts) / "checkpoints"
+    return tracking_root.joinpath(*relative_parts)
+
+
+def get_checkpoint_path(run_id: str) -> Path:
+    """
+    Return best_model.pt for a run, falling back to the highest-epoch checkpoint.
+    Prefers best_model.pt (lowest validation loss) over the latest epoch.
+    """
+    ckpt_dir = get_artifacts_dir(run_id) / "checkpoints"
     if not ckpt_dir.exists():
         raise FileNotFoundError(
             f"Expected checkpoints directory does not exist: {ckpt_dir} "
-            f"(reconstructed from MLFLOW_TRACKING_URI={tracking_uri} "
-            f"+ relative path {'/'.join(relative_parts)})"
+            f"(relocated under MLFLOW_TRACKING_URI={os.environ.get('MLFLOW_TRACKING_URI')})"
         )
 
     best = ckpt_dir / "best_model.pt"
