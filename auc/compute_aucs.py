@@ -69,7 +69,16 @@ def main():
     parser.add_argument("--output_file", type=str, default=None,
                         help="Filename for the AUC results. Defaults to 'aucs.csv' for "
                              "--split test, 'aucs_val.csv' for --split val, and both "
-                             "(one per split) for --split both.")
+                             "(one per split) for --split both. With --score softmax and no "
+                             "explicit --output_file, defaults instead to 'aucs_softmax.csv' / "
+                             "'aucs_val_softmax.csv' so the two score variants never clobber "
+                             "each other.")
+    parser.add_argument("--score", choices=["logit", "softmax"], default="logit",
+                        help="AUC score input: 'logit' (default, original behavior) uses the "
+                             "raw per-token logit; 'softmax' uses softmax(logits)[token_id] "
+                             "(normalized against every other token in that domain's full "
+                             "vocabulary) instead. Not guaranteed to give the same AUC -- see "
+                             "auc/aucs.py:evaluate_aucs docstring.")
     parser.add_argument("--split", choices=["test", "val", "both"], default="test",
                         help="Which split to evaluate on (default: test, matching the "
                              "original behavior). 'both' computes and logs both.")
@@ -88,7 +97,11 @@ def main():
     args = parser.parse_args()
 
     splits = ["val", "test"] if args.split == "both" else [args.split]
-    default_output_files = {"test": "aucs.csv", "val": "aucs_val.csv"}
+    default_output_files = (
+        {"test": "aucs_softmax.csv", "val": "aucs_val_softmax.csv"}
+        if args.score == "softmax"
+        else {"test": "aucs.csv", "val": "aucs_val.csv"}
+    )
 
     model, loaders, run_params = reconstruct_from_run(
         args.runid,
@@ -123,6 +136,7 @@ def main():
                 n_jobs=args.n_jobs,
                 logger=logger,
                 output_file=output_file,
+                score_transform=args.score,
             )
             logging.info(f"Done ({split}). {len(auc_df)} AUC rows computed.")
     finally:
