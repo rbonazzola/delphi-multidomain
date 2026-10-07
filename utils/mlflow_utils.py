@@ -63,13 +63,12 @@ def _load_domains_from_config_artifact(run_id: str) -> dict:
     "config" artifact, so fall back to finetune_source_run_id when this run
     has none of its own.
     """
-    try:
-        local_dir = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="config")
-    except OSError:
+    local_dir = artifact_local_path(run_id, "config")
+    if not local_dir.is_dir():
         source_run_id = mlflow.get_run(run_id).data.params.get("finetune_source_run_id")
         if not source_run_id:
             raise FileNotFoundError(f"No 'config' artifact for run {run_id} and no finetune_source_run_id to fall back to")
-        local_dir = mlflow.artifacts.download_artifacts(run_id=source_run_id, artifact_path="config")
+        local_dir = artifact_local_path(source_run_id, "config")
     yaml_files = sorted(Path(local_dir).glob("domain_config_*.yaml"))
     if not yaml_files:
         raise FileNotFoundError(
@@ -262,14 +261,31 @@ def load_model_spec(run_id: str, fallback_to_checkpoint: bool = True) -> Optiona
     return ckpt.get("model_spec")
 
 
+def _tracking_root() -> Optional[Path]:
+    """Local directory of the file-based tracking store ($MLFLOW_TRACKING_URI, else
+    mlflow's current tracking URI), or None if it isn't a local file store."""
+    uri = os.environ.get("MLFLOW_TRACKING_URI") or mlflow.get_tracking_uri()
+    parsed = urlparse(unquote(uri))
+    if parsed.scheme not in ("file", ""):
+        return None
+    return Path(parsed.path).resolve()
+
+
 def get_artifacts_dir(run_id: str) -> Path:
     """
-    The run's artifacts directory on this filesystem: the logged artifact_uri,
-    relocated under $MLFLOW_TRACKING_URI (it may have been logged on another
-    machine, or before the mlruns directory was moved).
-    """
-    from urllib.parse import urlparse, unquote
+    The run's artifacts directory on this filesystem.
 
+    The artifact_uri stored in a run's meta.yaml is an absolute path on the machine that
+    logged it, so it is wrong for a store copied from elsewhere (e.g. rsync'ed from the
+    cluster) or moved since. MLflow's own artifact APIs (client.list_artifacts,
+    mlflow.artifacts.download_artifacts, run.info.artifact_uri) all follow that stored
+    path; read artifacts of existing runs through this function instead (or the helpers
+    below). Tries, in order:
+      1. <tracking store>/<experiment_id>/<run_id>/artifacts  (default file-store layout)
+      2. the logged path relocated under the tracking store, from its 'mlruns' component
+      3. the logged path as-is
+    and returns the first that exists (else the first candidate).
+    """
     try:
         run = mlflow.get_run(run_id)
     except mlflow.exceptions.MlflowException as e:
@@ -277,7 +293,6 @@ def get_artifacts_dir(run_id: str) -> Path:
 
     artifact_uri = run.info.artifact_uri
     artifact_parsed = urlparse(unquote(artifact_uri))
-
     if artifact_parsed.scheme not in ("file", ""):
         raise NotImplementedError(
             f"artifact_uri has scheme '{artifact_parsed.scheme}' (not 'file'). "
@@ -286,48 +301,51 @@ def get_artifacts_dir(run_id: str) -> Path:
             f"mlflow.artifacts.download_artifacts(run_id=run_id) instead. "
             f"Original artifact_uri: {artifact_uri}"
         )
+    logged = Path(artifact_parsed.path)
 
-    artifact_path = Path(artifact_parsed.path)
+    candidates = []
+    root = _tracking_root()
+    if root is not None:
+        candidates.append(root / run.info.experiment_id / run.info.run_id / "artifacts")
+        if "mlruns" in logged.parts:
+            idx = len(logged.parts) - 1 - logged.parts[::-1].index("mlruns")
+            if logged.parts[idx + 1:]:
+                candidates.append(root.joinpath(*logged.parts[idx + 1:]))
+    candidates.append(logged)
 
-    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
-    if not tracking_uri:
-        raise EnvironmentError(
-            "MLFLOW_TRACKING_URI is not set. It's required to reconstruct the "
-            "artifact path independently of the original filesystem."
-        )
+    return next((c for c in candidates if c.is_dir()), candidates[0])
 
-    tracking_parsed = urlparse(unquote(tracking_uri))
-    if tracking_parsed.scheme not in ("file", ""):
-        raise NotImplementedError(
-            f"MLFLOW_TRACKING_URI has scheme '{tracking_parsed.scheme}' "
-            f"(not 'file') -- it points to a tracking server, not a local filesystem. "
-            f"This path-based approach doesn't apply; use "
-            f"mlflow.artifacts.download_artifacts(run_id=run_id) instead. "
-            f"Original MLFLOW_TRACKING_URI: {tracking_uri}"
-        )
 
-    tracking_root = Path(tracking_parsed.path)
-    if not tracking_root.exists():
-        raise FileNotFoundError(
-            f"The path from MLFLOW_TRACKING_URI does not exist on this filesystem: {tracking_root}"
-        )
+def artifact_local_path(run_id: str, artifact_path: str = "") -> Path:
+    """Local path of one of the run's artifacts (may not exist), see get_artifacts_dir."""
+    return get_artifacts_dir(run_id) / artifact_path
 
-    parts = artifact_path.parts
-    if "mlruns" not in parts:
-        raise ValueError(
-            f"Could not find 'mlruns' in artifact_uri, unable to relocate the path. "
-            f"artifact_uri: {artifact_uri}"
-        )
 
-    idx = parts.index("mlruns")
-    relative_parts = parts[idx + 1:]  # <experiment_id>/<run_id>/artifacts
-    if not relative_parts:
-        raise ValueError(
-            f"artifact_uri ends right at 'mlruns', with no experiment_id/run_id "
-            f"to reconstruct: {artifact_uri}"
-        )
+def run_has_artifact(run_id: str, artifact_path: str) -> bool:
+    """Whether the run has this artifact (file or directory), e.g. "aucs/aucs.csv"."""
+    try:
+        return artifact_local_path(run_id, artifact_path).exists()
+    except (RuntimeError, NotImplementedError):
+        return False
 
-    return tracking_root.joinpath(*relative_parts)
+
+def list_run_artifacts(run_id: str, path: str = "") -> list[str]:
+    """Direct children of an artifact directory, as artifact paths relative to the run's
+    artifact root (like `a.path` for a in client.list_artifacts(run_id, path))."""
+    d = artifact_local_path(run_id, path)
+    if not d.is_dir():
+        return []
+    return sorted((Path(path) / p.name).as_posix() for p in d.iterdir())
+
+
+def find_run_domain_yaml(run_id: str) -> str:
+    """File name of the domain config yaml logged at the run's artifact root (the yaml the
+    run was launched with; train*.py log exactly one). Raises if there isn't exactly one."""
+    yamls = [p for p in list_run_artifacts(run_id) if p.endswith(".yaml")]
+    if len(yamls) != 1:
+        raise ValueError(f"Expected exactly one domain config yaml artifact for run {run_id} "
+                         f"(in {get_artifacts_dir(run_id)}), got {yamls}")
+    return Path(yamls[0]).name
 
 
 def get_checkpoint_path(run_id: str) -> Path:

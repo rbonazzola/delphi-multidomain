@@ -154,3 +154,44 @@ def test_model_spec_artifact_roundtrip_and_checkpoint_fallback(tmp_path, monkeyp
 
     assert load_model_spec(ckpt_only, fallback_to_checkpoint=False) is None
     assert load_model_spec(ckpt_only) == spec
+
+
+def test_artifacts_resolved_after_store_moved(tmp_path, monkeypatch):
+    """A store copied/moved elsewhere (e.g. rsync'ed from the cluster) keeps the old
+    absolute artifact_uri in each meta.yaml; artifact reads must follow the store's
+    current location, not that stale path."""
+    import shutil as _shutil
+
+    import mlflow
+
+    from utils.mlflow_utils import (
+        find_run_domain_yaml, get_artifacts_dir, get_checkpoint_path, list_run_artifacts,
+        load_model_spec, run_has_artifact,
+    )
+    from utils.trainer import MLFlowLogger
+    from utils.ckpt_utils import MODEL_SPEC_ARTIFACT
+
+    old, new = tmp_path / "cluster" / "mlruns", tmp_path / "local" / "mlruns"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", str(old))
+    mlflow.set_tracking_uri(str(old))
+    spec = model_spec(_delphi())
+    logger = MLFlowLogger("moved_store", run_name="r")
+    logger.log_dict(spec, MODEL_SPEC_ARTIFACT)
+    logger.log_dict({"diseases": {}}, "domain_config_test.yaml")
+    run_id = logger.active_run.info.run_id
+    logger.end()
+    (get_artifacts_dir(run_id) / "checkpoints").mkdir()
+    torch.save({"model_spec": spec}, get_artifacts_dir(run_id) / "checkpoints" / "best_model.pt")
+
+    new.parent.mkdir(parents=True)
+    _shutil.move(str(old), str(new))  # meta.yaml still says artifact_uri=<old>/...
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", str(new))
+    mlflow.set_tracking_uri(str(new))
+    assert str(old) in mlflow.get_run(run_id).info.artifact_uri
+
+    assert get_artifacts_dir(run_id).is_relative_to(new)
+    assert find_run_domain_yaml(run_id) == "domain_config_test.yaml"
+    assert "checkpoints" in list_run_artifacts(run_id)
+    assert run_has_artifact(run_id, MODEL_SPEC_ARTIFACT) and not run_has_artifact(run_id, "aucs/aucs.csv")
+    assert load_model_spec(run_id, fallback_to_checkpoint=False) == spec
+    assert get_checkpoint_path(run_id).is_relative_to(new)
