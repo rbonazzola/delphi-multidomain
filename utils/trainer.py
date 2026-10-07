@@ -117,7 +117,8 @@ def clone_run_to_new_experiment(old_run_id: str, new_experiment_name: str, new_r
     mlflow.set_tag("resumed_from", old_run_id)
     mlflow.set_tag("parent_run", old_run_id)
 
-    src_dir = mlflow.artifacts.download_artifacts(run_id=old_run_id)
+    from utils.mlflow_utils import get_artifacts_dir
+    src_dir = get_artifacts_dir(old_run_id)  # not download_artifacts: the logged artifact_uri may be stale
     dst_dir = Path(mlflow.get_artifact_uri()).as_posix().replace("file://", "")
     dst_dir = Path(dst_dir)
     shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)

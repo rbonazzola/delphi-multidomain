@@ -573,11 +573,8 @@ def config_from_runid_multistream(runid: str, no_event_token_rate: float | None 
 
     # ── domains: reconstruct from the run's own domain_config_yaml artifact,
     #    filtered to the domain names embedded in the arch string.
-    client = mlflow.tracking.MlflowClient()
-    yaml_artifacts = [a.path for a in client.list_artifacts(runid) if a.path.endswith(".yaml")]
-    if len(yaml_artifacts) != 1:
-        raise ValueError(f"Expected exactly one domain config yaml artifact for run {runid}, got {yaml_artifacts}")
-    yaml_path = DELPHI_DIR / "config" / Path(yaml_artifacts[0]).name
+    from utils.mlflow_utils import find_run_domain_yaml
+    yaml_path = DELPHI_DIR / "config" / find_run_domain_yaml(runid)
     if not yaml_path.exists():
         raise FileNotFoundError(f"Expected local domain config at {yaml_path} (from run {runid}'s logged artifact)")
 
