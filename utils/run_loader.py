@@ -243,6 +243,13 @@ def _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, token
         domain_cfg = load_domain_config(domain_config_yaml, tokens_path=tokens_root)
     else:
         domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
+        if tokens_path is not None:
+            # Redirect before building: Delphi.__init__ reads each domain's tokenizer.yaml,
+            # and the run's own paths may not exist here.
+            tokens_root = Path(tokens_path).resolve()
+            for dname, dcfg in domain_cfg.items():
+                if dname not in ("padding", "no_event") and getattr(dcfg, "path", None):
+                    dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
 
     attn_scheme = params.get("attention_scheme", ["all:causal(mask_ties=True)"])
     n_layer = int(params.get("n_layer", 12))

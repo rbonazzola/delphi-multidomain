@@ -256,6 +256,7 @@ def evaluate_aucs(
     logger=None,
     output_file: str = "aucs.csv",
     score_transform: str = "logit",
+    tokens: Optional[List[Tuple[str, int]]] = None,
 ) -> pd.DataFrame:
     """
     Evaluate AUCs for all predicted diseases.
@@ -287,6 +288,9 @@ def evaluate_aucs(
         ranking by softmax can differ from ranking by the raw logit whenever the normalizer
         correlates with case/control status for token_id (e.g. subjects with an generally
         "busier"/more-confident predicted distribution at that timestep).
+    tokens : list of (domain_name, token_id), optional
+        Restrict evaluation to these tokens. If None, every token of every predicted
+        domain is evaluated.
 
     Returns
     -------
@@ -323,6 +327,12 @@ def evaluate_aucs(
         for dname in model.predicted_domains
         for tid in range(model.embed._domain_vocab_sizes[dname])
     ]
+    if tokens is not None:
+        requested = set(tokens)
+        unknown = requested - set(predicted_tokens)
+        if unknown:
+            raise ValueError(f"tokens not among the model's predicted tokens: {sorted(unknown)}")
+        predicted_tokens = [t for t in predicted_tokens if t in requested]
 
     # Group tokens by sex and disease
     by_disease_dfs = {}
