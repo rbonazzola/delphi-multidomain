@@ -184,8 +184,20 @@ def process_disease(logits_for_token, token_id, lookup_disease, block_size):
 #  Main evaluation function
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _matmul_half(h: torch.Tensor, w: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+    """h @ w for the fp16 output embeddings h [N_subj, T, n_embd], as fp16. On CUDA a plain fp16
+    matmul. On CPU fp16 matmul has no fast kernel (it was ~2.3 s per token for 20k subjects,
+    most of the AUC time): compute in fp32, chunked over subjects to bound the fp32 copy of h,
+    and round to fp16 like the CUDA result."""
+    if h.device.type != "cpu":
+        return h @ w.half()
+    w = w.float()
+    return torch.cat([(h[i:i + chunk_size].float() @ w).half() for i in range(0, h.shape[0], chunk_size)])
+
+
 def _domain_softmax_logsumexp(
-    h: torch.Tensor, domain_weight: torch.Tensor, chunk_size: int = 2000
+    h: torch.Tensor, domain_weight: torch.Tensor, chunk_size: int = 2000,
+    logit_offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-(subject, position) log-normalizer (logsumexp over the full domain vocab), computed
     once per domain and reused for every token's softmax score in that domain.
@@ -197,40 +209,83 @@ def _domain_softmax_logsumexp(
     model.embed._get_domain_weight); softmax(logit_t) = exp(logit_t - this normalizer) is then
     an O(1) extra step per token on top of the existing per-token dot product -- see
     `evaluate_aucs(score_transform="softmax")`, which is why the normalizer is shared across
-    tokens rather than recomputed each time.
+    tokens rather than recomputed each time. `logit_offset` [N_subj, vocab_size], if given, is
+    added at every position (see `_forward_pass_embeddings_and_tokens`).
     """
     n_subj = h.shape[0]
     out = torch.empty(h.shape[0], h.shape[1], dtype=torch.float32, device=h.device)
     w_t = domain_weight.T.half()
     for start in range(0, n_subj, chunk_size):
         end = min(start + chunk_size, n_subj)
-        chunk_logits = (h[start:end] @ w_t).float()  # [chunk, T, vocab_size]
+        chunk_logits = _matmul_half(h[start:end], w_t).float()  # [chunk, T, vocab_size]
+        if logit_offset is not None:
+            chunk_logits += logit_offset[start:end].float().unsqueeze(1)
         out[start:end] = torch.logsumexp(chunk_logits, dim=-1)
         del chunk_logits
     return out
 
 
-def _forward_pass_embeddings_and_tokens(model, test_loader, device, block_size, int_to_domain, domain_offsets):
+def _forward_pass_embeddings_and_tokens(model, test_loader, device, block_size, int_to_domain, domain_offsets,
+                                        cache_dir=None):
     """Shared step 1 for both evaluate_aucs and evaluate_aucs_dynamic: one forward
     pass over test_loader, collecting per-token output embeddings and a flat
     tokens_df (with age_bin, sex, and cutoff_age columns already attached).
+
+    If the model has a `subject_logit_offsets(batch)` method (late fusion: a per-subject
+    contribution added to h @ W at every position), it is also collected, as
+    {domain: [N_subj, vocab_size]}; otherwise the third return value is None.
+
+    cache_dir: if given, each batch's outputs are saved there (batch_00000.pt, ...) and batches
+    already saved are not recomputed, so a run that fails (in the forward pass or after it) resumes
+    where it stopped. The loader is still iterated in full: the collate's no-event sampler draws
+    from a seeded generator batch after batch, so the batches that do get computed are the same as
+    in an uninterrupted run. The caller must make cache_dir specific to the model, subjects and
+    loader settings (batch size, workers, block size): nothing here checks it.
     """
     print("Extracting output embeddings...")
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        n_cached = len(list(cache_dir.glob("batch_*.pt")))
+        if n_cached:
+            print(f"Resuming from {n_cached} cached batch(es) in {cache_dir}")
     all_tokens_dfs = []
     all_output_embeddings = []
+    offsets_fn = getattr(model, "subject_logit_offsets", None)
+    all_offsets = defaultdict(list)
     batch_offset = 0
 
     model.eval()
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Forward pass"):
-            batch = batch.to(device)
+        for i, batch in enumerate(tqdm(test_loader, desc="Forward pass")):
+            part = cache_dir / f"batch_{i:05d}.pt" if cache_dir is not None else None
+            if part is not None and part.exists():
+                cached = torch.load(part, map_location="cpu", weights_only=False)
+                h, offsets, tokens_df = cached["h"].to(device), cached["offsets"], cached["tokens_df"]
+                offsets = {d: o.to(device) for d, o in offsets.items()} if offsets is not None else None
+            else:
+                batch = batch.to(device)
+                _, _, h = model(batch, return_embeddings=True)
+                h = h.half()
+                offsets = ({d: o.half() for d, o in offsets_fn(batch).items()}
+                           if offsets_fn is not None else None)
+                tokens_df = batch_to_tokens_df(batch, int_to_domain, domain_offsets)
+                if part is not None:
+                    tmp = part.with_suffix(".tmp")  # atomic: a crash mid-save leaves no half-written part
+                    torch.save({"h": h.cpu(), "tokens_df": tokens_df,
+                                "offsets": {d: o.cpu() for d, o in offsets.items()} if offsets is not None else None},
+                               tmp)
+                    tmp.rename(part)
 
-            _, _, h = model(batch, return_embeddings=True)
-            all_output_embeddings.append(h.half())
+            all_output_embeddings.append(h)
+            if offsets is not None:
+                for dname, off in offsets.items():
+                    all_offsets[dname].append(off)
 
-            tokens_df = batch_to_tokens_df(batch, int_to_domain, domain_offsets)
+            n_in_batch = h.shape[0]
+            tokens_df = tokens_df.copy()
             tokens_df["subject_idx"] += batch_offset
-            batch_offset += batch.batch_size
+            batch_offset += n_in_batch
 
             all_tokens_dfs.append(tokens_df)
 
@@ -244,7 +299,16 @@ def _forward_pass_embeddings_and_tokens(model, test_loader, device, block_size, 
     tokens_df = add_sex_column(tokens_df)
     tokens_df = add_age_bin(tokens_df)
 
-    return all_output_embeddings, tokens_df
+    logit_offsets = {d: torch.cat(v, dim=0) for d, v in all_offsets.items()} if offsets_fn is not None else None
+    return all_output_embeddings, tokens_df, logit_offsets
+
+
+def _token_logits(model, all_output_embeddings, logit_offsets, domain_name, token_id):
+    """[N_subj, T] logits of one token: h @ W[token_id] (+ the per-subject offset, if any)."""
+    logit = _matmul_half(all_output_embeddings, model.embed._get_domain_weight(domain_name)[token_id])
+    if logit_offsets is not None and domain_name in logit_offsets:
+        logit = logit + logit_offsets[domain_name][:, token_id].unsqueeze(1)
+    return logit
 
 
 def evaluate_aucs(
@@ -257,6 +321,7 @@ def evaluate_aucs(
     output_file: str = "aucs.csv",
     score_transform: str = "logit",
     tokens: Optional[List[Tuple[str, int]]] = None,
+    cache_dir: Optional[str | Path] = None,
 ) -> pd.DataFrame:
     """
     Evaluate AUCs for all predicted diseases.
@@ -291,6 +356,9 @@ def evaluate_aucs(
     tokens : list of (domain_name, token_id), optional
         Restrict evaluation to these tokens. If None, every token of every predicted
         domain is evaluated.
+    cache_dir : path, optional
+        Per-batch cache of the forward pass, to resume after a failure; see
+        `_forward_pass_embeddings_and_tokens`.
 
     Returns
     -------
@@ -307,8 +375,8 @@ def evaluate_aucs(
     domain_offsets = model.domain_offsets
 
     # ── 1. Forward pass: collect embeddings and token info ────────────
-    all_output_embeddings, tokens_df = _forward_pass_embeddings_and_tokens(
-        model, test_loader, device, block_size, int_to_domain, domain_offsets
+    all_output_embeddings, tokens_df, logit_offsets = _forward_pass_embeddings_and_tokens(
+        model, test_loader, device, block_size, int_to_domain, domain_offsets, cache_dir=cache_dir
     )
 
     # ── 2. Build case/control indices ─────────────────────────────────
@@ -434,11 +502,12 @@ def evaluate_aucs(
         print("Precomputing per-domain softmax normalizers...")
         for dname in tqdm(model.predicted_domains, desc="Softmax normalizers"):
             domain_logsumexp[dname] = _domain_softmax_logsumexp(
-                all_output_embeddings, model.embed._get_domain_weight(dname)
+                all_output_embeddings, model.embed._get_domain_weight(dname),
+                logit_offset=None if logit_offsets is None else logit_offsets.get(dname),
             )
 
     def _score(domain_name, token_id):
-        logit = all_output_embeddings @ model.embed._get_domain_weight(domain_name)[token_id].half()
+        logit = _token_logits(model, all_output_embeddings, logit_offsets, domain_name, token_id)
         if score_transform == "softmax":
             return torch.exp(logit.float() - domain_logsumexp[domain_name]).detach().cpu().numpy()
         return logit.detach().cpu().numpy()
@@ -678,7 +747,7 @@ def evaluate_aucs_dynamic(
     int_to_domain = model.int_to_domain
     domain_offsets = model.domain_offsets
 
-    all_output_embeddings, tokens_df = _forward_pass_embeddings_and_tokens(
+    all_output_embeddings, tokens_df, logit_offsets = _forward_pass_embeddings_and_tokens(
         model, test_loader, device, block_size, int_to_domain, domain_offsets
     )
 
@@ -802,7 +871,7 @@ def evaluate_aucs_dynamic(
     print("Computing dynamic AUCs...")
 
     def _score(domain_name, token_id):
-        logit = all_output_embeddings @ model.embed._get_domain_weight(domain_name)[token_id].half()
+        logit = _token_logits(model, all_output_embeddings, logit_offsets, domain_name, token_id)
         return logit.detach().cpu().numpy()
 
     _auc_args = (
@@ -950,7 +1019,7 @@ def _prepare_dynamic_risk_set(
     int_to_domain = model.int_to_domain
     domain_offsets = model.domain_offsets
 
-    all_output_embeddings, tokens_df = _forward_pass_embeddings_and_tokens(
+    all_output_embeddings, tokens_df, logit_offsets = _forward_pass_embeddings_and_tokens(
         model, test_loader, device, block_size, int_to_domain, domain_offsets
     )
     if "cutoff_age" not in tokens_df.columns:
@@ -992,7 +1061,7 @@ def _prepare_dynamic_risk_set(
     N = all_output_embeddings.shape[0]
 
     return dict(
-        all_output_embeddings=all_output_embeddings, tokens_df=tokens_df,
+        all_output_embeddings=all_output_embeddings, logit_offsets=logit_offsets, tokens_df=tokens_df,
         all_sids=all_sids, censoring_age_arr=censoring_age_arr,
         tok_subj=tok_subj, tok_sex=tok_sex, tok_gidx=tok_gidx,
         windows=windows, age_masks=age_masks, N=N, block_size=block_size,
@@ -1006,8 +1075,8 @@ def _prepare_disease_windows(model, domain_name, token_id, disease_arrays, setup
     (per sex) -- see `_build_dynamic_disease_arrays`.
     """
     block_size = setup["block_size"]
-    logit = model.embed._get_domain_weight(domain_name)[token_id].half()
-    logit = (setup["all_output_embeddings"] @ logit).detach().cpu().numpy()  # [N, T]
+    logit = _token_logits(model, setup["all_output_embeddings"], setup["logit_offsets"],
+                          domain_name, token_id).detach().cpu().numpy()  # [N, T]
 
     prepared = []
     for sex, sex_id in SEX_TOKENS.items():
@@ -1223,13 +1292,13 @@ def compute_disease_cox_snell_residuals(
     int_to_domain = model.int_to_domain
     domain_offsets = model.domain_offsets
 
-    all_output_embeddings, tokens_df = _forward_pass_embeddings_and_tokens(
+    all_output_embeddings, tokens_df, logit_offsets = _forward_pass_embeddings_and_tokens(
         model, test_loader, device, block_size, int_to_domain, domain_offsets
     )
 
     N, T = all_output_embeddings.shape[0], all_output_embeddings.shape[1]
-    W_k = model.embed._get_domain_weight(domain_name)[token_id].half()
-    logit_k = (all_output_embeddings @ W_k).float().detach().cpu().numpy()  # [N, T]
+    logit_k = _token_logits(model, all_output_embeddings, logit_offsets,
+                            domain_name, token_id).float().detach().cpu().numpy()  # [N, T]
 
     ages = tokens_df["age"].to_numpy().reshape(N, T)
     domain_ids = tokens_df["domain_id"].to_numpy().reshape(N, T)

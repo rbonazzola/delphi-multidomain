@@ -17,8 +17,14 @@ Model reconstruction, in order of preference:
 Data params (no_event_token_rate, ...) come from the checkpoint's metadata["data_config"],
 or else from the run params. Token paths come from <data_root>/tokens.
 
+Without MLflow: --ckpt alone is enough for a run directory exported with the MLflow layout
+(e.g. gel/<experiment>/<run_id>/artifacts/checkpoints/best_model.pt). The run id is taken from
+the path, the run params from <run_dir>/params/ and (MultiStream without a model_spec) the
+domain config yaml from <run_dir>/artifacts/.
+
 Usage:
     python auc/compute_aucs_unified.py --runid <id>                      # the run's test split
+    python auc/compute_aucs_unified.py --ckpt gel/<exp>/<id>/artifacts/checkpoints/best_model.pt
     python auc/compute_aucs_unified.py --runid <id> --split both
     python auc/compute_aucs_unified.py --runid <id> --ckpt /path/best_model.pt \\
         --data_root /path/to/fold --output aucs.csv                      # from the .pt alone
@@ -29,6 +35,8 @@ Usage:
 """
 import argparse
 import copy
+import hashlib
+import json
 import logging
 import os
 import re
@@ -90,6 +98,57 @@ def find_checkpoint(run, name="best_model.pt"):
         run_id=run.info.run_id, artifact_path=f"checkpoints/{name}"))
 
 
+def run_id_from_path(ckpt_path):
+    """<run_id> from .../<run_id>/artifacts/checkpoints/<name>.pt (MLflow layout, also that of
+    exported run directories such as gel/), else None."""
+    if ckpt_path is None:
+        return None
+    for part in reversed(ckpt_path.parts[:-1]):
+        if re.fullmatch(r"[0-9a-f]{32}", part):
+            return part
+    return None
+
+
+def run_dir_of(ckpt_path):
+    """<run_dir> if ckpt_path is <run_dir>/artifacts/checkpoints/<name>.pt, else None."""
+    if ckpt_path is None or len(ckpt_path.parents) < 3 or ckpt_path.parents[1].name != "artifacts":
+        return None
+    return ckpt_path.parents[2]
+
+
+def params_from_run_dir(ckpt_path):
+    """The params/ files of the run directory a checkpoint lives in (exported runs), else {}."""
+    run_dir = run_dir_of(ckpt_path)
+    if run_dir is None or not (run_dir / "params").is_dir():
+        return {}
+    return {f.name: f.read_text().strip() for f in (run_dir / "params").iterdir() if f.is_file()}
+
+
+def mlflow_client():
+    """MlflowClient for the configured tracking store, or None if it cannot be opened: a file store
+    on a read-only filesystem (e.g. the one baked into the image, under Singularity) fails when
+    MLflow tries to create its .trash directory. The scripts then work from checkpoints alone."""
+    setup_mlflow()
+    try:
+        return mlflow.tracking.MlflowClient()
+    except OSError as e:
+        print(f"NOTE: cannot open the MLflow store {mlflow.get_tracking_uri()} ({e.strerror}); "
+              f"working without MLflow")
+        return None
+
+
+def get_run(client, run_id, ckpt_path=None):
+    """(run, params). If the run is not in the local tracking store: (None, the params/ files of
+    the run directory ckpt_path lives in, if any)."""
+    if run_id is not None and client is not None:
+        try:
+            run = client.get_run(run_id)
+            return run, run.data.params
+        except Exception:
+            pass
+    return None, params_from_run_dir(ckpt_path)
+
+
 def arch_domains(arch_str):
     """Domains listed in the [..] of each arch stream, in order, without repeats."""
     names = []
@@ -101,16 +160,24 @@ def arch_domains(arch_str):
     return names
 
 
-def resolve_domain_yaml(client, run_id):
-    """The run's domain config yaml, placed in config/ (so its `extends:` chain resolves)."""
-    yamls = [a.path for a in client.list_artifacts(run_id) if a.path.endswith(".yaml")]
+def resolve_domain_yaml(client, run_id, ckpt_path=None):
+    """The run's domain config yaml, placed in config/ (so its `extends:` chain resolves). From
+    the MLflow run's artifacts or, for an exported run directory, from <run_dir>/artifacts/."""
+    run_dir = run_dir_of(ckpt_path)
+    if run_dir is not None and any((run_dir / "artifacts").glob("*.yaml")):
+        yamls = sorted((run_dir / "artifacts").glob("*.yaml"))
+        fetch = lambda y: y  # noqa: E731
+    elif run_id is not None and client is not None:
+        yamls = [a.path for a in client.list_artifacts(run_id) if a.path.endswith(".yaml")]
+        fetch = lambda y: mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=y)  # noqa: E731
+    else:
+        raise SystemExit("No domain config yaml: pass --domain_config_yaml")
     if len(yamls) != 1:
         raise SystemExit(f"Expected exactly 1 domain config yaml among the run artifacts, found: {yamls}")
     name = Path(yamls[0]).name
     local = DELPHI_DIR / "config" / name
     if not local.exists():
-        src = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=yamls[0])
-        shutil.copy(src, local)
+        shutil.copy(fetch(yamls[0]), local)
         print(f"Copied {name} from the run artifacts to {local}")
     return local
 
@@ -177,7 +244,7 @@ def _block_size(args, params, spec):
     return int(stored)
 
 
-def build_model(args, client, params, ckpt, data_root, block_size):
+def build_model(args, client, params, ckpt, data_root, block_size, ckpt_path=None):
     """(model, domain_cfg) for any model class. See the module docstring."""
     spec = ckpt.get("model_spec")
     if spec is not None and args.domain_config_yaml is None:
@@ -189,8 +256,9 @@ def build_model(args, client, params, ckpt, data_root, block_size):
         return model, _model_config(model).domains
 
     if not params:
-        raise SystemExit("The checkpoint has no model_spec and the run is not in MLflow: "
-                         "there is nowhere to get the architecture and domains from.")
+        raise SystemExit("The checkpoint has no model_spec, the run is not in MLflow and the checkpoint "
+                         "is not in a run directory with params/: there is nowhere to get the "
+                         "architecture and domains from.")
 
     if "arch" in params:
         # Older MultiStream: domains from the yaml, arch from the run params
@@ -199,7 +267,7 @@ def build_model(args, client, params, ckpt, data_root, block_size):
         arch_str = params["arch"]
         requested = args.domains.split(",") if args.domains else arch_domains(arch_str)
         domain_names = [d for d in requested if d not in SPECIAL_DOMAINS]
-        yaml_path = Path(args.domain_config_yaml) if args.domain_config_yaml else resolve_domain_yaml(client, args.runid)
+        yaml_path = Path(args.domain_config_yaml) if args.domain_config_yaml else resolve_domain_yaml(client, args.runid, ckpt_path)
         default_cfg = load_domain_config(yaml_path, data_root / "tokens")
         domain_cfg = {k: v for k, v in default_cfg.items() if k in domain_names or k in SPECIAL_DOMAINS}
         not_found = [d for d in domain_names if d not in domain_cfg]
@@ -229,11 +297,123 @@ def build_model(args, client, params, ckpt, data_root, block_size):
     return model, domain_cfg
 
 
+# ── data ─────────────────────────────────────────────────────────────────────
+
+def no_event_settings(model, data_config):
+    """(no_event_token_rate, insertion_mode): from the data config, else from the model config
+    (DelphiConfig carries them; DelphiMultiStreamConfig does not)."""
+    model_cfg = _model_config(model)
+    rate = float(data_config.get("no_event_token_rate", getattr(model_cfg, "no_event_token_rate", 5.0)))
+    mode = data_config.get("no_event_token_insertion_mode",
+                           getattr(model_cfg, "no_event_token_insertion_mode", "random"))
+    return rate, mode
+
+
+def make_collate(model, domain_cfg, data_config, block_size):
+    no_event_rate, no_event_mode = no_event_settings(model, data_config)
+    continuous_domains = {d: c.n_latent_tokens or 1 for d, c in domain_cfg.items() if c.type == "continuous"}
+    return DelphiCollateFn(
+        age_sampler=AgeSampler(insertion_mode=no_event_mode, token_rate=no_event_rate,
+                               seed=_model_config(model).seed),
+        block_size=block_size,
+        domain_to_int=model.domain_to_int,
+        domain_offsets=model.domain_offsets,
+        padding_domain_id=model.domain_to_int["padding"],
+        no_event_domain_id=model.domain_to_int["no_event"],
+        continuous_domains=continuous_domains,
+        domain_dropout={},
+        training=False,
+    )
+
+
+def make_dataset(ids, model, domain_cfg, data_config, data_root, block_size):
+    no_event_rate, no_event_mode = no_event_settings(model, data_config)
+    return DelphiDataset(
+        subjects=ids,
+        root=data_root,
+        domains_cfg=domain_cfg,
+        domain_to_int=model.domain_to_int,
+        block_size=block_size,
+        exclusions=[],
+        required_domains=["diseases"],
+        no_event_token_rate=no_event_rate,
+        no_event_insertion_mode=no_event_mode,
+        continuous_domains={d: c.n_latent_tokens or 1 for d, c in domain_cfg.items() if c.type == "continuous"},
+        age_domains=["diseases", "death"],
+    )
+
+
+def localize_domain_paths(domain_cfg, data_root):
+    """DelphiDataset uses `path` as-is only when absolute (otherwise it re-joins it under root/tokens)."""
+    for dname, dcfg in domain_cfg.items():
+        if dname not in SPECIAL_DOMAINS and getattr(dcfg, "path", None):
+            dcfg.path = str(data_root / "tokens" / Path(str(dcfg.path)).name)
+            if not Path(dcfg.path).exists():
+                print(f"WARNING: path for '{dname}' does not exist: {dcfg.path}")
+
+
+def resolve_data_root(data_root_arg, subjects_arg, data_config):
+    """With --subjects (new ids) we evaluate on our own data: default data/transforms.
+    Without --subjects we use the checkpoint's ids, which live in the training data_root."""
+    default_root = "data/transforms" if subjects_arg else (data_config.get("data_root") or "data/transforms")
+    data_root = data_root_arg or (DELPHI_DIR / default_root)
+    if not (data_root / "tokens").is_dir():
+        raise SystemExit(
+            f"{data_root / 'tokens'} does not exist. --data_root is the directory that CONTAINS tokens/.\n"
+            f"(The run was trained with data_root={data_config.get('data_root')!r}.)")
+    return data_root
+
+
+def eval_jobs(args, subjects_arg, metadata, launch_dir, output_arg):
+    """[(label, subject ids, output csv)]: --subjects, or the checkpoint's split(s)."""
+    if subjects_arg:
+        if args.split != "test":
+            print("WARNING: ignoring --split since --subjects was given")
+        jobs = [(f"{subjects_arg.name}", read_subject_ids(subjects_arg), "aucs.csv")]
+    else:
+        splits = ["val", "test"] if args.split == "both" else [args.split]
+        jobs = [(s, list(metadata[SPLIT_KEYS[s]]), "aucs.csv" if s == "test" else "aucs_val.csv") for s in splits]
+    if args.score == "softmax":
+        jobs = [(label, ids, out.replace(".csv", "_softmax.csv")) for label, ids, out in jobs]
+    jobs = [(label, ids, launch_dir / out) for label, ids, out in jobs]
+    if output_arg and len(jobs) == 1:
+        jobs = [(jobs[0][0], jobs[0][1], output_arg)]
+    return jobs
+
+
+# ── forward-pass cache ───────────────────────────────────────────────────────
+
+def file_id(path):
+    """Identifies a checkpoint by path, size and mtime (a retrained/replaced file gets a new cache)."""
+    st = Path(path).stat()
+    return [str(Path(path).resolve()), st.st_size, int(st.st_mtime)]
+
+
+def forward_cache_dir(args, launch_dir, ids, **key):
+    """<cache_dir>/<hash>: one forward-pass cache per model + subjects + loader settings (everything
+    that changes the batches or the embeddings), or None with --no_cache. key.json records the key."""
+    if args.no_cache:
+        return None
+    key = {**key, "subjects": hashlib.sha1(",".join(map(str, ids)).encode()).hexdigest(), "n_subjects": len(ids),
+           "eval_batch_size": args.eval_batch_size, "num_workers": args.num_workers}
+    key_str = json.dumps(key, sort_keys=True, default=str)
+    base = Path(args.cache_dir) if args.cache_dir else launch_dir / "auc_cache"
+    cache = base / hashlib.sha1(key_str.encode()).hexdigest()[:16]
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "key.json").write_text(json.dumps(key, sort_keys=True, default=str, indent=1))
+    return cache
+
+
+def drop_forward_cache(args, cache):
+    if cache is not None and not args.keep_cache:
+        shutil.rmtree(cache, ignore_errors=True)
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--runid", required=True)
+    ap.add_argument("--runid", default=None, help="Optional with --ckpt: inferred from its path")
     ap.add_argument("--ckpt", default=None, help="Path to a .pt file (default: the run's best_model.pt)")
     ap.add_argument("--data_root", default=None,
                     help="Directory that CONTAINS tokens/. Default: the training data_root, "
@@ -265,6 +445,12 @@ def main():
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--n_jobs", type=int, default=8)
     ap.add_argument("--max_subjects", type=int, default=None, help="Only the first N subjects (debugging)")
+    ap.add_argument("--cache_dir", default=None,
+                    help="Per-batch cache of the forward pass (embeddings), to resume after a failure. "
+                         "Default: auc_cache/ where the script is launched")
+    ap.add_argument("--keep_cache", action="store_true",
+                    help="Keep the cache after a successful run (default: deleted once the CSV is written)")
+    ap.add_argument("--no_cache", action="store_true", help="Do not cache the forward pass")
     args = ap.parse_args()
 
     # resolve user-given paths before changing directory
@@ -275,23 +461,25 @@ def main():
     diseases_arg = Path(args.diseases).resolve() if args.diseases else None
     if args.domain_config_yaml:
         args.domain_config_yaml = str(Path(args.domain_config_yaml).resolve())
+    if args.cache_dir:
+        args.cache_dir = str(Path(args.cache_dir).resolve())
     launch_dir = Path.cwd()  # default CSVs go where the script was launched from
     # relative paths in yamls/specs (embeddings/hla/..., config/...) resolve from the repo
     os.chdir(DELPHI_DIR)
 
-    setup_mlflow()
-    client = mlflow.tracking.MlflowClient()
-    try:
-        run = client.get_run(args.runid)
-        params = run.data.params
-    except Exception as e:
+    client = mlflow_client()
+    args.runid = args.runid or run_id_from_path(ckpt_arg)
+    if args.runid is None and ckpt_arg is None:
+        raise SystemExit("Pass --runid and/or --ckpt")
+    run, params = get_run(client, args.runid, ckpt_arg)
+    if run is None:
         if ckpt_arg is None:
-            raise SystemExit(f"Run {args.runid} not found in {mlflow.get_tracking_uri()} ({e}).\n"
+            raise SystemExit(f"Run {args.runid} not found in {mlflow.get_tracking_uri()}.\n"
                              f"If you only have the .pt file, pass it with --ckpt.")
         if args.log_mlflow:
             raise SystemExit("--log_mlflow requires the run to be in MLflow")
-        print(f"WARNING: run {args.runid} is not in {mlflow.get_tracking_uri()}; using the checkpoint alone")
-        run, params = None, {}
+        print(f"NOTE: run {args.runid} is not in {mlflow.get_tracking_uri()}; using the checkpoint"
+              + (f" and the params/ of {run_dir_of(ckpt_arg)}" if params else " alone"))
 
     # ── checkpoint ──
     ckpt_path = ckpt_arg or find_checkpoint(run)
@@ -302,26 +490,13 @@ def main():
     # data params: from the checkpoint if present, otherwise from MLflow
     data_config = {**params, **(metadata.get("data_config") or {})}
 
-    # ── data root ──
-    # With --subjects (new ids) we evaluate on our own data: default data/transforms.
-    # Without --subjects we use the checkpoint's ids, which live in the training data_root.
-    default_root = "data/transforms" if subjects_arg else data_config.get("data_root", "data/transforms")
-    data_root = data_root_arg or (DELPHI_DIR / default_root)
-    if not (data_root / "tokens").is_dir():
-        raise SystemExit(
-            f"{data_root / 'tokens'} does not exist. --data_root is the directory that CONTAINS tokens/.\n"
-            f"(The run was trained with data_root={data_config.get('data_root')!r}.)")
+    data_root = resolve_data_root(data_root_arg, subjects_arg, data_config)
 
     # ── model ──
     block_size = _block_size(args, params, ckpt.get("model_spec"))
-    model, domain_cfg = build_model(args, client, params, ckpt, data_root, block_size)
+    model, domain_cfg = build_model(args, client, params, ckpt, data_root, block_size, ckpt_path)
     model = model.to(DEVICE).eval()
-    # DelphiDataset uses `path` as-is only when absolute (otherwise it re-joins it under root/tokens)
-    for dname, dcfg in domain_cfg.items():
-        if dname not in SPECIAL_DOMAINS and getattr(dcfg, "path", None):
-            dcfg.path = str(data_root / "tokens" / Path(str(dcfg.path)).name)
-            if not Path(dcfg.path).exists():
-                print(f"WARNING: path for '{dname}' does not exist: {dcfg.path}")
+    localize_domain_paths(domain_cfg, data_root)
     print(f"Domains: {list(domain_cfg)}")
     print(f"{type(model).__name__} loaded: {sum(p.numel() for p in model.parameters())} params, "
           f"block_size={block_size}")
@@ -332,36 +507,8 @@ def main():
         print(f"Evaluating {len(tokens)} tokens from {diseases_arg.name}")
 
     # ── data ──
-    # DelphiConfig carries the no-event settings; DelphiMultiStreamConfig does not
-    model_cfg = _model_config(model)
-    no_event_rate = float(data_config.get("no_event_token_rate", getattr(model_cfg, "no_event_token_rate", 5.0)))
-    no_event_mode = data_config.get("no_event_token_insertion_mode",
-                                    getattr(model_cfg, "no_event_token_insertion_mode", "random"))
-    continuous_domains = {d: c.n_latent_tokens or 1 for d, c in domain_cfg.items() if c.type == "continuous"}
-    collate = DelphiCollateFn(
-        age_sampler=AgeSampler(insertion_mode=no_event_mode, token_rate=no_event_rate, seed=model_cfg.seed),
-        block_size=block_size,
-        domain_to_int=model.domain_to_int,
-        domain_offsets=model.domain_offsets,
-        padding_domain_id=model.domain_to_int["padding"],
-        no_event_domain_id=model.domain_to_int["no_event"],
-        continuous_domains=continuous_domains,
-        domain_dropout={},
-        training=False,
-    )
-
-    if subjects_arg:
-        if args.split != "test":
-            print("WARNING: ignoring --split since --subjects was given")
-        jobs = [(f"{subjects_arg.name}", read_subject_ids(subjects_arg), "aucs.csv")]
-    else:
-        splits = ["val", "test"] if args.split == "both" else [args.split]
-        jobs = [(s, list(metadata[SPLIT_KEYS[s]]), "aucs.csv" if s == "test" else "aucs_val.csv") for s in splits]
-    if args.score == "softmax":
-        jobs = [(label, ids, out.replace(".csv", "_softmax.csv")) for label, ids, out in jobs]
-    jobs = [(label, ids, launch_dir / out) for label, ids, out in jobs]
-    if output_arg and len(jobs) == 1:
-        jobs = [(jobs[0][0], jobs[0][1], output_arg)]
+    collate = make_collate(model, domain_cfg, data_config, block_size)
+    jobs = eval_jobs(args, subjects_arg, metadata, launch_dir, output_arg)
 
     logger = None
     if args.log_mlflow:
@@ -373,27 +520,19 @@ def main():
         for label, ids, output in jobs:
             if args.max_subjects:
                 ids = ids[:args.max_subjects]
-            dataset = DelphiDataset(
-                subjects=ids,
-                root=data_root,
-                domains_cfg=domain_cfg,
-                domain_to_int=model.domain_to_int,
-                block_size=block_size,
-                exclusions=[],
-                required_domains=["diseases"],
-                no_event_token_rate=no_event_rate,
-                no_event_insertion_mode=no_event_mode,
-                continuous_domains=continuous_domains,
-                age_domains=["diseases", "death"],
-            )
+            dataset = make_dataset(ids, model, domain_cfg, data_config, data_root, block_size)
             loader = DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False,
                                 num_workers=args.num_workers, pin_memory=(DEVICE == "cuda"),
                                 collate_fn=collate)
             print(f"\n=== AUCs: {label} ({len(ids)} subjects) ===")
+            cache = forward_cache_dir(args, launch_dir, ids, ckpt=file_id(ckpt_path), block_size=block_size,
+                                      data_root=data_root, dcfg=args.dcfg, domains=args.domains,
+                                      domain_config_yaml=args.domain_config_yaml)
             auc_df = evaluate_aucs(model, loader, block_size=block_size, run_id=args.runid,
                                    n_jobs=args.n_jobs, logger=logger, output_file=Path(output).name,
-                                   score_transform=args.score, tokens=tokens)
+                                   score_transform=args.score, tokens=tokens, cache_dir=cache)
             auc_df.to_csv(output, index=False)
+            drop_forward_cache(args, cache)
             print(f"Done: {auc_df.shape} -> {output}")
     finally:
         if logger is not None:
