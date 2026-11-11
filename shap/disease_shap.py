@@ -39,6 +39,21 @@ Usage:
     python shap/disease_shap.py --experiment_id EXP_ID [--test_fold 1 2 3]
     python shap/disease_shap.py --run_id RUN_ID --source_domain hla_alleles
     python shap/disease_shap.py --run_id RUN_ID --dry_run
+    python shap/disease_shap.py --run_id RUN_ID --subjects ids.txt --tokens_dir /path/to/tokens
+    python shap/disease_shap.py --ckpt <run_dir>/artifacts/checkpoints/best_model.pt \
+        --subjects ids.txt --tokens_dir /path/to/tokens --output_dir shap_out
+
+--ckpt: load the model from a .pt file, without MLflow, as auc/compute_aucs_unified.py does
+(the same code): from ckpt["model_spec"] if present, else from the params/ (and, for
+MultiStream, the domain config yaml in artifacts/) of the exported run directory the .pt
+is in, e.g. gel/<experiment>/<run_id>/artifacts/checkpoints/best_model.pt. The run id is
+taken from the path. Late-fusion checkpoints are not supported (see load_model).
+
+--subjects: file with one subject ID per line (a non-numeric first line is a header and is
+ignored; for a CSV, the first column). The listed subjects are used as they are, instead of
+the checkpoint's test split.
+--tokens_dir: the directory with one folder per domain (diseases/, death/, sex/, ...), each
+with tokens.csv and tokenizer.yaml. Default: <repo>/data/transforms/tokens.
 """
 
 from __future__ import annotations
@@ -57,7 +72,8 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
-DELPHI_DIR = Path("/nfs/research/birney/users/bonazzola/repos/delphis/delphi-refactor")
+# The repo that contains this script (shap/disease_shap.py), e.g. /app in the Docker image.
+DELPHI_DIR = Path(__file__).resolve().parent.parent
 if str(DELPHI_DIR) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
@@ -65,9 +81,11 @@ _INVOCATION_CWD = Path.cwd()
 os.chdir(DELPHI_DIR)
 
 from data.dataset import DelphiCollateFn, DelphiDataset
+from auc.compute_aucs_unified import (
+    _block_size, build_model, get_run, mlflow_client, run_id_from_path,
+)
 from utils import reconstruct_model
 from utils.mlflow_utils import setup_mlflow
-from utils.utils import read_ids
 
 setup_mlflow()
 
@@ -89,10 +107,26 @@ class _NullAgeSampler:
         return torch.zeros(0), torch.zeros(0, dtype=torch.long)
 
 
-def _make_shap_collate(model) -> DelphiCollateFn:
+def read_subject_ids(path) -> list[int]:
+    """Subject IDs, one per line (or the first column of a CSV). A non-numeric line (header) is skipped."""
+    ids = []
+    for line in Path(path).read_text().splitlines():
+        field = line.strip().split(",")[0].strip()
+        if not field:
+            continue
+        try:
+            ids.append(int(float(field)))
+        except ValueError:
+            continue  # header
+    if not ids:
+        raise SystemExit(f"Could not read any subject ID from {path}")
+    return list(dict.fromkeys(ids))
+
+
+def _make_shap_collate(model, domain_cfg) -> DelphiCollateFn:
     continuous_domains = {
         name: cfg.n_latent_tokens or 1
-        for name, cfg in model.domain_cfg.items()
+        for name, cfg in domain_cfg.items()
         if cfg.type == "continuous"
     }
     return DelphiCollateFn(
@@ -101,8 +135,11 @@ def _make_shap_collate(model) -> DelphiCollateFn:
         domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets,
         padding_domain_id=model.domain_to_int["padding"],
-        no_event_token_id=1,
+        # No no-event tokens are inserted (_NullAgeSampler), so this id is never used.
+        no_event_domain_id=model.domain_to_int.get("no_event", model.domain_to_int["padding"]),
         continuous_domains=continuous_domains,
+        domain_dropout={},
+        training=False,
     )
 
 
@@ -133,7 +170,8 @@ def _build_coalition_item(
     kept_toks = item["local_token_ids"][:real_count][keep]
     kept_ages = item["ages"][:real_count][keep]
 
-    order = kept_ages.argsort()
+    # Stable sort: tokens with the same age keep their order whatever the coalition is.
+    order = kept_ages.argsort(stable=True)
     kept_doms = kept_doms[order]
     kept_toks = kept_toks[order]
     kept_ages = kept_ages[order]
@@ -164,21 +202,28 @@ def _eval_logits(
     """
     For each sequence in the batch and each target disease/death token,
     return the logit at the last context position before target_ages[t].
+
+    If several tokens share the last age before target_ages[t], the one with the largest
+    global token id is used. The collate sorts by (age, domain) with an unstable sort, so the
+    order of tied tokens can change between coalitions; with mask_ties each tied token has its
+    own hidden state. This rule does not depend on that order, so a token removed from the
+    coalition cannot change the context of an earlier target through a reordering.
     """
     _, _, h = model(batch, return_embeddings=True)   # [B, seq_len, n_embd]
     B        = batch.ages.shape[0]
     T        = len(target_ages)
     result   = torch.zeros(B, T)
     ages     = batch.ages  # [B, seq_len]
+    token_ids = batch.global_token_ids  # [B, seq_len]
 
     for j in range(T):
         a_t   = target_ages[j]
         valid = (ages < a_t) & (ages > PADDING_AGE + 1.0)   # [B, seq_len]
         has_valid = valid.any(dim=1)                          # [B]
 
-        age_masked = ages.clone()
-        age_masked[~valid] = -float("inf")
-        last_pos = age_masked.argmax(dim=1)                  # [B]
+        last_age = torch.where(valid, ages, -float("inf")).max(dim=1, keepdim=True).values  # [B, 1]
+        at_last_age = valid & (ages == last_age)
+        last_pos = torch.where(at_last_age, token_ids, -1).argmax(dim=1)   # [B]
 
         h_ctx  = h[torch.arange(B), last_pos].float()        # [B, n_embd]
         logit  = (h_ctx @ target_weights[j]) * has_valid.float()
@@ -248,24 +293,65 @@ def compute_subject_shap(
 # Per-run processing
 # ---------------------------------------------------------------------------
 
+def load_model(run_id: str, ckpt_path: Optional[Path], tokens_dir: Path):
+    """(model, domain_cfg, test_ids). From the .pt file if ckpt_path is given (no MLflow needed),
+    else from the MLflow run (utils.reconstruct_model, plain Delphi only)."""
+    if ckpt_path is None:
+        model, test_ids, _, _ = reconstruct_model(run_id)
+        return model, model.domain_cfg, test_ids
+
+    client = mlflow_client()
+    _, params = get_run(client, run_id, ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "trunk_run_id" in params:
+        # DelphiLateFusion: logits = trunk logits + an HLA term that is constant per subject.
+        raise SystemExit(
+            f"{ckpt_path} is a late-fusion model. Its HLA term is the same at every position, so "
+            f"disease->disease SHAP values are those of its trunk (run {params['trunk_run_id']}): "
+            f"pass the trunk's checkpoint. HLA attribution for late fusion is not implemented.")
+
+    # build_model (as in auc/compute_aucs_unified.py) looks for the tokens in <data_root>/tokens.
+    if tokens_dir.name == "tokens":
+        data_root = tokens_dir.parent
+    else:
+        import tempfile
+        data_root = Path(tempfile.mkdtemp(prefix="shap_data_root_"))
+        (data_root / "tokens").symlink_to(tokens_dir)
+    options = argparse.Namespace(
+        runid=run_id, block_size=None, dcfg=[], domains=None, domain_config_yaml=None)
+    block_size = _block_size(options, params, ckpt.get("model_spec"))
+    model, domain_cfg = build_model(options, client, params, ckpt, data_root, block_size, ckpt_path)
+    test_ids = (ckpt.get("metadata") or {}).get("test_ids") or []
+    logger.info(f"  {type(model).__name__} from {ckpt_path} (block_size={block_size})")
+    return model, domain_cfg, test_ids
+
+
 def process_run(
     run_id: str,
     n_permutations: int,
     step_batch_size: int,
     output_path: Path,
-    subjects_include: Optional[set] = None,
+    subject_ids: Optional[list] = None,
+    tokens_dir: Optional[Path] = None,
+    ckpt_path: Optional[Path] = None,
     partition_idx: int = 0,
     n_partitions: int = 1,
     source_domain: str = "diseases_death",
     target_disease_ids: Optional[set] = None,
+    source_disease_ids: Optional[set] = None,
 ) -> None:
     logger.info(f"Loading model  run_id={run_id[:12]}  partition={partition_idx}/{n_partitions}  source={source_domain}")
-    model, test_ids, _, _ = reconstruct_model(run_id)
+    tokens_dir = Path(tokens_dir) if tokens_dir is not None else DELPHI_DIR / "data" / "transforms" / "tokens"
+    model, domain_cfg, test_ids = load_model(run_id, ckpt_path, tokens_dir)
     model = model.to(DEVICE).eval()
+    if subject_ids is None and not test_ids:
+        raise SystemExit("The checkpoint has no test split: pass --subjects.")
 
-    if subjects_include is not None:
-        test_ids = [sid for sid in test_ids if int(sid) in subjects_include]
-        logger.info(f"  {len(test_ids)} subjects after filtering")
+    if subject_ids is not None:
+        in_test = len(set(subject_ids) & {int(sid) for sid in test_ids})
+        logger.info(f"  {len(subject_ids)} subjects from --subjects "
+                    f"({in_test} of them in the checkpoint's test split)")
+        test_ids = subject_ids
 
     if n_partitions > 1:
         test_ids = sorted(test_ids)
@@ -288,23 +374,33 @@ def process_run(
 
     padding_domain_id = model.domain_to_int["padding"]
 
+    # Token files: <tokens_dir>/<domain folder>/ (the folder name is the one the model was trained with)
+    for dname, dcfg in domain_cfg.items():
+        if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
+            continue
+        dcfg.path = str(tokens_dir / Path(str(dcfg.path)).name)
+        if not Path(dcfg.path).is_dir():
+            raise FileNotFoundError(f"Domain '{dname}': {dcfg.path} does not exist (check --tokens_dir)")
+    logger.info(f"  tokens from {tokens_dir}")
+
     continuous_domains = {
         name: cfg.n_latent_tokens or 1
-        for name, cfg in model.domain_cfg.items()
+        for name, cfg in domain_cfg.items()
         if cfg.type == "continuous"
     }
     dataset = DelphiDataset(
-        root=DELPHI_DIR / "data" / "transforms",
-        domains_cfg=model.domain_cfg,
+        root=tokens_dir.parent,
+        domains_cfg=domain_cfg,
         domain_to_int=model.domain_to_int,
         block_size=model.block_size,
         subjects=test_ids,
         required_domains=["diseases"],
-        no_event_token_rate=model.config.no_event_token_rate,
-        no_event_insertion_mode=model.config.no_event_token_insertion_mode,
+        # DelphiMultiStreamConfig has no no-event settings; no no-event token is inserted anyway.
+        no_event_token_rate=getattr(model.config, "no_event_token_rate", 5.0),
+        no_event_insertion_mode=getattr(model.config, "no_event_token_insertion_mode", "random"),
         continuous_domains=continuous_domains,
     )
-    collate = _make_shap_collate(model)
+    collate = _make_shap_collate(model, domain_cfg)
 
     records = []
     for subj_idx in tqdm(range(len(dataset)), desc=f"Subjects ({run_id[:8]})"):
@@ -318,6 +414,11 @@ def process_run(
         src_mask = torch.zeros(real_count, dtype=torch.bool)
         for d_int in src_ints:
             src_mask |= (domain_ids == d_int)
+        if source_disease_ids is not None:
+            # Only these 'diseases' tokens are permuted; all other tokens stay fixed (context).
+            src_mask &= (domain_ids == disease_int) & torch.isin(
+                token_ids, torch.tensor(sorted(source_disease_ids))
+            )
         src_positions = src_mask.nonzero(as_tuple=True)[0].tolist()
 
         tgt_mask = torch.zeros(real_count, dtype=torch.bool)
@@ -331,8 +432,8 @@ def process_run(
 
         if len(src_positions) == 0 or len(tgt_positions) == 0:
             continue
-        # For disease→disease mode, require at least 2 tokens (need a causal pair)
-        if source_domain == "diseases_death" and len(src_positions) < 2:
+        # Need at least one source before a target (a causal pair)
+        if not (ages[src_positions].min() < ages[tgt_positions].max()):
             continue
 
         src_domain_ids = domain_ids[src_positions]
@@ -450,6 +551,8 @@ def main() -> None:
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--run_id",        nargs="+", metavar="RUN_ID",
                      help="One or more MLflow run IDs to process directly.")
+    src.add_argument("--ckpt",          type=str, metavar="PATH",
+                     help="Model .pt file (no MLflow needed); see the module docstring.")
     src.add_argument("--experiment_id", type=str,
                      help="MLflow experiment ID; selects all FINISHED runs.")
     src.add_argument("--generate_submission", type=str, metavar="RUN_ID",
@@ -465,7 +568,12 @@ def main() -> None:
                         help="Split subjects into this many partitions (default: 1 = no split).")
     parser.add_argument("--partition_idx",  type=int, default=0,
                         help="Which partition to process (0-based).")
-    parser.add_argument("--subjects",       type=str, default=None)
+    parser.add_argument("--subjects",       type=str, default=None,
+                        help="File with subject IDs, one per line (header optional). "
+                             "Used instead of the checkpoint's test split.")
+    parser.add_argument("--tokens_dir",     type=str, default=None,
+                        help="Directory with one folder per domain (diseases/, death/, ...). "
+                             "Default: <repo>/data/transforms/tokens.")
     parser.add_argument("--output_dir",     type=str, default=None,
                         help=f"Output directory (default: {OUTPUT_DIR}).")
     parser.add_argument("--tsv_output",     type=str, default=None,
@@ -478,6 +586,11 @@ def main() -> None:
                         help="Restrict target tokens to these 'diseases' token IDs "
                              "(drops 'death' from targets). E.g. the 17 autoimmune "
                              "disease IDs used in the ablation/epistasis analyses.")
+    parser.add_argument("--source_token_ids", type=int, nargs="+", default=None,
+                        metavar="TOKEN_ID",
+                        help="Only with --source_domain diseases_death: permute only these "
+                             "'diseases' token IDs; all other tokens stay fixed as context. "
+                             "Fewer sources = much faster.")
     parser.add_argument("--dry_run", "--dryrun", action="store_true")
     args = parser.parse_args()
 
@@ -521,7 +634,13 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     #  NORMAL PROCESSING MODE                                              #
     # ------------------------------------------------------------------ #
-    if args.run_id:
+    ckpt_path = None
+    if args.ckpt:
+        ckpt_path = (_INVOCATION_CWD / args.ckpt).resolve()
+        if not ckpt_path.is_file():
+            raise SystemExit(f"{ckpt_path} does not exist")
+        run_ids = [run_id_from_path(ckpt_path) or ckpt_path.stem]
+    elif args.run_id:
         run_ids = args.run_id
     else:
         runs = mlflow.search_runs(
@@ -534,9 +653,10 @@ def main() -> None:
         if not run_ids:
             raise SystemExit("No FINISHED runs found.")
 
-    subjects_include = None
+    subject_ids = None
     if args.subjects:
-        subjects_include = set(read_ids(args.subjects))
+        subject_ids = read_subject_ids(_INVOCATION_CWD / args.subjects)
+    tokens_dir = (_INVOCATION_CWD / args.tokens_dir).resolve() if args.tokens_dir else None
 
     if args.dry_run:
         n_jobs = len(run_ids) * args.n_partitions
@@ -547,7 +667,12 @@ def main() -> None:
 
     target_disease_ids = set(args.target_disease_ids) if args.target_disease_ids else None
 
+    source_disease_ids = set(args.source_token_ids) if args.source_token_ids else None
+    if source_disease_ids is not None and args.source_domain != "diseases_death":
+        raise SystemExit("--source_token_ids needs --source_domain diseases_death")
     src_tag = f"_src-{args.source_domain}" if args.source_domain != "diseases_death" else ""
+    if source_disease_ids is not None:
+        src_tag += f"_src-{len(source_disease_ids)}ids"
     tgt_tag = "_tgt-autoimmune17" if target_disease_ids is not None else ""
     suffix = f"_part{args.partition_idx:04d}of{args.n_partitions}" if args.n_partitions > 1 else ""
     for run_id in run_ids:
@@ -556,11 +681,14 @@ def main() -> None:
             n_permutations=args.n_permutations,
             step_batch_size=args.batch_size,
             output_path=output_dir / f"{run_id}{src_tag}{tgt_tag}{suffix}.pkl",
-            subjects_include=subjects_include,
+            subject_ids=subject_ids,
+            tokens_dir=tokens_dir,
+            ckpt_path=ckpt_path,
             partition_idx=args.partition_idx,
             n_partitions=args.n_partitions,
             source_domain=args.source_domain,
             target_disease_ids=target_disease_ids,
+            source_disease_ids=source_disease_ids,
         )
 
 
