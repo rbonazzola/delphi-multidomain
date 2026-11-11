@@ -123,6 +123,33 @@ def read_subject_ids(path) -> list[int]:
     return list(dict.fromkeys(ids))
 
 
+def resolve_disease_tokens(values, tokens_dir: Path) -> dict[int, str]:
+    """{token_id: label} for a list of ICD-10 codes (e.g. "E10") and/or 'diseases' token IDs.
+
+    Codes are looked up in <tokens_dir>/diseases/tokenizer.yaml (the entry's first 3 characters,
+    ignoring case). An integer is taken as a token ID.
+    """
+    import yaml
+    vocab = yaml.safe_load((tokens_dir / "diseases" / "tokenizer.yaml").read_text())
+    by_code = {}
+    for token_id, entry in enumerate(vocab):
+        by_code.setdefault(str(entry)[:3].upper(), token_id)
+    resolved = {}
+    for value in values:
+        value = str(value).strip()
+        if value.isdigit():
+            token_id = int(value)
+            if token_id >= len(vocab):
+                raise SystemExit(f"Token ID {token_id} is out of the diseases vocabulary ({len(vocab)} tokens)")
+        elif value.upper() in by_code:
+            token_id = by_code[value.upper()]
+        else:
+            raise SystemExit(f"{value!r} is not an ICD-10 code of {tokens_dir / 'diseases' / 'tokenizer.yaml'}")
+        resolved[token_id] = str(vocab[token_id])[:3]
+        logger.info(f"  {value} -> token {token_id}: {vocab[token_id]}")
+    return resolved
+
+
 def _make_shap_collate(model, domain_cfg) -> DelphiCollateFn:
     continuous_domains = {
         name: cfg.n_latent_tokens or 1
@@ -581,16 +608,15 @@ def main() -> None:
     parser.add_argument("--source_domain",  type=str, default="diseases_death",
                         choices=["diseases_death", "hla_alleles"],
                         help="Domain of tokens to permute as SHAP sources.")
-    parser.add_argument("--target_disease_ids", type=int, nargs="+", default=None,
-                        metavar="TOKEN_ID",
-                        help="Restrict target tokens to these 'diseases' token IDs "
-                             "(drops 'death' from targets). E.g. the 17 autoimmune "
-                             "disease IDs used in the ablation/epistasis analyses.")
-    parser.add_argument("--source_token_ids", type=int, nargs="+", default=None,
-                        metavar="TOKEN_ID",
+    parser.add_argument("--target_disease_ids", type=str, nargs="+", default=None,
+                        metavar="CODE_OR_ID",
+                        help="Restrict target tokens to these diseases: ICD-10 codes (E10) "
+                             "or 'diseases' token IDs (201); drops 'death' from targets.")
+    parser.add_argument("--source_token_ids", type=str, nargs="+", default=None,
+                        metavar="CODE_OR_ID",
                         help="Only with --source_domain diseases_death: permute only these "
-                             "'diseases' token IDs; all other tokens stay fixed as context. "
-                             "Fewer sources = much faster.")
+                             "diseases (ICD-10 codes or token IDs); all other tokens stay "
+                             "fixed as context. Fewer sources = much faster.")
     parser.add_argument("--dry_run", "--dryrun", action="store_true")
     args = parser.parse_args()
 
@@ -665,15 +691,21 @@ def main() -> None:
             print(f"  {rid}")
         return
 
-    target_disease_ids = set(args.target_disease_ids) if args.target_disease_ids else None
+    codes_dir = tokens_dir or DELPHI_DIR / "data" / "transforms" / "tokens"
+    targets = resolve_disease_tokens(args.target_disease_ids, codes_dir) if args.target_disease_ids else None
+    sources = resolve_disease_tokens(args.source_token_ids, codes_dir) if args.source_token_ids else None
+    target_disease_ids = set(targets) if targets else None
 
-    source_disease_ids = set(args.source_token_ids) if args.source_token_ids else None
+    source_disease_ids = set(sources) if sources else None
     if source_disease_ids is not None and args.source_domain != "diseases_death":
         raise SystemExit("--source_token_ids needs --source_domain diseases_death")
     src_tag = f"_src-{args.source_domain}" if args.source_domain != "diseases_death" else ""
-    if source_disease_ids is not None:
-        src_tag += f"_src-{len(source_disease_ids)}ids"
-    tgt_tag = "_tgt-autoimmune17" if target_disease_ids is not None else ""
+    def _codes_tag(prefix, chosen):
+        labels = sorted(set(chosen.values()))
+        return f"_{prefix}-{'-'.join(labels)}" if len(labels) <= 5 else f"_{prefix}-{len(chosen)}diseases"
+    if sources:
+        src_tag += _codes_tag("src", sources)
+    tgt_tag = _codes_tag("tgt", targets) if targets else ""
     suffix = f"_part{args.partition_idx:04d}of{args.n_partitions}" if args.n_partitions > 1 else ""
     for run_id in run_ids:
         process_run(
