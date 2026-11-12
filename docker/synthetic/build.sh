@@ -44,6 +44,7 @@ mkdir -p "$STAGE/code"/{data,auc,config}
 cp "$REPO"/config/*.yaml "$STAGE/code/config/"
 cp "$REPO"/{pyproject.toml,uv.lock,README.md,LICENSE} "$STAGE/"
 cp "$REPO"/{train.py,train_synthetic.py} "$STAGE/code/"
+cp "$REPO/docker/synthetic/README.md" "$STAGE/code/README.synthetic.md"
 cp "$REPO/data/dataset.py" "$STAGE/code/data/"
 cp "$REPO/auc/aucs.py" "$STAGE/code/auc/"
 rsync -a --exclude='__pycache__/' --exclude='legacy/' --include='*/' --include='*.py' --exclude='*' --prune-empty-dirs \

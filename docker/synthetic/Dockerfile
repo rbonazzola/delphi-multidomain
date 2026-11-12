@@ -5,7 +5,8 @@ FROM ghcr.io/astral-sh/uv:0.9.5-python3.11-bookworm-slim
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    MLFLOW_TRACKING_URI=/workspace/mlruns
+    MLFLOW_TRACKING_URI=/workspace/mlruns \
+    GIT_PYTHON_REFRESH=quiet
 
 WORKDIR /opt/delphi
 
