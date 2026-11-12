@@ -863,6 +863,10 @@ class DelphiCollateFn:
         token, always 0).
     continuous_domains : dict[str, int]
         {domain_name: n_latent_tokens}
+    trim_multiple : int
+        With block_size="auto", round each batch length UP to a multiple of
+        this value (extra slots stay as padding at the front). Fewer distinct
+        shapes means fewer torch.compile recompilations. 1 = exact trim.
     """
 
     PADDING_AGE = -10000.0
@@ -880,9 +884,11 @@ class DelphiCollateFn:
         domain_dropout: Optional[Dict[int, tuple]] = None,
         age_jitter: Optional[Dict[int, tuple]] = None,
         training: bool = True,
+        trim_multiple: int = 1,
     ):
         self.age_sampler = age_sampler
         self.block_size = block_size
+        self.trim_multiple = trim_multiple
         self.domain_to_int = domain_to_int
         self.domain_offsets = domain_offsets
         self.padding_domain_id = padding_domain_id
@@ -1049,11 +1055,14 @@ class DelphiCollateFn:
         # After sorting, padding (age=PADDING_AGE) collects at the front of every
         # sequence.
         #
-        # block_size="auto": trim to the longest real sequence in this batch.
+        # block_size="auto": trim to the longest real sequence in this batch,
+        # rounded up to a multiple of trim_multiple.
         # block_size=N (int): keep the full [B, N] — padding stays at the front.
         if self.block_size == "auto":
             n_real = (ages > self.PADDING_AGE).sum(dim=1)   # [B]
-            trim_start = int((T - n_real.max()).item())
+            m = self.trim_multiple
+            keep = min(T, -(-int(n_real.max().item()) // m) * m)
+            trim_start = T - keep
             if trim_start > 0:
                 global_token_ids = global_token_ids[:, trim_start:]
                 domain_ids       = domain_ids[:, trim_start:]

@@ -53,7 +53,7 @@ from delphi.model import Delphi, DelphiConfig, DomainConfig
 from delphi.optim import OptimConfig, configure_optimizers
 from utils.trainer import MLFlowLogger, Trainer
 from utils.cv_utils import get_data_partitions
-from utils import setup_mlflow
+from utils import setup_mlflow, AUTO_BLOCK_SIZE
 from train import _compile_model  # reuse cache-aware torch.compile wrapper
 from auc.aucs import evaluate_aucs
 
@@ -130,13 +130,21 @@ def get_cli_args():
     parser.add_argument("--n_layer", "--n-layer", dest="n_layer", default=12, type=int)
     parser.add_argument("--n_head", "--n-head", dest="n_head", default=6, type=int)
     parser.add_argument("--n_embd", "--n-embd", dest="n_embd", default=120, type=int)
-    parser.add_argument("--block_size", "--block-size", dest="block_size", default=512, type=int)
+    parser.add_argument("--block_size", "--block-size", dest="block_size", default="auto",
+                        type=lambda v: v if v == "auto" else int(v),
+                        help="Max tokens per subject. 'auto' (default) caches up to AUTO_BLOCK_SIZE "
+                             "tokens and trims each batch to its longest sequence (as in train.py).")
+    parser.add_argument("--trim_multiple", "--trim-multiple", dest="trim_multiple", default=32, type=int,
+                        help="With --block_size auto, round each batch length up to a multiple of this "
+                             "(fewer distinct shapes, fewer torch.compile recompilations). 1 = exact trim.")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", default=64, type=int)
     parser.add_argument("--eval_batch_size", "--eval-batch-size", dest="eval_batch_size", default=256, type=int)
     parser.add_argument("--num_workers", "--num-workers", dest="num_workers", default=4, type=int)
     parser.add_argument("--token_dropout", "--token-dropout", dest="token_dropout", default=0.1, type=float)
     parser.add_argument("--no_event_token_rate", "--no-event-token-rate", dest="no_event_token_rate",
-                        default=2.0, type=float)
+                        default=5.0, type=float,
+                        help="Years between no-event tokens (DelphiConfig default; also used by the "
+                             "model that generated the synthetic cohort).")
     parser.add_argument("--no_event_token_insertion_mode", "--no-event-token-insertion-mode",
                         dest="no_event_token_insertion_mode", default="random")
 
@@ -188,6 +196,11 @@ def get_cli_args():
     return parser.parse_args()
 
 
+def cache_block_size(args) -> int:
+    """Fixed per-subject cache size; with block_size="auto" the collate still trims each batch."""
+    return AUTO_BLOCK_SIZE if args.block_size == "auto" else args.block_size
+
+
 def get_dataloaders(domain_cfg, model, tokens_dir, args):
     train_ids, val_ids, test_ids = split_subjects(
         tokens_dir, args.val_frac, args.test_frac, args.seed, n_subjects_debug=args.n_subjects_debug
@@ -198,7 +211,7 @@ def get_dataloaders(domain_cfg, model, tokens_dir, args):
 
     dataset_kwargs = dict(
         root=root, domains_cfg=domain_cfg, domain_to_int=model.domain_to_int,
-        block_size=args.block_size, required_domains=["sex"],
+        block_size=cache_block_size(args), required_domains=["sex"],
         no_event_token_rate=args.no_event_token_rate,
         no_event_insertion_mode=args.no_event_token_insertion_mode,
         age_domains=["diseases", "death"],
@@ -225,7 +238,8 @@ def get_dataloaders(domain_cfg, model, tokens_dir, args):
     }
 
     collate_kwargs = dict(
-        age_sampler=age_sampler, block_size=args.block_size, domain_to_int=model.domain_to_int,
+        age_sampler=age_sampler, block_size=args.block_size, trim_multiple=args.trim_multiple,
+        domain_to_int=model.domain_to_int,
         domain_offsets=model.domain_offsets, padding_domain_id=model.domain_to_int["padding"],
         no_event_domain_id=model.domain_to_int["no_event"], continuous_domains={},
         domain_dropout=domain_dropout,
@@ -290,7 +304,7 @@ def main():
     delphi_config = DelphiConfig(
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         domains=domain_cfg, attention_scheme=args.attention_scheme,
-        token_dropout=args.token_dropout, block_size=args.block_size,
+        token_dropout=args.token_dropout, block_size=cache_block_size(args),
         no_event_token_rate=args.no_event_token_rate,
         no_event_token_insertion_mode=args.no_event_token_insertion_mode,
         seed=args.seed,

@@ -291,7 +291,7 @@ def get_cli_args():
                              "any value <=0) for the old unbounded behavior — one file per "
                              "improving epoch for the whole run, never pruned. Default: 5.")
 
-    parser.add_argument("--no_event_token_rate", "--no-event-token-rate", dest="no_event_token_rate", default=2, type=float)
+    parser.add_argument("--no_event_token_rate", "--no-event-token-rate", dest="no_event_token_rate", default=5, type=float)
     parser.add_argument("--no_event_token_insertion_mode", "--no-event-token-insertion-mode",
                         dest="no_event_token_insertion_mode", default="random", type=str)
 
