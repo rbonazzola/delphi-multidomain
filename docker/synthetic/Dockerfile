@@ -16,9 +16,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --extra log --no-install-project
 ENV PATH="/opt/delphi/.venv/bin:$PATH"
 
-# torch.compile (inductor/Triton) builds a small C launcher at run time.
+# torch.compile compiles code at run time: a C launcher for Triton on GPU (gcc),
+# and C++ kernels on CPU (g++).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && apt-get install -y --no-install-recommends gcc g++ libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 COPY code/ ./
