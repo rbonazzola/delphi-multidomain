@@ -27,7 +27,8 @@ dependencies = [
 [project.optional-dependencies]
 log = [
   "wandb>=0.25.1,<0.26",
-  "mlflow<3.6", # superior to 3.6 introduce sqlite as the recommended/default backend. 
+  "mlflow==2.22.0", # same as the cluster env; 3.x writes run metadata that 2.x does not read
+  "rich==14.0.0",
   "loguru"
 ]
 apps = [

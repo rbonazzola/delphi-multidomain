@@ -481,7 +481,10 @@ class Trainer(BaseTrainer):
         ])
 
         # Mixed precision
-        self.use_amp = use_amp and torch.cuda.is_available()
+        self.use_amp = use_amp and torch.device(self.device).type == "cuda"
+        # torch 2.3 autocast rejects device_type="mps" even when disabled; AMP is CUDA-only
+        # here, so any other device uses a disabled CPU autocast (a no-op).
+        self.autocast_device = "cuda" if self.use_amp else "cpu"
         self.amp_dtype = torch.bfloat16
         # bfloat16 has the same exponent range as float32, so no gradient scaling needed
         self.scaler = torch.amp.GradScaler("cuda", enabled=False)
@@ -821,7 +824,7 @@ class Trainer(BaseTrainer):
         # Move batch to device
         batch = batch.to(self.device)
 
-        with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+        with torch.amp.autocast(self.autocast_device, dtype=self.amp_dtype, enabled=self.use_amp):
 
             # Forward pass
             logits_dict, att = model(batch, return_attention=return_att)

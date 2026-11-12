@@ -41,7 +41,10 @@ import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = os.getenv("DEVICE") or (
+    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+)
+PIN_MEMORY = DEVICE.startswith("cuda")
 if (DELPHI_DIR := Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
@@ -230,8 +233,8 @@ def get_dataloaders(domain_cfg, model, tokens_dir, args):
     train_collate = DelphiCollateFn(**collate_kwargs, age_jitter=age_jitter, training=True)
     eval_collate = DelphiCollateFn(**collate_kwargs, training=False)
 
-    train_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
-    eval_kwargs = dict(batch_size=args.eval_batch_size, num_workers=args.num_workers, pin_memory=True)
+    train_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=PIN_MEMORY)
+    eval_kwargs = dict(batch_size=args.eval_batch_size, num_workers=args.num_workers, pin_memory=PIN_MEMORY)
 
     train_loader = FlexibleDataLoader(train_dataset, shuffle=True, collate_fn=train_collate, **train_kwargs)
     valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate, **eval_kwargs)
@@ -265,7 +268,7 @@ def build_real_eval_loader(model, real_test_fold, eval_batch_size, num_workers):
     from torch.utils.data import DataLoader
     return DataLoader(
         real_test_dataset, batch_size=eval_batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, collate_fn=eval_collate,
+        num_workers=num_workers, pin_memory=PIN_MEMORY, collate_fn=eval_collate,
     )
 
 
@@ -298,7 +301,8 @@ def main():
         sys.exit(0)
 
     model = Delphi(delphi_config).to(DEVICE)
-    model = _compile_model(model, disable=args.no_compile)
+    # torch.compile (inductor) does not support MPS in torch 2.3
+    model = _compile_model(model, disable=args.no_compile or DEVICE.startswith("mps"))
 
     dataloaders = get_dataloaders(domain_cfg, model, tokens_dir, args)
 
