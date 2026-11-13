@@ -231,6 +231,10 @@ def get_cli_args():
                         help="Max tokens per subject in the cache. 'auto' (default) uses a "
                              "generous upper bound; the effective per-batch length is always "
                              "trimmed to the longest sequence in that batch.")
+    parser.add_argument("--trim_multiple", "--trim-multiple", dest="trim_multiple", default=1, type=int,
+                        help="With --block_size auto, round each batch length up to a multiple of this "
+                             "(fewer distinct shapes, fewer torch.compile recompilations). "
+                             "1 (default) = exact trim. Ignored with a fixed --block_size.")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", default=32, type=int)
     parser.add_argument("--batch_size_schedule", "--batch-size-schedule", dest="batch_size_schedule",
                         default=None, type=BatchSizeScheduler.from_string,
@@ -486,6 +490,7 @@ def get_dataloaders(
     no_event_insertion_mode="random",
     seed=42,
     subjects_include_list=None,
+    trim_multiple=1,
 ):
     data_root = DELPHI_DIR / args.data_root
     train_ids, val_ids, test_ids = get_data_partitions(
@@ -554,6 +559,7 @@ def get_dataloaders(
         no_event_domain_id=model.domain_to_int["no_event"],
         continuous_domains=continuous_domains,
         domain_dropout=domain_dropout,
+        trim_multiple=trim_multiple,
     )
     train_collate = DelphiCollateFn(**collate_kwargs, age_jitter=age_jitter, training=True)
     eval_collate  = DelphiCollateFn(**collate_kwargs, training=False)
@@ -660,6 +666,7 @@ if __name__ == "__main__":
             no_event_insertion_mode=args.no_event_token_insertion_mode,
             seed=args.seed,
             subjects_include_list=args.subjects,
+            trim_multiple=args.trim_multiple,
         )
 
         # ── Optimizer ─────────────────────────────────────────────────────
@@ -698,6 +705,7 @@ if __name__ == "__main__":
             "patience": args.patience,
             "attention_scheme_alias": attention_scheme_alias,
             "arch": args.arch,
+            "trim_multiple": args.trim_multiple,
             "domain_list": ",".join(domains),
             "token_loss_alpha": args.token_loss_alpha,
             "token_loss_alpha_schedule": args.token_loss_alpha_schedule,
