@@ -69,12 +69,20 @@ def _split_top_level(s: str, sep: str = ",") -> List[str]:
 
 
 def _parse_arch_str(s: str) -> Dict[str, int]:
-    """``'h24d240l3'`` → ``{'n_head': 24, 'n_embd': 240, 'n_layer': 3}``."""
-    out: Dict[str, int] = {}
-    for key, pat in [("n_head", r"h(\d+)"), ("n_embd", r"d(\d+)"), ("n_layer", r"l(\d+)")]:
-        m = re.search(pat, s)
-        if m:
-            out[key] = int(m.group(1))
+    """``'h24d240l3'`` → ``{'n_head': 24, 'n_embd': 240, 'n_layer': 3}``.
+
+    Any letter order and case. ``h`` and ``d`` are required; ``l`` is optional
+    (``n_layer`` defaults to 1 in the callers).
+    Shared with ``train.py --arch`` via :func:`utils.utils.parse_arch_str`.
+    """
+    from utils.utils import parse_arch_str
+    out = parse_arch_str(s, strict=False)
+    missing = [letter for letter, key in (("h", "n_head"), ("d", "n_embd")) if key not in out]
+    if missing:
+        raise ValueError(
+            f"Invalid MultiStream stage spec {s!r}: missing {', '.join(missing)} "
+            f"(expected e.g. 'h12d120l3')."
+        )
     return out
 
 

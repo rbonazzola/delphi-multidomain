@@ -49,6 +49,8 @@ from utils.cv_utils import get_data_partitions
 from utils import (
     load_domain_config, 
     apply_domain_overrides, 
+    parse_arch_str,
+    format_arch_str,
     setup_mlflow, 
     AUTO_BLOCK_SIZE # cache upper bound when block_size="auto"
 )
@@ -71,6 +73,7 @@ for _handler in logging.root.handlers:
 
 root_path = DELPHI_DIR / "data" / "transforms"
 ATTENTION_SCHEMES = yaml.safe_load((DELPHI_DIR / "config" / "attention_schemes.yaml").read_text())
+ARCH_DEFAULTS = {"n_head": 6, "n_embd": 120, "n_layer": 12}  # used when neither --arch nor --n_* is given
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.allow_tf32 = True
@@ -212,9 +215,17 @@ def get_cli_args():
     parser.add_argument("--domains",            default="diseases,death,cv_drugs,ns_drugs,lifestyle,hla_alleles,sex")
     parser.add_argument("--attention_scheme", "--attention-scheme", dest="attention_scheme",
                         default="[hla_alleles,sex]:bidirectional,[sex,diseases,lifestyle,death,padding,no_event]:causal(mask_ties=True)", nargs="+")
-    parser.add_argument("--n_layer", "--n-layer",       dest="n_layer", default=12,  type=int)
-    parser.add_argument("--n_head",  "--n-head",        dest="n_head",  default=6,   type=int)
-    parser.add_argument("--n_embd",  "--n-embd",        dest="n_embd",  default=120, type=int)
+    # Defaults live in ARCH_DEFAULTS (applied after parsing) so that a conflict between
+    # --arch and an explicitly passed --n_* flag can be detected.
+    parser.add_argument("--arch", dest="arch", default=None, metavar="hNdDlL",
+                        help="Architecture shorthand, e.g. 'h12d120l12' = --n_head 12 --n_embd 120 --n_layer 12. "
+                             "An explicit --n_head/--n_embd/--n_layer with a different value is an error.")
+    parser.add_argument("--n_layer", "--n-layer",       dest="n_layer", default=None, type=int,
+                        help=f"default: {ARCH_DEFAULTS['n_layer']}")
+    parser.add_argument("--n_head",  "--n-head",        dest="n_head",  default=None, type=int,
+                        help=f"default: {ARCH_DEFAULTS['n_head']}")
+    parser.add_argument("--n_embd",  "--n-embd",        dest="n_embd",  default=None, type=int,
+                        help=f"default: {ARCH_DEFAULTS['n_embd']}")
     parser.add_argument("--block_size", "--block-size", "--blocksize", dest="block_size", default="auto",
                         type=lambda v: v if v == "auto" else int(v),
                         help="Max tokens per subject in the cache. 'auto' (default) uses a "
@@ -338,6 +349,23 @@ def get_cli_args():
 
     if args.experiment_name is None and not args.resume_run_id and not args.resume_from_previous and not args.dry_run:
         parser.error("--experiment_name / -x is required unless --resume_run_id or --resume_from_previous is set.")
+
+    # Resolve --arch / --n_head / --n_embd / --n_layer into one consistent set,
+    # then store the canonical string in args.arch (logged to MLflow, usable as {arch} in --run_name).
+    if args.arch is not None:
+        try:
+            arch = parse_arch_str(args.arch, strict=True)
+        except ValueError as e:
+            parser.error(str(e))
+        for key, value in arch.items():
+            explicit = getattr(args, key)
+            if explicit is not None and explicit != value:
+                parser.error(f"--arch {args.arch} sets {key}={value}, but --{key} {explicit} was also given.")
+            setattr(args, key, value)
+    for key, default in ARCH_DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, default)
+    args.arch = format_arch_str(args.n_head, args.n_embd, args.n_layer)
 
     prefix = args.run_name_prefix or ""
     raw_run_name = (prefix + args.run_name_suffix) or None
@@ -669,6 +697,7 @@ if __name__ == "__main__":
             "min_epochs": args.min_epochs,
             "patience": args.patience,
             "attention_scheme_alias": attention_scheme_alias,
+            "arch": args.arch,
             "domain_list": ",".join(domains),
             "token_loss_alpha": args.token_loss_alpha,
             "token_loss_alpha_schedule": args.token_loss_alpha_schedule,

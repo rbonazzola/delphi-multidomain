@@ -27,6 +27,8 @@ _SUBMODULE_OF = {
     # utils
     "load_domain_config": "utils.utils",
     "apply_domain_overrides": "utils.utils",
+    "parse_arch_str": "utils.utils",
+    "format_arch_str": "utils.utils",
     "read_ids": "utils.utils",
     "read_disease_ids": "utils.utils",
 }

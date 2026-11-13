@@ -1,3 +1,4 @@
+import re
 import sys
 from dataclasses import fields as dc_fields
 from pathlib import Path
@@ -11,6 +12,45 @@ sys.path.insert(0, str(DELPHI_DIR))
 from delphi.model import DomainConfig
 
 _DOMAIN_CONFIG_FIELDS = {f.name for f in dc_fields(DomainConfig)}
+
+
+_ARCH_LETTER_TO_KEY = {"h": "n_head", "d": "n_embd", "l": "n_layer"}
+_ARCH_TOKEN_RE = re.compile(r"([hdl])\s*(\d+)", re.IGNORECASE)
+_ARCH_FULL_RE = re.compile(r"\s*(?:[hdl]\s*\d+\s*)+", re.IGNORECASE)
+
+
+def parse_arch_str(s: str, strict: bool = False) -> dict:
+    """Parse an architecture string such as ``'h12d120l12'``.
+
+    Returns ``{'n_head': 12, 'n_embd': 120, 'n_layer': 12}``.
+
+    Letters can be in any order and in upper or lower case (``'L12H12D120'`` is the
+    same as ``'h12d120l12'``); spaces are allowed. A repeated letter is an error.
+
+    - ``strict=False`` (MultiStream stages): each letter is optional; missing keys are
+      left out of the result.
+    - ``strict=True`` (``train.py --arch``): the string must contain only ``h``, ``d``
+      and ``l`` tokens, each exactly once.
+    """
+    expected = "'h<n_head>d<n_embd>l<n_layer>' (any order), e.g. 'h12d120l12'"
+    if strict and not _ARCH_FULL_RE.fullmatch(s):
+        raise ValueError(f"Invalid architecture string {s!r}: expected {expected}.")
+    out = {}
+    for letter, value in _ARCH_TOKEN_RE.findall(s):
+        key = _ARCH_LETTER_TO_KEY[letter.lower()]
+        if key in out:
+            raise ValueError(f"Invalid architecture string {s!r}: '{letter.lower()}' appears more than once.")
+        out[key] = int(value)
+    if strict:
+        missing = [l for l, k in _ARCH_LETTER_TO_KEY.items() if k not in out]
+        if missing:
+            raise ValueError(f"Invalid architecture string {s!r}: missing {', '.join(missing)}; expected {expected}.")
+    return out
+
+
+def format_arch_str(n_head: int, n_embd: int, n_layer: int) -> str:
+    """Inverse of :func:`parse_arch_str`: ``(12, 120, 12)`` → ``'h12d120l12'``."""
+    return f"h{n_head}d{n_embd}l{n_layer}"
 
 
 def _normalize_domain_cfg(cfg: dict) -> dict:

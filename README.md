@@ -94,8 +94,7 @@ Full reference (syntax, aliases, worked example with attention matrices, presets
 python train.py \
   --domains diseases,death,lifestyle,sex \
   --attention_scheme "all:causal(mask_ties=True)" \
-  --n_layer 12 \
-  --n_embd 240 \
+  --arch h6d240l12 \
   --experiment_name example \
   --run_name fold1 \
   --batch_size_schedule "10:32,10:64,*:256x4" \
@@ -103,6 +102,8 @@ python train.py \
 ```
 
 Note: `padding` and `no_event` are added automatically and do not need to be listed in `--domains`.
+
+`--arch hNdDlL` is a shorthand for `--n_head N --n_embd D --n_layer L` (e.g. `--arch h12d240l12`). Letter order and case do not matter (`L12H12D240` is the same); each letter must appear once. You can still pass the three flags separately; a flag that disagrees with `--arch` is an error. The resolved string is logged as the MLflow param `arch` and can be used as `{arch}` in `--run_name`. Defaults: `h6d120l12`.
 
 ### Batch size schedule (`--batch_size_schedule`)
 
