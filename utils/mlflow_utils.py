@@ -409,5 +409,5 @@ def _get_last_epoch_checkpoint(run_dir: str) -> tuple[Path, int]:
 def load_checkpoint(run_id: str) -> tuple[dict, Path]:
     """Load best_model.pt, falling back to the highest-epoch checkpoint."""
     ckpt_path = get_checkpoint_path(run_id)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     return ckpt, ckpt_path

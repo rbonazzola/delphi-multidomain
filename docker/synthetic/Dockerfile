@@ -10,7 +10,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /opt/delphi
 
-# Dependencies first (cached layer). torch comes from the cu118 index on linux.
+# Dependencies first (cached layer). torch comes from the cu128 index on linux.
 # The uv cache lives in a BuildKit cache mount, so it does not end up in the image.
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \

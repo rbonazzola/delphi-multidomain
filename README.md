@@ -39,7 +39,7 @@ The code has been tested with the following versions:
 - `numpy=1.26.4`
 - `pandas=2.2.3`
 - `mlflow=2.22.0`
-- `torch=2.3.0`
+- `torch=2.8.0`
 
 ## Training
 

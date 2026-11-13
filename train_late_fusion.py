@@ -278,7 +278,7 @@ def main(args):
             ckpt_path = client.download_artifacts(
                 existing_run_id, "checkpoints/best_model.pt", tmp
             )
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         head.load_state_dict(ckpt["state_dict"])
         log.info(
             "Loaded head checkpoint from epoch %s (val=%.4f)",

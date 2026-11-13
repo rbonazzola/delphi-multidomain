@@ -102,7 +102,7 @@ class PretrainedHLAEncoder:
 
         first_locus = meta["locus"].iloc[0]
         d_embd = torch.load(
-            embeddings_dir / f"{first_locus}.pt", map_location="cpu"
+            embeddings_dir / f"{first_locus}.pt", map_location="cpu", weights_only=False
         ).shape[1]
         self.n_features = d_embd
 
@@ -111,7 +111,7 @@ class PretrainedHLAEncoder:
 
         for locus in meta["locus"].unique():
             locus_emb = torch.load(
-                embeddings_dir / f"{locus}.pt", map_location="cpu"
+                embeddings_dir / f"{locus}.pt", map_location="cpu", weights_only=False
             )   # [n_locus_alleles, d_embd]
             # local_idx 0..n-1 corresponds to alleles sorted by global token_id within this locus
             locus_meta = meta[meta["locus"] == locus].sort_values("token_id")

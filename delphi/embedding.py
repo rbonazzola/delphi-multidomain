@@ -137,7 +137,7 @@ class PretrainedProjector(nn.Module):
         freeze: bool = False,
     ):
         super().__init__()
-        weights = torch.load(pretrained_path, map_location="cpu")
+        weights = torch.load(pretrained_path, map_location="cpu", weights_only=False)
         vocab_size, d_ext = weights.shape
 
         self.embed = nn.Embedding(vocab_size, d_ext)

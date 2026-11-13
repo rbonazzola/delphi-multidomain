@@ -482,7 +482,7 @@ class Trainer(BaseTrainer):
 
         # Mixed precision
         self.use_amp = use_amp and torch.device(self.device).type == "cuda"
-        # torch 2.3 autocast rejects device_type="mps" even when disabled; AMP is CUDA-only
+        # torch 2.3 autocast rejected device_type="mps" even when disabled; AMP is CUDA-only
         # here, so any other device uses a disabled CPU autocast (a no-op).
         self.autocast_device = "cuda" if self.use_amp else "cpu"
         self.amp_dtype = torch.bfloat16

@@ -11,7 +11,7 @@ Run one command to train on GPU, on CPU, or (natively) on Apple Silicon.
 | **Image** | `delphi-synthetic:latest` (10.8 GB, 3.3 GB compressed) |
 | **Native bundle** | code + data, no environment (66 MB) |
 | **Domains** | `sex`, `lifestyle`, `diseases`, `death` |
-| **Stack** | Python 3.11 · PyTorch 2.3.0 (CUDA 11.8) · MLflow 2.22.0 |
+| **Stack** | Python 3.11 · PyTorch 2.8.0 (CUDA 12.8) · MLflow 2.22.0 |
 
 ---
 
@@ -30,8 +30,8 @@ Run one command to train on GPU, on CPU, or (natively) on Apple Silicon.
 
 ## Quick start
 
-**Requirements:** Docker. For GPU training, also an NVIDIA driver (version 520 or newer, for
-CUDA 11.8) and
+**Requirements:** Docker. For GPU training, also an NVIDIA driver (version 570 or newer, for
+CUDA 12.8) and
 [`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 on the host.
 
@@ -156,8 +156,7 @@ uv sync --frozen --no-dev --extra log --no-install-project
 uv run python train_synthetic.py --tokens_dir synthetic_data --no_rich --max_epochs 100
 ```
 
-- The script selects MPS automatically and disables `torch.compile` (not supported on MPS
-  in PyTorch 2.3).
+- The script selects MPS automatically and disables `torch.compile` (not tested on MPS).
 - If an operation is not implemented on MPS, prefix the command with
   `PYTORCH_ENABLE_MPS_FALLBACK=1` to run that operation on CPU.
 

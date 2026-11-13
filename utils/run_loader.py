@@ -65,7 +65,7 @@ def load_model_from_run(
     params = load_run_params(run_id)
 
     ckpt_path = get_checkpoint_path(run_id)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     metadata = ckpt.get("metadata", {})
 
     bs = _resolve_block_size(params, block_size)
@@ -556,7 +556,7 @@ def config_from_runid(runid: str):
     delphi_cfg = DelphiConfig(**delphi_params)
     model = Delphi(delphi_cfg)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
 
     from utils.ckpt_utils import strip_compiled_prefix
@@ -711,7 +711,7 @@ def config_from_runid_multistream(runid: str, no_event_token_rate: float | None 
 
     ckpt_path = get_checkpoint_path(runid)
     logging.info("Loading checkpoint: %s", ckpt_path)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     start_epoch = ckpt.get("metadata", {}).get("epoch", 0) + 1
     date_cutoff = ckpt.get("metadata", {}).get("date_cutoff", None)
 

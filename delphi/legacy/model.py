@@ -608,7 +608,7 @@ class Delphi(nn.Module):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        checkpoint = torch.load(ckpt_path, map_location=device)        
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)        
         conf = DelphiConfig(**checkpoint['model_args'])        
         model = Delphi(conf)
         

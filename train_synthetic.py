@@ -315,7 +315,7 @@ def main():
         sys.exit(0)
 
     model = Delphi(delphi_config).to(DEVICE)
-    # torch.compile (inductor) does not support MPS in torch 2.3
+    # torch.compile (inductor) is not tested on MPS: disabled there
     model = _compile_model(model, disable=args.no_compile or DEVICE.startswith("mps"))
 
     dataloaders = get_dataloaders(domain_cfg, model, tokens_dir, args)
