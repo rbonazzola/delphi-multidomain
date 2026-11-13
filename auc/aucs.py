@@ -36,6 +36,10 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 DAYS_PER_YEAR = 365.25
+
+# Washout used to score cases in the AUCs (see add_washout_previous): each case is scored at
+# the last token at least this many days before its diagnosis.
+DEFAULT_WASHOUT_DAYS = 90.0
 SEX_TOKENS = {"female": 0, "male": 1}
 AGE_RANGES = [(a, a + 5) for a in range(0, 85, 5)]
 EMPTY = (np.array([], dtype=int), np.array([], dtype=int))
@@ -109,29 +113,68 @@ def add_age_bin(df):
     return df
 
 
-def add_strict_day_previous(df):
-    """Add `strict_prev_idx` / `age_strict_previous`: the global_idx and age of the last token of
-    the same subject recorded on an EARLIER day than this token (-1 / NaN if there is none).
+def add_washout_previous(df, washout_days):
+    """Add `washout_prev_idx` / `age_washout_previous`: the global_idx and age of the last token
+    of the same subject recorded at least `washout_days` before this token (age <= this age -
+    washout_days), or -1 / NaN if there is none. Needs washout_days > 0.
 
     A case scored at the position right before its diagnosis token (`global_idx - 1`) can be
     looking at a token recorded on the diagnosis day itself -- e.g. L40 (psoriasis) coded with
     M07 (psoriatic arthropathy) at the same visit. `mask_ties` keeps same-day tokens out of
     attention, but the token at the scoring position still reaches the prediction through the
-    residual stream, so the prediction already "knows" part of the diagnosis. Scoring at the last
-    earlier-day token avoids that. Expects one row per global_idx, sorted (as built by
-    `_forward_pass_embeddings_and_tokens`).
+    residual stream, so the prediction already "knows" part of the diagnosis. Scoring at the
+    last token before a washout window avoids that: washout_days=1 skips the diagnosis day
+    (ages are whole days), longer windows also skip the work-up that leads to the diagnosis.
+
+    Expects one row per global_idx, sorted (as built by `_forward_pass_embeddings_and_tokens`),
+    with tokens in age order within a subject (the collate sorts them by age). Tokens with a
+    negative age (padding) are never used.
     """
+    if not washout_days > 0:
+        raise ValueError(f"washout_days must be > 0, got {washout_days!r}")
     g = df["global_idx"].to_numpy()
     assert (g == np.arange(len(g))).all(), "tokens_df must have one row per global_idx, sorted"
-    subj = df["subject_idx"].to_numpy()
-    age = df["age"].to_numpy()
-    new_day = np.r_[True, (subj[1:] != subj[:-1]) | (age[1:] != age[:-1])]
-    day_start = np.maximum.accumulate(np.where(new_day, g, 0))
-    prev = day_start - 1
-    valid = (prev >= 0) & (subj[np.clip(prev, 0, None)] == subj) & (age[np.clip(prev, 0, None)] >= 0)
-    df["strict_prev_idx"] = np.where(valid, prev, -1)
-    df["age_strict_previous"] = np.where(valid, age[np.clip(prev, 0, None)], np.nan)
+    subj = df["subject_idx"].to_numpy().astype(np.int64)
+    age = df["age"].to_numpy().astype(np.float64)
+
+    valid = np.flatnonzero(age >= 0)
+    v_subj, v_age = subj[valid], age[valid]
+    assert (np.diff(v_subj) >= 0).all(), "tokens must be sorted by subject"
+
+    # Last valid token with (subject, age) <= (this subject, this age - washout): one
+    # searchsorted on a key that orders by subject, then age (span > any age + washout). The
+    # running max makes the key sorted even where the collate's float32 sort key (age +
+    # domain * 0.001) leaves a token a few thousandths of a day out of order.
+    span = 2.0 ** np.ceil(np.log2(float(v_age.max(initial=0.0)) + washout_days + 2.0))
+    key = np.maximum.accumulate(v_subj * span + v_age)
+    k = np.searchsorted(key, subj * span + (age - washout_days), side="right") - 1
+    prev = np.where(k >= 0, valid[np.clip(k, 0, None)], -1)
+    prev = np.where((prev >= 0) & (subj[np.clip(prev, 0, None)] == subj), prev, -1)
+
+    ok = (prev >= 0) & (prev < g)
+    df["washout_prev_idx"] = np.where(ok, prev, -1)
+    df["age_washout_previous"] = np.where(ok, age[np.clip(prev, 0, None)], np.nan)
     return df
+
+
+def case_scoring_arrays(by_disease_dfs, washout_days):
+    """Per sex and (domain, token_id): (case index, age used for the case's age bin), and the
+    `case_offset` for `compute_auc_from_indices`. washout_days=0: the token right before the
+    diagnosis (case index = diagnosis global_idx, offset 1). washout_days > 0: the last token at
+    least washout_days earlier (`add_washout_previous` must have been applied; offset 0); cases
+    with no such token are dropped."""
+    if washout_days > 0:
+        cols, offset = ("washout_prev_idx", "age_washout_previous"), 0
+    else:
+        cols, offset = ("global_idx", "age_previous"), 1
+    arrays = {
+        sex_id: {
+            dd: (df.loc[df[cols[0]] >= 0, cols[0]].to_numpy(), df.loc[df[cols[0]] >= 0, cols[1]].to_numpy())
+            for dd, df in dfs.items()
+        }
+        for sex_id, dfs in by_disease_dfs.items()
+    }
+    return arrays, offset
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -349,7 +392,7 @@ def evaluate_aucs(
     score_transform: str = "logit",
     tokens: Optional[List[Tuple[str, int]]] = None,
     cache_dir: Optional[str | Path] = None,
-    case_position: str = "strict_day",
+    washout_days: float = DEFAULT_WASHOUT_DAYS,
 ) -> pd.DataFrame:
     """
     Evaluate AUCs for all predicted diseases.
@@ -387,13 +430,14 @@ def evaluate_aucs(
     cache_dir : path, optional
         Per-batch cache of the forward pass, to resume after a failure; see
         `_forward_pass_embeddings_and_tokens`.
-    case_position : str
-        Where a case is scored, which also sets its age bin.
-        "strict_day" (default): at the last token recorded on a day before the diagnosis day,
-        so codes recorded together with the diagnosis (e.g. L40 with M07, G30 with F00) are not
-        seen; see `add_strict_day_previous`. Cases with no earlier-day token are dropped.
-        "previous_token": at the token right before the diagnosis token, whatever its date
-        (the behavior before 2026-10-09; reproduces earlier aucs.csv files).
+    washout_days : float
+        Where a case is scored, which also sets its age bin: at the last token recorded at least
+        `washout_days` days before the diagnosis token (see `add_washout_previous`); cases with
+        no such token are dropped. Default: DEFAULT_WASHOUT_DAYS (90), so neither codes recorded
+        together with the diagnosis (e.g. L40 with M07) nor the work-up that leads to it are seen.
+        1: any earlier day. 0: the token right before the diagnosis token, whatever its date (the
+        behavior before 2026-10-09; reproduces earlier aucs.csv files). Controls are scored as
+        before, whatever this value.
 
     Returns
     -------
@@ -401,8 +445,8 @@ def evaluate_aucs(
     """
     if score_transform not in ("logit", "softmax"):
         raise ValueError(f"score_transform must be 'logit' or 'softmax', got {score_transform!r}")
-    if case_position not in ("strict_day", "previous_token"):
-        raise ValueError(f"case_position must be 'strict_day' or 'previous_token', got {case_position!r}")
+    if not washout_days >= 0:
+        raise ValueError(f"washout_days must be >= 0, got {washout_days!r}")
     import logging
 
     device = model.device
@@ -418,8 +462,8 @@ def evaluate_aucs(
 
     # ── 2. Build case/control indices ─────────────────────────────────
     print("Building case/control indices...")
-    if case_position == "strict_day":
-        tokens_df = add_strict_day_previous(tokens_df)
+    if washout_days > 0:
+        tokens_df = add_washout_previous(tokens_df, washout_days)
 
     # Precompute age masks
     age_masks = {}
@@ -472,27 +516,8 @@ def evaluate_aucs(
     tok_sex = tokens_df["sex"].to_numpy()
     tok_gidx = tokens_df["global_idx"].to_numpy()
 
-    # (case index, age used for the age bin) per disease; with case_offset below, the case is
-    # scored at index - case_offset
-    if case_position == "strict_day":
-        case_offset = 0
-        disease_idx = {
-            sex_id: {
-                dd: (df.loc[df.strict_prev_idx >= 0, "strict_prev_idx"].to_numpy(),
-                     df.loc[df.strict_prev_idx >= 0, "age_strict_previous"].to_numpy())
-                for dd, df in by_disease_dfs[sex_id].items()
-            }
-            for sex_id in SEX_TOKENS.values()
-        }
-    else:
-        case_offset = 1
-        disease_idx = {
-            sex_id: {
-                dd: (df["global_idx"].to_numpy(), df["age_previous"].to_numpy())
-                for dd, df in by_disease_dfs[sex_id].items()
-            }
-            for sex_id in SEX_TOKENS.values()
-        }
+    # (case index, age used for the age bin) per disease; the case is scored at index - case_offset
+    disease_idx, case_offset = case_scoring_arrays(by_disease_dfs, washout_days)
 
     del by_disease_dfs, tokens_df
 
@@ -589,7 +614,7 @@ def evaluate_aucs(
 
     if run_id is not None:
         auc_df = auc_df.assign(runid=run_id, block_size=block_size)
-    auc_df = auc_df.assign(case_position=case_position)
+    auc_df = auc_df.assign(washout_days=washout_days)
 
     columns_order = [
         c for c in [
@@ -597,7 +622,7 @@ def evaluate_aucs(
             "sex", "age_start", "age_end",
             "n_case", "n_ctrl",
             "auc_delong", "auc_delong_var", "mann_u", "mann_p",
-            "block_size", "case_position",
+            "block_size", "washout_days",
         ]
         if c in auc_df.columns
     ]

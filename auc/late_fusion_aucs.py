@@ -25,11 +25,14 @@ from auc.aucs import (
     batch_to_tokens_df,
     add_sex_column,
     add_age_bin,
+    add_washout_previous,
+    case_scoring_arrays,
     extract_case_ctrl_for_sex_age,
     process_disease,
     SEX_TOKENS,
     AGE_RANGES,
     DAYS_PER_YEAR,
+    DEFAULT_WASHOUT_DAYS,
 )
 
 
@@ -59,6 +62,7 @@ def evaluate_aucs_late_fusion(
     n_jobs: int = -1,
     logger=None,
     output_file: str = "aucs.csv",
+    washout_days: float = DEFAULT_WASHOUT_DAYS,
 ) -> pd.DataFrame:
     """
     Compute per-disease AUCs for a DelphiLateFusion model.
@@ -73,7 +77,12 @@ def evaluate_aucs_late_fusion(
     n_jobs : joblib parallelism for AUC computation.
     logger : MLFlowLogger; if provided, saves results as artifact.
     output_file : artifact filename.
+    washout_days : where a case is scored, as in auc.aucs.evaluate_aucs: the last token at least
+        washout_days before the diagnosis token (default DEFAULT_WASHOUT_DAYS = 90); 0: the
+        token right before it.
     """
+    if not washout_days >= 0:
+        raise ValueError(f"washout_days must be >= 0, got {washout_days!r}")
     device = model.device
     trunk = model.trunk
     block_size = block_size or trunk.config.block_size
@@ -122,6 +131,8 @@ def evaluate_aucs_late_fusion(
     tokens_df["subject_idx"] = tokens_df.global_idx // block_size
     tokens_df = add_sex_column(tokens_df)
     tokens_df = add_age_bin(tokens_df)
+    if washout_days > 0:
+        tokens_df = add_washout_previous(tokens_df, washout_days)
     del all_tokens_dfs
 
     # ── 2. Decide which disease tokens to evaluate ────────────────────────────
@@ -168,13 +179,7 @@ def evaluate_aucs_late_fusion(
     tok_sex = tokens_df["sex"].to_numpy()
     tok_gidx = tokens_df["global_idx"].to_numpy()
 
-    disease_idx = {
-        sex_id: {
-            dd: (df["global_idx"].to_numpy(), df["age_previous"].to_numpy())
-            for dd, df in by_disease_dfs[sex_id].items()
-        }
-        for sex_id in SEX_TOKENS.values()
-    }
+    disease_idx, case_offset = case_scoring_arrays(by_disease_dfs, washout_days)
 
     tasks = [
         (sex, sex_id, a0, a1)
@@ -241,19 +246,19 @@ def evaluate_aucs_late_fusion(
         for _, token_id in tqdm(predicted_tokens, desc="AUC computation")
     )
     if n_jobs == 1:
-        auc_results = [process_disease(*a, block_size=block_size) for a in _auc_args]
+        auc_results = [process_disease(*a, block_size=block_size, case_offset=case_offset) for a in _auc_args]
     else:
         auc_results = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(process_disease)(*a, block_size=block_size) for a in _auc_args
+            delayed(process_disease)(*a, block_size=block_size, case_offset=case_offset) for a in _auc_args
         )
 
     # ── 5. Assemble and log ───────────────────────────────────────────────────
     auc_data = [row for sublist in auc_results for row in sublist]
-    auc_df = pd.DataFrame(auc_data)
+    auc_df = pd.DataFrame(auc_data).assign(washout_days=washout_days)
 
     columns_order = [c for c in [
         "domain", "token_id", "sex", "age_start", "age_end",
-        "n_case", "n_ctrl", "auc_delong", "auc_delong_var", "mann_u", "mann_p",
+        "n_case", "n_ctrl", "auc_delong", "auc_delong_var", "mann_u", "mann_p", "washout_days",
     ] if c in auc_df.columns]
     auc_df = auc_df[columns_order]
 

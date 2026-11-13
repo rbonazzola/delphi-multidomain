@@ -25,6 +25,7 @@ from utils.mlflow_utils import setup_mlflow, get_checkpoint_path
 from utils.run_loader import reconstruct_from_run
 from utils.trainer import MLFlowLogger
 from train_late_fusion import build_encoder, build_hla_features
+from auc.aucs import DEFAULT_WASHOUT_DAYS
 from auc.late_fusion_aucs import evaluate_aucs_late_fusion
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -37,6 +38,10 @@ def main():
     ap.add_argument("--eval_block_size", type=int, default=128)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--split", choices=["val", "test"], default="val")
+    ap.add_argument("--washout_days", type=float, default=DEFAULT_WASHOUT_DAYS,
+                    help="Score each case at the last token at least this many days before the "
+                         "diagnosis. Default: %(default)g. 0: the token right before it. "
+                         "See auc/aucs.py:evaluate_aucs")
     args = ap.parse_args()
 
     setup_mlflow()
@@ -91,6 +96,7 @@ def main():
         auc_df = evaluate_aucs_late_fusion(
             model=model, test_loader=auc_loader, focus_token_ids=None,
             block_size=args.eval_block_size, n_jobs=8, logger=logger, output_file=output_file,
+            washout_days=args.washout_days,
         )
         print(f"AUC summary:\n{auc_df.groupby('domain')['auc_delong'].describe().to_string()}")
     finally:

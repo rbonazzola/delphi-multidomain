@@ -55,7 +55,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from auc.aucs import evaluate_aucs
+from auc.aucs import DEFAULT_WASHOUT_DAYS, evaluate_aucs
 from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
 from utils.ckpt_utils import load_model_from_checkpoint, strip_compiled_prefix, _domain_configs_from_spec
 from utils.mlflow_utils import setup_mlflow
@@ -429,6 +429,11 @@ def main():
     ap.add_argument("--score", choices=["logit", "softmax"], default="logit",
                     help="AUC score: raw logit (default) or softmax over the domain vocabulary. "
                          "See auc/aucs.py:evaluate_aucs")
+    ap.add_argument("--washout_days", type=float, default=DEFAULT_WASHOUT_DAYS,
+                    help="Score each case at the last token at least this many days before the "
+                         "diagnosis (cases without one are dropped). Default: %(default)g. "
+                         "0: the token right before the diagnosis (AUCs computed before 2026-10-09). "
+                         "See auc/aucs.py:evaluate_aucs")
     ap.add_argument("--output", default=None,
                     help="Output CSV. Default: aucs.csv / aucs_val.csv (with a _softmax suffix if --score softmax). "
                          "With --split both the defaults are always used.")
@@ -530,7 +535,8 @@ def main():
                                       domain_config_yaml=args.domain_config_yaml)
             auc_df = evaluate_aucs(model, loader, block_size=block_size, run_id=args.runid,
                                    n_jobs=args.n_jobs, logger=logger, output_file=Path(output).name,
-                                   score_transform=args.score, tokens=tokens, cache_dir=cache)
+                                   score_transform=args.score, tokens=tokens, cache_dir=cache,
+                                   washout_days=args.washout_days)
             auc_df.to_csv(output, index=False)
             drop_forward_cache(args, cache)
             print(f"Done: {auc_df.shape} -> {output}")
