@@ -23,6 +23,11 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc g++ libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
+# With --user <uid> the uid has no passwd entry: torch.compile needs a user name
+# (getpass) and a writable home for its caches.
+ENV USER=delphi \
+    HOME=/tmp
+
 COPY code/ ./
 COPY synthetic_data/ /opt/delphi/synthetic_data/
 

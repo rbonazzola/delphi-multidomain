@@ -139,7 +139,9 @@ def get_cli_args():
                              "(fewer distinct shapes, fewer torch.compile recompilations). 1 = exact trim.")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", default=64, type=int)
     parser.add_argument("--eval_batch_size", "--eval-batch-size", dest="eval_batch_size", default=256, type=int)
-    parser.add_argument("--num_workers", "--num-workers", dest="num_workers", default=4, type=int)
+    parser.add_argument("--num_workers", "--num-workers", dest="num_workers", default=4, type=int,
+                        help="DataLoader worker processes, started once (persistent). 0: load the data in "
+                             "the main process (slower on GPU). On macOS the workers take ~30 s to start.")
     parser.add_argument("--token_dropout", "--token-dropout", dest="token_dropout", default=0.1, type=float)
     parser.add_argument("--no_event_token_rate", "--no-event-token-rate", dest="no_event_token_rate",
                         default=5.0, type=float,
@@ -247,8 +249,11 @@ def get_dataloaders(domain_cfg, model, tokens_dir, args):
     train_collate = DelphiCollateFn(**collate_kwargs, age_jitter=age_jitter, training=True)
     eval_collate = DelphiCollateFn(**collate_kwargs, training=False)
 
-    train_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=PIN_MEMORY)
-    eval_kwargs = dict(batch_size=args.eval_batch_size, num_workers=args.num_workers, pin_memory=PIN_MEMORY)
+    # persistent_workers: start the workers once, not at every epoch. With "spawn" (macOS) each
+    # start pickles the whole dataset into every worker, which made workers slower than none.
+    workers = dict(num_workers=args.num_workers, persistent_workers=args.num_workers > 0)
+    train_kwargs = dict(batch_size=args.batch_size, pin_memory=PIN_MEMORY, **workers)
+    eval_kwargs = dict(batch_size=args.eval_batch_size, pin_memory=PIN_MEMORY, **workers)
 
     train_loader = FlexibleDataLoader(train_dataset, shuffle=True, collate_fn=train_collate, **train_kwargs)
     valid_loader = FlexibleDataLoader(valid_dataset, shuffle=False, collate_fn=eval_collate, **eval_kwargs)

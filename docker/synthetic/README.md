@@ -1,6 +1,6 @@
 # Delphi · synthetic-data training image
 
-Train [Delphi](../../README.md) — a generative transformer for health trajectories — on a
+Train Delphi — a generative transformer for health trajectories — on a
 **synthetic cohort** of 485,631 subjects, without access to UK Biobank.
 
 The image contains the training code, a pinned Python environment, and the synthetic cohort.
@@ -8,7 +8,7 @@ Run one command to train on GPU, on CPU, or (natively) on Apple Silicon.
 
 | | |
 |---|---|
-| **Image** | `delphi-synthetic:latest` (10.8 GB, 3.3 GB compressed) |
+| **Image** | `delphi-synthetic:latest` |
 | **Native bundle** | code + data, no environment (66 MB) |
 | **Domains** | `sex`, `lifestyle`, `diseases`, `death` |
 | **Stack** | Python 3.11 · PyTorch 2.8.0 (CUDA 12.8) · MLflow 2.22.0 |
@@ -35,13 +35,13 @@ CUDA 12.8) and
 [`nvidia-container-toolkit`](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 on the host.
 
-This README is also inside the image (`/opt/delphi/README.synthetic.md`) and the native bundle.
+This README is also inside the image (`/opt/delphi/README.synthetic.md`).
 
 **1. Load the image.**
 
 ```bash
-sha256sum -c delphi-synthetic_2026-11-12.tar.gz.sha256
-docker load -i delphi-synthetic_2026-11-12.tar.gz
+sha256sum -c delphi-synthetic_2026-11-13.tar.gz.sha256
+docker load -i delphi-synthetic_2026-11-13.tar.gz
 ```
 
 **2. Check that the container sees the GPU.**
@@ -56,7 +56,7 @@ docker run --rm --gpus all --entrypoint python delphi-synthetic:latest \
 ```bash
 mkdir -p mlruns
 docker run --rm --gpus all --shm-size=2g \
-    --user $(id -u):$(id -g) -e HOME=/tmp -e USER=$(whoami) \
+    --user $(id -u):$(id -g) \
     -v "$PWD/mlruns:/workspace/mlruns" \
     delphi-synthetic:latest \
     --n_subjects_debug 2000 --max_epochs 1 --n_layer 2 --n_head 2 --n_embd 32 --block_size 128
@@ -69,7 +69,7 @@ bar starts.
 
 ```bash
 docker run --rm --gpus all --shm-size=8g \
-    --user $(id -u):$(id -g) -e HOME=/tmp -e USER=$(whoami) \
+    --user $(id -u):$(id -g) \
     -v "$PWD/mlruns:/workspace/mlruns" \
     delphi-synthetic:latest --max_epochs 100 --experiment_name synthetic-delphi
 ```
@@ -91,9 +91,8 @@ Each run stores its metrics, parameters and checkpoints (`artifacts/checkpoints/
 | Flag | Why |
 |---|---|
 | `--gpus all` | Gives the container access to the GPUs. Leave it out to train on CPU. |
-| `--shm-size=2g` (or more) | The DataLoader workers share memory through `/dev/shm`. Docker's default (64 MB) is too small. |
-| `--user $(id -u):$(id -g)` | Writes `mlruns/` as your user, not as root. |
-| `-e HOME=/tmp -e USER=$(whoami)` | Required together with `--user`: PyTorch needs a user name and a writable home. |
+| `--shm-size=2g` (or more) | With `--num_workers` > 0, the DataLoader workers share memory through `/dev/shm`. Docker's default (64 MB) is too small. |
+| `--user $(id -u):$(id -g)` | Writes `mlruns/` as your user, not as root. The image sets `USER=delphi` and `HOME=/tmp`, which `torch.compile` needs when the user ID has no account in the image. |
 | `-v "$PWD/mlruns:/workspace/mlruns"` | Keeps the MLflow runs on the host after the container exits. |
 | `-e DEVICE=cpu` | Forces the device. Default: `cuda` if available, else `mps`, else `cpu`. |
 
@@ -110,6 +109,7 @@ are already set. Show all arguments with `docker run --rm delphi-synthetic:lates
 | `--trim_multiple` | 32 | With `auto`, round each batch length up to this multiple (fewer `torch.compile` recompilations) |
 | `--no_event_token_rate` | 5 | Years between "no event" tokens (same as the generating model) |
 | `--batch_size` | 64 | Training batch size |
+| `--num_workers` | 4 | DataLoader worker processes, started once for the whole run. 0 loads the data in the main process (about 2× slower per epoch on GPU). On macOS the workers take about 30 s to start. |
 | `--lr` | 1e-4 | Peak learning rate (cosine schedule) |
 | `--n_subjects_debug` | all | Use only N subjects (for quick tests) |
 | `--val_frac` / `--test_frac` | 0.1 / 0.1 | Random split of the synthetic subjects |
@@ -150,13 +150,15 @@ and the same data as the image.
 curl -LsSf https://astral.sh/uv/install.sh | sh          # install uv, if needed
 
 mkdir delphi-synthetic && cd delphi-synthetic
-tar -xzf ../delphi-synthetic-bundle_2026-11-12.tar.gz
+tar -xzf ../delphi-synthetic-bundle_2026-11-13.tar.gz
 uv sync --frozen --no-dev --extra log --no-install-project
 
 uv run python train_synthetic.py --tokens_dir synthetic_data --no_rich --max_epochs 100
 ```
 
 - The script selects MPS automatically and disables `torch.compile` (not tested on MPS).
+- With PyTorch 2.8, `torch.isin` runs on MPS, and the DataLoader workers work on macOS: they
+  take about 30 s to start, then each epoch is about 2× faster than with `--num_workers 0`.
 - If an operation is not implemented on MPS, prefix the command with
   `PYTORCH_ENABLE_MPS_FALLBACK=1` to run that operation on CPU.
 
@@ -168,7 +170,7 @@ uv run python train_synthetic.py --tokens_dir synthetic_data --no_rich --max_epo
 ## Run on an HPC cluster (Singularity)
 
 ```bash
-singularity build delphi-synthetic.sif docker-archive://delphi-synthetic_2026-11-12.tar.gz
+singularity build delphi-synthetic.sif docker-archive://delphi-synthetic_2026-11-13.tar.gz
 singularity run --nv --bind "$PWD/mlruns:/workspace/mlruns" delphi-synthetic.sif --max_epochs 100
 ```
 
