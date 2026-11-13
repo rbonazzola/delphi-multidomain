@@ -27,6 +27,77 @@ _SPLIT_TO_METADATA_KEY = {
 }
 
 
+def _resolve_block_size(params: dict, block_size: int | None) -> int:
+    """Explicit override, else the run's stored block size ("auto" -> AUTO_BLOCK_SIZE)."""
+    stored_block_size = params.get("block_size", "96")
+    if block_size is not None:
+        return block_size
+    if stored_block_size == "auto":
+        logging.warning(
+            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d "
+            "as the fixed block size.", AUTO_BLOCK_SIZE
+        )
+        return AUTO_BLOCK_SIZE
+    return int(stored_block_size)
+
+
+def load_model_from_run(
+    run_id: str,
+    block_size: int | None = None,
+    device: str | None = None,
+    tokens_path: Union[str, Path, None] = None,
+    domain_config_yaml: Union[str, Path, None] = None,
+) -> tuple:
+    """
+    Model-only half of `reconstruct_from_run`: load a run's best checkpoint into
+    a model (eval mode, on device), without building any dataset.
+
+    Returns (model, domain_cfg, run_params, checkpoint_metadata). Parameters are
+    as in `reconstruct_from_run`; domain paths in `domain_cfg` are rewritten to
+    `tokens_path/<domain>` when `tokens_path` is given.
+    """
+    from utils.mlflow_utils import get_checkpoint_path, load_run_params
+    from utils.ckpt_utils import load_model_from_checkpoint
+
+    if device is None:
+        device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+
+    params = load_run_params(run_id)
+
+    ckpt_path = get_checkpoint_path(run_id)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    metadata = ckpt.get("metadata", {})
+
+    bs = _resolve_block_size(params, block_size)
+
+    if ckpt.get("model_spec") is not None and domain_config_yaml is None:
+        # Self-contained checkpoint: the exact construction config is stored in it,
+        # no need to parse (possibly truncated) MLflow params.
+        if tokens_path is not None:
+            # Redirect before building: the run's own data (e.g. a synthetic cohort)
+            # may not exist here at all, only a folder sharing its vocabulary.
+            ckpt = {**ckpt, "model_spec": _spec_with_tokens_path(ckpt["model_spec"], tokens_path)}
+        model = load_model_from_checkpoint(ckpt, block_size=bs)
+        domain_cfg = _model_config(model).domains
+    else:
+        model, domain_cfg = _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, tokens_path)
+    model = model.to(device)
+    model.eval()
+
+    if tokens_path is not None:
+        # Must be absolute: DelphiDataset only uses a domain's `path` as-is when
+        # it's absolute, otherwise it re-joins it under root/"tokens"/... -- a
+        # relative tokens_path here would silently double that prefix.
+        tokens_root = Path(tokens_path).resolve()
+        for dname, dcfg in domain_cfg.items():
+            if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
+                continue
+            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
+
+    logging.info("Model loaded: %d parameters", sum(p.numel() for p in model.parameters()))
+    return model, domain_cfg, params, metadata
+
+
 def reconstruct_from_run(
     run_id: str,
     split: Union[str, list[str]] = "test",
@@ -71,22 +142,20 @@ def reconstruct_from_run(
     run_params   : dict — raw MLflow params.
     """
     from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
-    from utils.mlflow_utils import get_checkpoint_path, load_run_params
-    from utils.ckpt_utils import load_model_from_checkpoint
-
-    if device is None:
-        device = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
     splits: list[str] = [split] if isinstance(split, str) else list(split)
     for s in splits:
         if s not in _SPLIT_TO_METADATA_KEY:
             raise ValueError(f"split must be one of {list(_SPLIT_TO_METADATA_KEY)}, got {s!r}")
 
-    params = load_run_params(run_id)
-
-    ckpt_path = get_checkpoint_path(run_id)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    metadata = ckpt.get("metadata", {})
+    model, domain_cfg, params, metadata = load_model_from_run(
+        run_id,
+        block_size=block_size,
+        device=device,
+        tokens_path=tokens_path,
+        domain_config_yaml=domain_config_yaml,
+    )
+    bs = _resolve_block_size(params, block_size)
 
     if subjects is not None:
         if isinstance(subjects, (str, Path)):
@@ -100,44 +169,6 @@ def reconstruct_from_run(
             key = _SPLIT_TO_METADATA_KEY[s]
             if metadata.get(key) is None:
                 raise ValueError(f"Checkpoint metadata missing '{key}' (needed for split={s!r}).")
-
-    stored_block_size = params.get("block_size", "96")
-    if block_size is not None:
-        bs = block_size
-    elif stored_block_size == "auto":
-        logging.warning(
-            "Run was trained with block_size='auto'; using AUTO_BLOCK_SIZE=%d "
-            "as the fixed block size.", AUTO_BLOCK_SIZE
-        )
-        bs = AUTO_BLOCK_SIZE
-    else:
-        bs = int(stored_block_size)
-
-    if ckpt.get("model_spec") is not None and domain_config_yaml is None:
-        # Self-contained checkpoint: the exact construction config is stored in it,
-        # no need to parse (possibly truncated) MLflow params.
-        if tokens_path is not None:
-            # Redirect before building: the run's own data (e.g. a synthetic cohort)
-            # may not exist here at all, only a folder sharing its vocabulary.
-            ckpt = {**ckpt, "model_spec": _spec_with_tokens_path(ckpt["model_spec"], tokens_path)}
-        model = load_model_from_checkpoint(ckpt, block_size=bs)
-        domain_cfg = _model_config(model).domains
-    else:
-        model, domain_cfg = _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, tokens_path)
-    model = model.to(device)
-    model.eval()
-
-    if tokens_path is not None:
-        # Must be absolute: DelphiDataset only uses a domain's `path` as-is when
-        # it's absolute, otherwise it re-joins it under root/"tokens"/... -- a
-        # relative tokens_path here would silently double that prefix.
-        tokens_root = Path(tokens_path).resolve()
-        for dname, dcfg in domain_cfg.items():
-            if dname in ("padding", "no_event") or not getattr(dcfg, "path", None):
-                continue
-            dcfg.path = str(tokens_root / Path(str(dcfg.path)).name)
-
-    logging.info("Model loaded: %d parameters", sum(p.numel() for p in model.parameters()))
 
     # DelphiConfig carries the no-event sampling settings; DelphiMultiStreamConfig doesn't,
     # so for MultiStream they come from the checkpoint's data_config.
