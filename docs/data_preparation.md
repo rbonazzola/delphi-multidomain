@@ -119,7 +119,7 @@ python data/generate_hla_pretrained_embeddings.py \
     --n_components 0.995
 ```
 
-See the README section *Pretrained token embeddings* for the config fields.
+For the config fields, see [domain_config.md](domain_config.md#pretrained-token-embeddings-projector-pretrained).
 
 ## 6. Subject lists (cross-validation folds)
 
@@ -169,7 +169,7 @@ python train.py --domain_config_yaml config/my_experiment.yaml \
     --domains diseases,death,lifestyle,sex,my_biomarker ...
 ```
 
-The README section *Preparing the data for each domain* lists all the config fields.
+For all the config fields, see [domain_config.md](domain_config.md).
 
 ## 8. Check the result
 

@@ -45,25 +45,14 @@ The code has been tested with the following versions:
 
 Each domain is a directory with a `tokenizer.yaml` and a `tokens.csv`; the CV folds are 10 subject-list files. To create these files, see [docs/data_preparation.md](docs/data_preparation.md).
 
-Domains are configured via a YAML file (see `config/domain_config_default.yaml` for a reference).
-Each entry defines one domain and its properties:
+Domains are configured in a YAML file (reference: `config/domain_config_default.yaml`). Give the file with `--domain_config_yaml` and select the active domains with `--domains`:
 
 ```yaml
 diseases:
   projector: embed
-  path: diseases
+  path: diseases      # relative to <data_root>/tokens/
   predict: true
-  no_repeat: true   # each disease is recorded only at first diagnosis
-
-lifestyle:
-  projector: embed
-  path: lifestyle
-  age_jitter: true
-
-sex:
-  projector: embed
-  path: sex
-  at_birth: true
+  no_repeat: true
 
 genetic_pcs:
   type: continuous
@@ -74,128 +63,14 @@ genetic_pcs:
   n_latent_tokens: 5
 ```
 
-**`no_repeat: true`** should be set for domains where each token appears at most once per subject by construction (e.g. diseases recorded only at first diagnosis). When enabled, the logits for already-seen tokens are set to `-inf` after each forward pass, before the loss is computed. This prevents the model from learning the spurious pattern of suppressing a disease's logit once it has appeared - an artefact of the data, not a biological signal.
-
-Pass the config file via `--domain_config_yaml` and select which domains to activate with `--domains`:
-
 ```bash
 python train.py --domain_config_yaml config/domain_config_default.yaml --domains diseases,lifestyle,sex ...
+python train.py --dcfg diseases.predict=True lifestyle.age_jitter=False ...   # override fields from the CLI
 ```
 
-The `padding` domain is injected automatically — do not add it to the YAML or `--domains`.
+`padding` and `no_event` are added automatically: do not list them in `--domains`.
 
-#### Domain groups (`group`)
-
-Each domain can declare a `group` name used for compact display in logs and run summaries. When multiple domains share a group, they appear as a single token in reports instead of listing each domain individually.
-
-`config/domain_config_default.yaml` sets the following defaults:
-
-| Group | Domains |
-|-------|---------|
-| `core` | diseases, death, lifestyle, sex |
-| `drugs` | cv_drugs, ns_drugs |
-| `hla` | hla_alleles |
-| *(none)* | genetic_pcs — shown by its own name |
-
-You can override or add groups via `--dcfg` or in a child config that extends the default.
-
-#### Extending a config (`extends`)
-
-A domain config YAML can inherit from another file using `extends:`:
-
-```yaml
-# config/my_experiment.yaml
-extends: domain_config_default.yaml
-
-diseases:
-  predict: false        # override one field; all other fields are inherited
-
-hla_a:
-  parent: hla_alleles   # within-file inheritance still works
-  subdomain: hla_a
-  predict: true
-  group: hla            # group is not inherited via parent; set it explicitly
-```
-
-The child file is deep-merged on top of the base: within each domain, only the fields declared in the child override those from the base; unmentioned fields are kept as-is. Chains are supported (A extends B extends C). Paths in `extends` are resolved relative to the file that declares them.
-
-#### Overriding domain config fields from the CLI
-
-Individual domain config fields can be overridden at runtime without editing the YAML, using `--dcfg` (alias for `--domain_config`):
-
-```bash
-python train.py --dcfg diseases.predict=True hla_alleles.dropout_rate=0.2 lifestyle.age_jitter=False ...
-```
-
-Multiple overrides can be passed in a single `--dcfg` invocation (space-separated) or across multiple invocations. The format is always `DOMAIN.FIELD=VALUE`. Values are parsed as Python literals (booleans, ints, floats, strings).
-
-Duration fields (`age_jitter_min`, `age_jitter_max`) accept human-readable strings:
-
-```bash
-python train.py --dcfg lifestyle.age_jitter_min=-20y lifestyle.age_jitter_max=10y ...
-# Accepted units: y (years), m (months), d (days)
-```
-
-For each domain, create a folder under `data/transforms/tokens/<domain_name>/` with two files:
-- `tokens.csv`: columns `subject_id`, `age` (in days), `token_id` — one row per token event, all subjects together.
-- `tokenizer.yaml`: list of token names in order; position determines `token_id` (zero-based).
-
-#### Pretrained token embeddings (`projector: pretrained`)
-
-When external token embeddings are available (e.g. ESM2 protein embeddings for HLA alleles), the domain can be configured to use them instead of learning embeddings from scratch:
-
-```yaml
-hla_a:
-  projector: pretrained
-  pretrained_path: /path/to/hla_a_embeddings.pt
-  freeze: false          # true = keep pretrained weights fixed; false = fine-tune
-  path: hla_alleles      # still needed for tokenizer.yaml and tokens.csv
-  at_birth: true
-  subdomain: hla_a
-  subdomain_column: locus
-```
-
-**How it works:** the `.pt` file must be a `torch.Tensor` of shape `[vocab_size, d_ext]`, where `vocab_size` matches the number of entries in `tokenizer.yaml` and `d_ext` is the external embedding dimension. At runtime a learned linear layer projects each `d_ext`-dimensional vector to `n_embd`, so the external dimension does not need to match the model's embedding size.
-
-The domain still uses the shared `tokenizer.yaml` and `tokens.csv` under `path`. The pretrained weights replace the random initialization of the embedding table; the linear projection on top is always trained from scratch.
-
-**`freeze: true`** locks the pretrained embedding weights and only trains the projection layer. **`freeze: false`** (default) fine-tunes both. Fine-tuning is usually beneficial when the model is large enough and the downstream task differs from the pretraining objective.
-
-**Combining with subdomain hierarchy:** a common pattern is to define an abstract parent with the shared `path` / `at_birth` / `subdomain_column` settings, then override `projector` and `pretrained_path` in each child:
-
-```yaml
-hla_alleles:
-  abstract: true
-  projector: embed          # default for children that don't override it
-  path: hla_alleles
-  at_birth: true
-  subdomain_column: locus
-
-hla_a:
-  parent: hla_alleles       # inherits path, at_birth, subdomain_column
-  subdomain: hla_a
-  projector: pretrained     # overrides the parent's projector
-  pretrained_path: /path/to/hla_a_esm2.pt
-  freeze: false
-```
-
-Children that do not override `projector` fall back to the parent's value (`embed` in the example above), so you can mix pretrained and learned embeddings across loci in the same config.
-
-#### Token collapsing (`token_value_column`)
-
-When a metadata column maps multiple fine-grained tokens to the same coarser group, `token_value_column` collapses them into a single token without splitting into child domains. This is an alternative to the subdomain hierarchy when you want a single domain with reduced granularity.
-
-```yaml
-hla_alleles:
-  projector: embed
-  path: hla_alleles
-  at_birth: true
-  token_value_column: allele_1field   # collapses 2-field alleles to 1-field groups
-```
-
-**How it works:** at load time, `TokenDomain` reads `token_metadata.csv`, groups all `token_id`s by their value in `token_value_column`, and assigns a new contiguous ID to each unique group value. The resulting vocabulary contains one entry per unique value in that column (e.g. `HLA-A*01`, `HLA-A*02`, …) instead of one per original token. Multiple original tokens that share the same group value are treated as the same token during training.
-
-`token_value_column` and `subdomain` are mutually exclusive — use one or the other.
+Full reference (all fields, `group`, `extends`, `parent`/`abstract` hierarchy, `--dcfg`, domain dropout, pretrained embeddings, token collapsing): [docs/domain_config.md](docs/domain_config.md).
 
 ### Specifying the attention scheme
 

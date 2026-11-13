@@ -39,7 +39,7 @@ The mask uses **token ages**, not the order of the domains. For example, with `a
 |-------|-----------|
 | `all` | Every domain in the model, including the `padding` and `no_event` pseudo-domains |
 | `at_birth` | Every domain with `at_birth: true` in its config (resolved when the model is built) |
-| a `group` or `parent` name | Every domain with that `group` (or `parent`) in its config. For example, `hla_alleles` expands to `hla_a`, `hla_b`, ... in per-locus configs |
+| a `group` or `parent` name | Every domain with that `group` in its config; for a domain with no `group`, its `parent`. For example, `hla_alleles` expands to `hla_a`, `hla_b`, ... in `config/domain_config_per_hla_locus.yaml`. See [domain_config.md](domain_config.md) |
 
 > ⚠️ **No-event tokens.** No-event tokens belong to the `no_event` domain. `all` includes it. An explicit list such as `[sex,diseases,lifestyle,death]` does not include it. If a scheme does not mention `no_event` (directly or through `all`), no-event tokens attend only to themselves and no token attends to them. Use `all` for the causal rule, or add `no_event` to the list.
 
