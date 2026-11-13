@@ -85,6 +85,7 @@ from auc.compute_aucs_unified import (
     _block_size, build_model, get_run, mlflow_client, run_id_from_path,
 )
 from utils import reconstruct_model
+from utils.run_loader import _model_config
 from utils.mlflow_utils import setup_mlflow
 
 setup_mlflow()
@@ -322,10 +323,10 @@ def compute_subject_shap(
 
 def load_model(run_id: str, ckpt_path: Optional[Path], tokens_dir: Path):
     """(model, domain_cfg, test_ids). From the .pt file if ckpt_path is given (no MLflow needed),
-    else from the MLflow run (utils.reconstruct_model, plain Delphi only)."""
+    else from the MLflow run (utils.reconstruct_model: Delphi or DelphiMultiStream)."""
     if ckpt_path is None:
         model, test_ids, _, _ = reconstruct_model(run_id)
-        return model, model.domain_cfg, test_ids
+        return model, _model_config(model).domains, test_ids
 
     client = mlflow_client()
     _, params = get_run(client, run_id, ckpt_path)
