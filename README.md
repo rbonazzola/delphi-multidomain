@@ -19,8 +19,6 @@ It focuses on:
   - [Training](#training)
     - [Preparing the data for each domain](#preparing-the-data-for-each-domain)
     - [Specifying the attention scheme](#specifying-the-attention-scheme)
-      - [Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)](#example-1-fully-causal-attention-with-tie-masking-ie-no-same-time-attention)
-      - [Example 2 — Bidirectional HLA block + causal domains](#example-2--bidirectional-hla-block--causal-domains)
     - [Exemplar command](#exemplar-command)
     - [Batch size schedule (`--batch_size_schedule`)](#batch-size-schedule---batch_size_schedule)
     - [Dry run (`--dryrun` / `--dry`)](#dry-run---dryrun----dry)
@@ -44,6 +42,8 @@ The code has been tested with the following versions:
 ## Training
 
 ### Preparing the data for each domain
+
+Each domain is a directory with a `tokenizer.yaml` and a `tokens.csv`; the CV folds are 10 subject-list files. To create these files, see [docs/data_preparation.md](docs/data_preparation.md).
 
 Domains are configured via a YAML file (see `config/domain_config_default.yaml` for a reference).
 Each entry defines one domain and its properties:
@@ -199,91 +199,35 @@ hla_alleles:
 
 ### Specifying the attention scheme
 
-The attention scheme within and across domains is specified via `--attention_scheme`. You can either pass a scheme string directly or use a named alias defined in `config/attention_schemes.yaml`:
-
-```yaml
-# config/attention_schemes.yaml
-hla_bidir:
-  description: HLA bidirectional with sex, rest causal
-  scheme: "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"
-
-hla_causal:
-  description: fully causal, no bidirectional HLA
-  scheme: "all:causal(mask_ties=True)"
-```
+`--attention_scheme` sets which tokens each token can attend to. It takes a scheme string or a preset name from `config/attention_schemes.yaml`:
 
 ```bash
-python train.py --attention_scheme hla_bidir ...
+python train.py --attention_scheme "[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)" ...
+python train.py --attention_scheme hla_bidirectional ...   # same scheme, as a preset
 ```
 
-Add your own aliases to that file to avoid repeating long scheme strings across runs.
+Key points:
+- Each rule `<domains>:<type>` adds allowed pairs; the final mask is the union of all rules.
+- `causal` compares **token ages**, not domain order. `mask_ties=True` blocks same-age pairs (so at-birth tokens do not see each other unless a `bidirectional` rule connects them).
+- Use `all` in the causal rule. An explicit domain list does not include the `no_event` domain, so no-event tokens become isolated.
 
-#### Example 1: Fully causal attention (with tie-masking, i.e. no same-time attention)
-
-For instance:
-`"[sex,diseases,lifestyle,death,hla_alleles]:causal(mask_ties=True)"`
-
-The corresponding attention matrix:
-
-| From \ To    | HLA | sex | diseases | lifestyle | death |
-|--------------|-----|-----|----------|-----------|-------|
-| **HLA**      | ·   | ·   | ·        | ·         | ·     |
-| **sex**      | ←   | ·   | ·        | ·         | ·     |
-| **diseases** | ←   | ←   | ←        | ·         | ·     |
-| **lifestyle**| ←   | ←   | ←        | ←         | ·     |
-| **death**    | ←   | ←   | ←        | ←         | ←     |
-
-In this configuration, all domains follow a strictly causal structure.
-Each domain may attend to **past tokens of itself and previous domains**, but never to the future
-nor to same-time tokens (`mask_ties=True`).
-
-Two built-in aliases are available for use in any domain group:
-
-| Alias | Expands to |
-|-------|-----------|
-| `all` | Every domain present in the model (equivalent to listing them all explicitly) |
-| `at_birth` | Every domain whose config entry has `at_birth: true` (resolved at model construction time from `config.domains`) |
-
-For example:
-```
-"all:causal(mask_ties=True)"
-"[at_birth]:bidirectional,all:causal(mask_ties=True)"
-```
-
-The second scheme gives every at-birth domain (e.g. `sex`, `hla_alleles`, `genetic_pcs`) a bidirectional block and makes all remaining domains causal — without having to enumerate them by name. If you later add or remove a domain from the config, the scheme automatically reflects the change.
-
-#### Example 2 — Bidirectional HLA block + causal domains
-
-On the other hand:
-`"[hla_alleles,sex]:bidirectional,all:causal(mask_ties=True)"`
-
-| From \ To    | HLA | sex | diseases | lifestyle | death |
-|--------------|-----|-----|----------|-----------|-------|
-| **HLA**      | ↔   | ↔   | ·        | ·         | ·     |
-| **sex**      | ↔   | ↔   | ·        | ·         | ·     |
-| **diseases** | ←   | ←   | ←        | ·         | ·     |
-| **lifestyle**| ←   | ←   | ←        | ←         | ·     |
-| **death**    | ←   | ←   | ←        | ←         | ←     |
-
-Here, the HLA allele and sex domains form a **bidirectional static block**, allowing mutual
-contextualization of at-birth attributes. All downstream domains follow a causal structure,
-ensuring temporal consistency while allowing conditioning on static information.
+Full reference (syntax, aliases, worked example with attention matrices, presets, per-layer schemes): [docs/attention_schemes.md](docs/attention_schemes.md).
 
 ### Exemplar command
 
 ```bash
 python train.py \
   --domains diseases,death,lifestyle,sex \
-  --attention_scheme "[sex,diseases,lifestyle,death]:causal(mask_ties=True)" \
+  --attention_scheme "all:causal(mask_ties=True)" \
   --n_layer 12 \
   --n_embd 240 \
   --experiment_name example \
-  --run_name_prefix fold1 \
+  --run_name fold1 \
   --batch_size_schedule "10:32,10:64,*:256x4" \
   --eval_batch_size 512
 ```
 
-Note: `padding` is added automatically and does not need to be listed in `--domains` or `--attention_scheme`.
+Note: `padding` and `no_event` are added automatically and do not need to be listed in `--domains`.
 
 ### Batch size schedule (`--batch_size_schedule`)
 
@@ -313,7 +257,7 @@ Validates the full configuration — domain config, attention scheme, data loadi
 ```bash
 python train.py --dry \
   --domains diseases,death,lifestyle,sex \
-  --attention_scheme hla_bidir \
+  --attention_scheme base \
   --experiment_name my_experiment
 ```
 

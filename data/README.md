@@ -1,3 +1,5 @@
+> ⚠️ **Legacy format.** This page describes the `.bin` format of the original Delphi. The current `train.py` reads one directory per domain: see [docs/data_preparation.md](../docs/data_preparation.md).
+
 # Data preparation
 
 If you would like to train Delphi on your own data, you can use the following instructions for data preparation.

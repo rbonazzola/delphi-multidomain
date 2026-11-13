@@ -244,7 +244,10 @@ class TokenDomain:
             df = df[df["token_id"].isin(valid_old_ids)].copy()
             df["token_id"] = df["token_id"].map(self._old_to_new)
 
-        df = df.sort_values("subject_id")
+        # Sort by (subject_id, token_id), not subject_id alone: a single-key sort is
+        # not stable, and continuous domains are copied into the input vector in row
+        # order, so a subject's dimensions (PCs, metabolites) would get permuted.
+        df = df.sort_values(["subject_id", "token_id"])
 
         if self.at_birth:
             if "age" in df.columns and (df["age"] != 0).any():
