@@ -15,6 +15,8 @@ Output .pkl keys:
   - "ages":         np.ndarray (N,) — age in days at the disease event
   - "sexes":        np.ndarray (N,) — int (0=female, 1=male, -1=unknown)
   - "age_brackets": np.ndarray (N,) — bracket label string or None
+  - "event_ids":    np.ndarray (N, 2) — (subject_id, occurrence of the disease within the
+                    subject), to pair events across runs (e.g. default vs --carrier_donors)
 
 Usage:
     python shap/custom_hla_shap.py \\
@@ -46,6 +48,9 @@ Donor genotype filtering:
                         behaviour of excluding the case alleles.  Repeatable.
     --donor_requires    ALLELE_PREFIX  Alleles donors MUST carry (AND logic, repeatable).
     --donor_zygosity    {any,het,hom}  Zygosity applied to each --donor_requires group.
+    --carrier_donors    Null control: donors must carry the case allele (no exclusions), so
+                        the allele's own effect cancels and Δlogit measures only the rest of
+                        the HLA block. Allele effect ≈ Δ(default donors) − Δ(carrier donors).
 """
 
 import os
@@ -116,16 +121,22 @@ def assign_age_bracket(age_days):
 def _make_continuous_domains(model):
     return {
         dname: cfg.n_latent_tokens or 1
-        for dname, cfg in model.domain_cfg.items()
+        for dname, cfg in model.config.domains.items()
         if cfg.type == "continuous"
     }
 
 
-def _make_collate(model):
+def _no_event_settings(params):
+    """(rate, insertion_mode) used at training time, as resolved by reconstruct_model."""
+    return params["no_event_token_rate"], params["no_event_token_insertion_mode"]
+
+
+def _make_collate(model, no_event):
+    no_event_token_rate, no_event_insertion_mode = no_event
     continuous_domains = _make_continuous_domains(model)
     age_sampler = AgeSampler(
-        insertion_mode=model.config.no_event_token_insertion_mode,
-        token_rate=model.config.no_event_token_rate,
+        insertion_mode=no_event_insertion_mode,
+        token_rate=no_event_token_rate,
         seed=model.config.seed,
     )
     return DelphiCollateFn(
@@ -139,7 +150,8 @@ def _make_collate(model):
     )
 
 
-def get_dataloader(model, all_test_ids, subject_ids=None, block_size=None):
+def get_dataloader(model, no_event, all_test_ids, subject_ids=None, block_size=None):
+    no_event_token_rate, no_event_insertion_mode = no_event
     if block_size is not None:
         model.set_block_size(block_size)
 
@@ -154,16 +166,16 @@ def get_dataloader(model, all_test_ids, subject_ids=None, block_size=None):
     continuous_domains = _make_continuous_domains(model)
     dataset = DelphiDataset(
         root=DELPHI_DIR / "data" / "transforms",
-        domains_cfg=model.domain_cfg,
+        domains_cfg=model.config.domains,
         domain_to_int=model.domain_to_int,
         block_size=model.block_size,
         subjects=subject_ids,
         required_domains=["diseases"],
-        no_event_token_rate=model.config.no_event_token_rate,
-        no_event_insertion_mode=model.config.no_event_token_insertion_mode,
+        no_event_token_rate=no_event_token_rate,
+        no_event_insertion_mode=no_event_insertion_mode,
         continuous_domains=continuous_domains,
     )
-    collate = _make_collate(model)
+    collate = _make_collate(model, no_event)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate)
     return dataset, dataloader
 
@@ -185,7 +197,7 @@ def get_tokens_df_from_dataset(model, dataset):
     return df
 
 
-def get_tokens_df_cached(model, test_ids, run_id, cache_dir=None):
+def get_tokens_df_cached(model, no_event, test_ids, run_id, cache_dir=None):
     if cache_dir is not None:
         dataset_hash = hash(tuple(sorted(test_ids)))
         cache_path = Path(cache_dir)
@@ -197,7 +209,7 @@ def get_tokens_df_cached(model, test_ids, run_id, cache_dir=None):
             return pd.read_parquet(cache_file)
 
     print("Computing tokens_df...")
-    dataset, _ = get_dataloader(model, all_test_ids=test_ids)
+    dataset, _ = get_dataloader(model, no_event, all_test_ids=test_ids)
     tokens_df = get_tokens_df_from_dataset(model, dataset)
 
     if cache_dir is not None:
@@ -239,6 +251,21 @@ def disease_prev_logits_from_embeddings(model, h, batch, disease_domain, disease
     )
     b_idx, t_prev = torch.where(next_is_disease)
     return logits[b_idx, t_prev], torch.stack([b_idx, t_prev], dim=1)
+
+
+def _event_keys(idx_prev):
+    """(batch row, occurrence number within that row) for each event from
+    disease_prev_logits_from_embeddings. Rows match subjects (collate keeps item
+    order) and occurrences are age-ordered, so the same event gets the same key in
+    the original and the HLA-swapped batch, even if the swap shifts positions or
+    truncates the end of a sequence (donor HLA block longer than the original)."""
+    rows = idx_prev[:, 0].tolist()
+    keys, seen = [], {}
+    for b in rows:  # torch.where returns events row-major, so per-row order is by position
+        k = seen.get(b, 0)
+        keys.append((b, k))
+        seen[b] = k + 1
+    return keys
 
 
 def inject_hla_item(item_rec, item_don, hla_domain_ints, padding_domain_id, padding_age=-10000.0):
@@ -446,9 +473,11 @@ def compute_delta_for_run(
     donor_exclude_ids=None,
     donor_require_id_groups=None,
     donor_zygosity="any",
+    no_event=None,
 ):
     """
-    Returns (delta, ages, sexes) as 1-D tensors, one entry per disease event.
+    Returns (delta, ages, sexes, event_ids): 1-D tensors with one entry per disease
+    event, and event_ids [N, 2] = (subject_id, occurrence within the subject).
 
     Case selection:
       Subjects carrying allele_ids with case_zygosity AND having the disease.
@@ -460,7 +489,12 @@ def compute_delta_for_run(
       donor_exclude_ids: overrides the default exclusion set if provided.
       donor_require_id_groups: list of allele-id lists, each group must be
       carried with donor_zygosity — AND logic across groups.
+
+    no_event: (rate, insertion_mode) for no-event token sampling — required;
+      see _no_event_settings.
     """
+    if no_event is None:
+        raise ValueError("compute_delta_for_run: no_event=(rate, insertion_mode) is required")
     locus_map = None if "hla_alleles" in model.domain_to_int else _load_hla_locus_map()
     hla_counts = build_hla_allele_counts_global(tokens_df, model, locus_map)
     gf = GenotypeFilter(hla_counts)
@@ -493,13 +527,14 @@ def compute_delta_for_run(
 
     if not subjects_with_allele_disease:
         logger.warning("No cases found after filtering.")
-        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int)
+        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int), torch.empty((0, 2), dtype=torch.long)
     if not donor_subjects:
         logger.warning("No donors found after filtering.")
-        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int)
+        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int), torch.empty((0, 2), dtype=torch.long)
 
     filtered_dataset, filtered_dataloader = get_dataloader(
         model=model,
+        no_event=no_event,
         all_test_ids=test_ids,
         subject_ids=subjects_with_allele_disease,
         block_size=96,
@@ -508,6 +543,7 @@ def compute_delta_for_run(
     n_donors = min(len(subjects_with_allele_disease) * 2, len(donor_subjects))
     donor_dataset, _ = get_dataloader(
         model=model,
+        no_event=no_event,
         all_test_ids=test_ids,
         subject_ids=random.sample(list(donor_subjects), n_donors),
         block_size=96,
@@ -515,12 +551,13 @@ def compute_delta_for_run(
 
     hla_domain_ints = get_hla_domain_ints(model)
     padding_domain_id = model.domain_to_int["padding"]
-    collate = _make_collate(model)
+    collate = _make_collate(model, no_event)
 
     donor_subjects_list = donor_dataset.subject_list
     donor_idx = 0
 
-    delta_all, ages_all, sexes_all = [], [], []
+    delta_all, ages_all, sexes_all, event_ids_all = [], [], [], []
+    n_events_orig = n_events_dropped = n_events_partial = 0
 
     for batch in tqdm(
         filtered_dataloader,
@@ -535,9 +572,9 @@ def compute_delta_for_run(
         logits_orig, idx_prev = disease_prev_logits_from_embeddings(
             model, h, batch, "diseases", disease_id
         )
-        n_orig = len(logits_orig)
-        if n_orig == 0:
+        if len(logits_orig) == 0:
             continue
+        keys_orig = _event_keys(idx_prev)
 
         b_idx, t_prev = idx_prev[:, 0], idx_prev[:, 1]
         ages_at_event  = batch.ages[b_idx, t_prev].cpu()
@@ -547,7 +584,7 @@ def compute_delta_for_run(
         rec_sids  = batch.subject_ids.tolist()
         rec_items = [filtered_dataset[filtered_dataset._sid_to_idx[sid]] for sid in rec_sids]
 
-        logits_sw_samples = []
+        logits_sw_samples = []  # one {event key: logit} dict per counterfactual
         for _ in tqdm(range(n_counterfactuals), desc="Counterfactuals", leave=False):
             don_items = []
             for _ in rec_sids:
@@ -564,27 +601,47 @@ def compute_delta_for_run(
             with torch.no_grad():
                 _, _, h_sw = model(batch_sw, return_embeddings=True)
 
-            logits_sw, _ = disease_prev_logits_from_embeddings(
+            logits_sw, idx_sw = disease_prev_logits_from_embeddings(
                 model, h_sw, batch_sw, "diseases", disease_id
             )
-            if len(logits_sw) == 0:
-                continue
-            n = min(n_orig, len(logits_sw))
-            logits_sw_samples.append(logits_sw[:n].cpu())
+            logits_sw_samples.append(dict(zip(_event_keys(idx_sw), logits_sw.cpu().tolist())))
 
-        if not logits_sw_samples:
+        # Pair each original event with the same event in every counterfactual where it
+        # survived; average over those. Events lost in all counterfactuals are dropped.
+        keep, sw_avg = [], []
+        for i, key in enumerate(keys_orig):
+            vals = [cf[key] for cf in logits_sw_samples if key in cf]
+            if not vals:
+                n_events_dropped += 1
+                continue
+            if len(vals) < len(logits_sw_samples):
+                n_events_partial += 1
+            keep.append(i)
+            sw_avg.append(sum(vals) / len(vals))
+        n_events_orig += len(keys_orig)
+        if not keep:
             continue
 
-        n = min(n_orig, min(len(s) for s in logits_sw_samples))
-        logits_sw_avg = torch.stack([s[:n] for s in logits_sw_samples]).mean(dim=0)
-        delta_all.append(logits_orig[:n].cpu() - logits_sw_avg)
-        ages_all.append(ages_at_event[:n])
-        sexes_all.append(sexes_at_event[:n])
+        keep = torch.tensor(keep)
+        delta_all.append(logits_orig.cpu()[keep] - torch.tensor(sw_avg, dtype=logits_orig.dtype))
+        ages_all.append(ages_at_event[keep])
+        sexes_all.append(sexes_at_event[keep])
+        event_ids_all.append(torch.tensor(
+            [(int(batch.subject_ids[keys_orig[i][0]]), keys_orig[i][1]) for i in keep.tolist()],
+            dtype=torch.long,
+        ))
+
+    if n_events_dropped or n_events_partial:
+        logger.info(
+            f"{disease_name} vs {allele_name}: {n_events_orig} events; {n_events_dropped} dropped "
+            f"(lost in every counterfactual), {n_events_partial} averaged over fewer counterfactuals "
+            f"(sequence truncated by a longer donor HLA block)."
+        )
 
     if not delta_all:
-        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int)
+        return torch.tensor([]), torch.tensor([]), torch.tensor([], dtype=torch.int), torch.empty((0, 2), dtype=torch.long)
 
-    return torch.cat(delta_all), torch.cat(ages_all), torch.cat(sexes_all)
+    return torch.cat(delta_all), torch.cat(ages_all), torch.cat(sexes_all), torch.cat(event_ids_all)
 
 
 def process_fold(
@@ -598,7 +655,8 @@ def process_fold(
 ):
     run_id = runs_df.query("test_fold == @fold").run_id.iloc[0]
 
-    model, test_ids, _, _ = reconstruct_model(run_id)
+    model, test_ids, _, params = reconstruct_model(run_id)
+    no_event = _no_event_settings(params)
     model = model.to("cpu")
     model.eval()
 
@@ -606,10 +664,10 @@ def process_fold(
         test_ids = [int(sid) for sid in test_ids if int(sid) in subjects_include]
         logger.info(f"fold {fold}: {len(test_ids)} subjects after filtering")
 
-    tokens_df = get_tokens_df_cached(model, test_ids, run_id=run_id, cache_dir=cache_dir)
+    tokens_df = get_tokens_df_cached(model, no_event, test_ids, run_id=run_id, cache_dir=cache_dir)
     sex_map = extract_sex_map(tokens_df)
 
-    delta_fold, ages_fold, sexes_fold = compute_delta_for_run(
+    delta_fold, ages_fold, sexes_fold, event_ids_fold = compute_delta_for_run(
         model, test_ids, tokens_df, disease_id, allele_ids,
         sex_map=sex_map, sex_filter=sex_filter,
         n_counterfactuals=n_counterfactuals,
@@ -619,10 +677,11 @@ def process_fold(
         donor_exclude_ids=donor_exclude_ids,
         donor_require_id_groups=donor_require_id_groups,
         donor_zygosity=donor_zygosity,
+        no_event=no_event,
     )
 
     print(f"fold {fold} n={len(delta_fold)}")
-    return delta_fold, ages_fold, sexes_fold
+    return delta_fold, ages_fold, sexes_fold, event_ids_fold
 
 
 def get_allele_pairs_for_scan(
@@ -744,34 +803,36 @@ def process_fold_scan(
 ):
     """
     Load model and tokens_df once for this fold, then compute Δlogit for every
-    allele in allele_ids_to_scan.  Returns {allele_id: (delta, ages, sexes)}.
+    allele in allele_ids_to_scan.  Returns {allele_id: (delta, ages, sexes, event_ids)}.
 
     Donors for each allele are its non-carriers (default behaviour).
     """
     run_id = runs_df.query("test_fold == @fold").run_id.iloc[0]
-    model, test_ids, _, _ = reconstruct_model(run_id)
+    model, test_ids, _, params = reconstruct_model(run_id)
+    no_event = _no_event_settings(params)
     model = model.to("cpu").eval()
 
     if subjects_include is not None:
         test_ids = [int(sid) for sid in test_ids if int(sid) in subjects_include]
         logger.info(f"fold {fold}: {len(test_ids)} subjects after filtering")
 
-    tokens_df = get_tokens_df_cached(model, test_ids, run_id=run_id, cache_dir=cache_dir)
+    tokens_df = get_tokens_df_cached(model, no_event, test_ids, run_id=run_id, cache_dir=cache_dir)
     sex_map = extract_sex_map(tokens_df)
 
     results = {}
     for allele_id in tqdm(allele_ids_to_scan, desc=f"fold {fold} — alleles"):
         allele_name = hla_tokenizer[allele_id]
-        delta, ages, sexes = compute_delta_for_run(
+        delta, ages, sexes, event_ids = compute_delta_for_run(
             model, test_ids, tokens_df, disease_id, [allele_id],
             sex_map=sex_map, sex_filter=sex_filter,
             n_counterfactuals=n_counterfactuals,
             disease_name="(scan)", allele_name=allele_name,
             case_zygosity=case_zygosity,
             donor_zygosity=donor_zygosity,
+            no_event=no_event,
         )
         if len(delta) > 0:
-            results[allele_id] = (delta, ages, sexes)
+            results[allele_id] = (delta, ages, sexes, event_ids)
 
     return results
 
@@ -793,24 +854,25 @@ def process_fold_scan_pairs(
     Cases  : subjects carrying BOTH a and b.
     Donors : subjects carrying NEITHER a nor b.
 
-    Returns {(a_id, b_id): (delta, ages, sexes)}.
+    Returns {(a_id, b_id): (delta, ages, sexes, event_ids)}.
     """
     run_id = runs_df.query("test_fold == @fold").run_id.iloc[0]
-    model, test_ids, _, _ = reconstruct_model(run_id)
+    model, test_ids, _, params = reconstruct_model(run_id)
+    no_event = _no_event_settings(params)
     model = model.to("cpu").eval()
 
     if subjects_include is not None:
         test_ids = [int(sid) for sid in test_ids if int(sid) in subjects_include]
         logger.info(f"fold {fold}: {len(test_ids)} subjects after filtering")
 
-    tokens_df = get_tokens_df_cached(model, test_ids, run_id=run_id, cache_dir=cache_dir)
+    tokens_df = get_tokens_df_cached(model, no_event, test_ids, run_id=run_id, cache_dir=cache_dir)
     sex_map = extract_sex_map(tokens_df)
 
     results = {}
     for a_id, b_id, locus_a, locus_b, a_name, b_name, _, _ in tqdm(
         pairs_to_scan, desc=f"fold {fold} — pairs"
     ):
-        delta, ages, sexes = compute_delta_for_run(
+        delta, ages, sexes, event_ids = compute_delta_for_run(
             model, test_ids, tokens_df, disease_id,
             allele_ids=[a_id],
             sex_map=sex_map, sex_filter=sex_filter,
@@ -821,9 +883,10 @@ def process_fold_scan_pairs(
             case_also_allele_id_groups=[[b_id]],
             donor_exclude_ids=[a_id, b_id],
             donor_zygosity=donor_zygosity,
+            no_event=no_event,
         )
         if len(delta) > 0:
-            results[(a_id, b_id)] = (delta, ages, sexes)
+            results[(a_id, b_id)] = (delta, ages, sexes, event_ids)
 
     return results
 
@@ -966,6 +1029,11 @@ def main():
     parser.add_argument(
         "--donor_zygosity", choices=["any", "het", "hom"], default="any",
         help="Zygosity applied to each --donor_requires group.",
+    )
+    parser.add_argument(
+        "--carrier_donors", action="store_true",
+        help="Null control: donors must carry the case allele (no exclusions). Single-allele "
+             "mode only; incompatible with --allele_id_b and --donor_excludes.",
     )
     args = parser.parse_args()
 
@@ -1131,11 +1199,13 @@ def main():
             delta  = torch.cat([p[0] for p in parts]).numpy()
             ages   = torch.cat([p[1] for p in parts]).numpy()
             sexes  = torch.cat([p[2] for p in parts]).numpy()
+            event_ids = torch.cat([p[3] for p in parts]).numpy()
             age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
             out_path = output_dir / f"{disease_id}__{a_id}-{b_id}__{sex_label}.pkl"
             pkl.dump(
-                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
+                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets,
+                 "event_ids": event_ids},
                 open(out_path, "wb"),
             )
 
@@ -1206,11 +1276,13 @@ def main():
             delta = torch.cat([p[0] for p in parts]).numpy()
             ages  = torch.cat([p[1] for p in parts]).numpy()
             sexes = torch.cat([p[2] for p in parts]).numpy()
+            event_ids = torch.cat([p[3] for p in parts]).numpy()
             age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
             out_path = output_dir / f"{disease_id}__{allele_id}__{sex_label}.pkl"
             pkl.dump(
-                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
+                {"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets,
+                 "event_ids": event_ids},
                 open(out_path, "wb"),
             )
 
@@ -1258,6 +1330,13 @@ def main():
     )
     donor_require_id_groups = [_resolve_allele_spec(s) for s in args.donor_requires]
 
+    if args.carrier_donors:
+        if args.allele_id_b is not None or args.donor_excludes is not None:
+            raise SystemExit("--carrier_donors is incompatible with --allele_id_b and --donor_excludes.")
+        donor_exclude_ids = []
+        donor_require_id_groups = donor_require_id_groups + [list(allele_ids)]
+        allele_name = f"{allele_name} [carrier donors]"
+
     # --- pair mode via --allele_id_b ---
     if args.allele_id_b is not None:
         b_id = args.allele_id_b
@@ -1285,10 +1364,13 @@ def main():
         print(f"Case zygosity  : {args.case_zygosity}")
         if case_also_allele_id_groups:
             print(f"Case also      : {args.case_also}")
-        _excl_label = args.donor_excludes if args.donor_excludes is not None else "(case alleles)"
+        _excl_label = (
+            "(none)" if donor_exclude_ids == []
+            else args.donor_excludes if args.donor_excludes is not None else "(case alleles)"
+        )
         print(f"Donor excludes : {_excl_label}")
         if donor_require_id_groups:
-            print(f"Donor requires : {args.donor_requires}  zygosity={args.donor_zygosity}")
+            print(f"Donor requires : {donor_require_id_groups}  zygosity={args.donor_zygosity}")
         print(f"Runs    ({len(runs_df)}):")
         for _, row in runs_df.iterrows():
             print(f"  fold={row['test_fold']}  run_id={row['run_id']}  name={row['mlflow.runName']}")
@@ -1329,10 +1411,11 @@ def main():
         desc="Folds",
     ))
 
-    all_delta, all_ages, all_sexes = zip(*fold_results)
+    all_delta, all_ages, all_sexes, all_event_ids = zip(*fold_results)
     delta = torch.cat(all_delta).numpy()
     ages  = torch.cat(all_ages).numpy()
     sexes = torch.cat(all_sexes).numpy()
+    event_ids = torch.cat(all_event_ids).numpy()
     age_brackets = np.array([assign_age_bracket(a) for a in ages])
 
     # --- summary ---
@@ -1370,7 +1453,8 @@ def main():
 
     # --- save ---
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-    pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets},
+    pkl.dump({"delta": delta, "ages": ages, "sexes": sexes, "age_brackets": age_brackets,
+              "event_ids": event_ids},
              open(output_file, "wb"))
     print(f"\nSaved to {output_file}")
 

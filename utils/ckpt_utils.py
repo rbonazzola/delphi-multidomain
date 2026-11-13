@@ -258,6 +258,34 @@ def normalize_state_dict(state_dict: dict, model) -> dict:
     return {k: v for k, v in state_dict.items() if k in expected or not k.endswith(".attn.bias")}
 
 
+def check_spec_domain_order(spec: dict, domains_param: str | None, run_id: str = "") -> None:
+    """Raise if the model_spec lists the domains in a different order than the run's
+    `domains` MLflow param (the order the model was trained with).
+
+    The domain order fixes each domain's slice of the global embedding table, so a spec with
+    the right domains in the wrong order still loads with strict=True (no shape changes) but
+    reads every token's embedding from another domain's rows: a silently broken model. The
+    2026-10-01 model_spec backfill wrote alphabetical orders for runs whose `domains` param
+    was truncated (see utils/repair_spec_domain_order.py). Only names present in both are
+    compared, since MLflow truncates the param at 6000 chars.
+    """
+    if not domains_param or spec is None:
+        return
+    in_param = re.findall(r"'(\w+)': (?:DomainConfig|\{)", domains_param)
+    in_spec = list(spec["config"]["domains"])
+    common = set(in_param) & set(in_spec)
+    a = [d for d in in_param if d in common]
+    b = [d for d in in_spec if d in common]
+    if a != b:
+        raise ValueError(
+            f"model_spec of run {run_id or '?'} lists the domains in a different order than the "
+            f"run's `domains` param, so its embedding-table offsets don't match the trained "
+            f"weights.\n  param: {a}\n  spec:  {b}\n"
+            f"Repair the checkpoint with utils/repair_spec_domain_order.py, or load it with "
+            f"domain_config_yaml=<the run's yaml>."
+        )
+
+
 def load_model_from_checkpoint(ckpt: dict, device=None, repo_dir: Path | None = None, **config_overrides):
     """Rebuild the model from ckpt["model_spec"] and load ckpt["state_dict"] into it (strict)."""
     if ckpt.get("model_spec") is None:

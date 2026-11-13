@@ -2,6 +2,11 @@
 
 Counterfactual attribution of HLA allele effects on disease risk using the Delphi model.
 
+Works with both `Delphi` (single trunk) and `DelphiMultiStream` runs: `reconstruct_model`
+rebuilds the right class from the checkpoint's `model_spec`, or from the run's `arch` param
+for older MultiStream checkpoints. In MultiStream the swapped HLA block goes through its own
+encoder and reaches the prediction via the trunk, so Δlogit measures the same counterfactual.
+
 ## Method
 
 For each case subject (carrying a given HLA allele **and** having a given disease), their

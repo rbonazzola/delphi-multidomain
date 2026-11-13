@@ -145,7 +145,10 @@ def read_ids(path, type=int):
     Read UK Biobank IDs from a CSV file.
     Handles files with or without header; uses first column only.
     """
-    s = pd.read_csv(path, dtype=str, comment="#").iloc[:, 0]
+    s = pd.read_csv(path, dtype=str, comment="#", header=None).iloc[:, 0]
+    # A non-numeric first line is a header (e.g. "eid"); a numeric one is already an ID.
+    if not s.empty and not s.iloc[0].strip().replace(".0", "").isdigit():
+        s = s.iloc[1:]
     return set(
         s.str.strip()
          .str.replace(r"\.0$", "", regex=True)

@@ -109,6 +109,31 @@ def add_age_bin(df):
     return df
 
 
+def add_strict_day_previous(df):
+    """Add `strict_prev_idx` / `age_strict_previous`: the global_idx and age of the last token of
+    the same subject recorded on an EARLIER day than this token (-1 / NaN if there is none).
+
+    A case scored at the position right before its diagnosis token (`global_idx - 1`) can be
+    looking at a token recorded on the diagnosis day itself -- e.g. L40 (psoriasis) coded with
+    M07 (psoriatic arthropathy) at the same visit. `mask_ties` keeps same-day tokens out of
+    attention, but the token at the scoring position still reaches the prediction through the
+    residual stream, so the prediction already "knows" part of the diagnosis. Scoring at the last
+    earlier-day token avoids that. Expects one row per global_idx, sorted (as built by
+    `_forward_pass_embeddings_and_tokens`).
+    """
+    g = df["global_idx"].to_numpy()
+    assert (g == np.arange(len(g))).all(), "tokens_df must have one row per global_idx, sorted"
+    subj = df["subject_idx"].to_numpy()
+    age = df["age"].to_numpy()
+    new_day = np.r_[True, (subj[1:] != subj[:-1]) | (age[1:] != age[:-1])]
+    day_start = np.maximum.accumulate(np.where(new_day, g, 0))
+    prev = day_start - 1
+    valid = (prev >= 0) & (subj[np.clip(prev, 0, None)] == subj) & (age[np.clip(prev, 0, None)] >= 0)
+    df["strict_prev_idx"] = np.where(valid, prev, -1)
+    df["age_strict_previous"] = np.where(valid, age[np.clip(prev, 0, None)], np.nan)
+    return df
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Case/Control extraction
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -149,23 +174,25 @@ def extract_case_ctrl_for_sex_age(
 #  AUC computation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compute_auc_from_indices(logits_for_token, cases, controls, block_size):
+def compute_auc_from_indices(logits_for_token, cases, controls, block_size, case_offset=1):
+    """`cases` are scored at global index `case - case_offset` (1: the token right before the
+    diagnosis token, as indexed by its global_idx; 0: `cases` already hold scoring indices)."""
 
     from auc.scripts.auc_utils import compute_all_stats
 
     return compute_all_stats(
-        logits_for_token[cases // block_size, cases % block_size - 1],
+        logits_for_token[cases // block_size, cases % block_size - case_offset],
         logits_for_token[controls // block_size, controls % block_size],
     )
 
 
-def process_disease(logits_for_token, token_id, lookup_disease, block_size):
+def process_disease(logits_for_token, token_id, lookup_disease, block_size, case_offset=1):
     rows = []
     for age_range in AGE_RANGES:
         for sex in ["female", "male"]:
             case, ctrl = lookup_disease.get((sex, age_range), EMPTY)
 
-            stats = compute_auc_from_indices(logits_for_token, case, ctrl, block_size)
+            stats = compute_auc_from_indices(logits_for_token, case, ctrl, block_size, case_offset)
             stats.update({
                 "domain": token_id[0],
                 "token_id": token_id[1],
@@ -322,6 +349,7 @@ def evaluate_aucs(
     score_transform: str = "logit",
     tokens: Optional[List[Tuple[str, int]]] = None,
     cache_dir: Optional[str | Path] = None,
+    case_position: str = "strict_day",
 ) -> pd.DataFrame:
     """
     Evaluate AUCs for all predicted diseases.
@@ -359,6 +387,13 @@ def evaluate_aucs(
     cache_dir : path, optional
         Per-batch cache of the forward pass, to resume after a failure; see
         `_forward_pass_embeddings_and_tokens`.
+    case_position : str
+        Where a case is scored, which also sets its age bin.
+        "strict_day" (default): at the last token recorded on a day before the diagnosis day,
+        so codes recorded together with the diagnosis (e.g. L40 with M07, G30 with F00) are not
+        seen; see `add_strict_day_previous`. Cases with no earlier-day token are dropped.
+        "previous_token": at the token right before the diagnosis token, whatever its date
+        (the behavior before 2026-10-09; reproduces earlier aucs.csv files).
 
     Returns
     -------
@@ -366,6 +401,8 @@ def evaluate_aucs(
     """
     if score_transform not in ("logit", "softmax"):
         raise ValueError(f"score_transform must be 'logit' or 'softmax', got {score_transform!r}")
+    if case_position not in ("strict_day", "previous_token"):
+        raise ValueError(f"case_position must be 'strict_day' or 'previous_token', got {case_position!r}")
     import logging
 
     device = model.device
@@ -381,6 +418,8 @@ def evaluate_aucs(
 
     # ── 2. Build case/control indices ─────────────────────────────────
     print("Building case/control indices...")
+    if case_position == "strict_day":
+        tokens_df = add_strict_day_previous(tokens_df)
 
     # Precompute age masks
     age_masks = {}
@@ -433,13 +472,27 @@ def evaluate_aucs(
     tok_sex = tokens_df["sex"].to_numpy()
     tok_gidx = tokens_df["global_idx"].to_numpy()
 
-    disease_idx = {
-        sex_id: {
-            dd: (df["global_idx"].to_numpy(), df["age_previous"].to_numpy())
-            for dd, df in by_disease_dfs[sex_id].items()
+    # (case index, age used for the age bin) per disease; with case_offset below, the case is
+    # scored at index - case_offset
+    if case_position == "strict_day":
+        case_offset = 0
+        disease_idx = {
+            sex_id: {
+                dd: (df.loc[df.strict_prev_idx >= 0, "strict_prev_idx"].to_numpy(),
+                     df.loc[df.strict_prev_idx >= 0, "age_strict_previous"].to_numpy())
+                for dd, df in by_disease_dfs[sex_id].items()
+            }
+            for sex_id in SEX_TOKENS.values()
         }
-        for sex_id in SEX_TOKENS.values()
-    }
+    else:
+        case_offset = 1
+        disease_idx = {
+            sex_id: {
+                dd: (df["global_idx"].to_numpy(), df["age_previous"].to_numpy())
+                for dd, df in by_disease_dfs[sex_id].items()
+            }
+            for sex_id in SEX_TOKENS.values()
+        }
 
     del by_disease_dfs, tokens_df
 
@@ -521,10 +574,10 @@ def evaluate_aucs(
         for domain_name, token_id in tqdm(predicted_tokens, desc="AUC computation")
     )
     if n_jobs == 1:
-        results = [process_disease(*a, block_size=block_size) for a in _auc_args]
+        results = [process_disease(*a, block_size=block_size, case_offset=case_offset) for a in _auc_args]
     else:
         results = Parallel(n_jobs=n_jobs, backend="threading")(
-            delayed(process_disease)(*a, block_size=block_size) for a in _auc_args
+            delayed(process_disease)(*a, block_size=block_size, case_offset=case_offset) for a in _auc_args
         )
 
     # ── 4. Assemble results ──────────────────────────────────────────
@@ -536,6 +589,7 @@ def evaluate_aucs(
 
     if run_id is not None:
         auc_df = auc_df.assign(runid=run_id, block_size=block_size)
+    auc_df = auc_df.assign(case_position=case_position)
 
     columns_order = [
         c for c in [
@@ -543,7 +597,7 @@ def evaluate_aucs(
             "sex", "age_start", "age_end",
             "n_case", "n_ctrl",
             "auc_delong", "auc_delong_var", "mann_u", "mann_p",
-            "block_size",
+            "block_size", "case_position",
         ]
         if c in auc_df.columns
     ]

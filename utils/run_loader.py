@@ -71,6 +71,8 @@ def load_model_from_run(
     bs = _resolve_block_size(params, block_size)
 
     if ckpt.get("model_spec") is not None and domain_config_yaml is None:
+        from utils.ckpt_utils import check_spec_domain_order
+        check_spec_domain_order(ckpt["model_spec"], params.get("domains"), run_id)
         # Self-contained checkpoint: the exact construction config is stored in it,
         # no need to parse (possibly truncated) MLflow params.
         if tokens_path is not None:
@@ -308,15 +310,89 @@ def _build_model_from_params(run_id, params, ckpt, bs, domain_config_yaml, token
     return model, domain_cfg
 
 
-def reconstruct_model(run_id: str):
-    """
-    Lightweight model-only reconstruction from an MLflow run.
-    Infers config from the state dict; applies legacy weight migrations.
+def find_run_domain_yaml(run_id: str) -> str:
+    """Basename of the run's logged domain config YAML artifact (exactly one expected)."""
+    import mlflow
 
-    Returns: model, test_ids, ckpt_path, params
+    client = mlflow.tracking.MlflowClient()
+    yaml_artifacts = [a.path for a in client.list_artifacts(run_id) if a.path.endswith(".yaml")]
+    if len(yaml_artifacts) != 1:
+        raise ValueError(f"Expected exactly one domain config yaml artifact for run {run_id}, got {yaml_artifacts}")
+    return Path(yaml_artifacts[0]).name
+
+
+def _build_multistream_from_params(run_id, params, ckpt):
+    """
+    Legacy DelphiMultiStream path (checkpoint without "model_spec"): rebuild the
+    model from the run's 'arch' param, as config_from_runid_multistream does, but
+    model only. Domains come from the run's domain config YAML (the 'domains' param
+    may be truncated), filtered to the names in the arch string's bracketed groups.
+    """
+    from delphi.multi_stream_model import DelphiMultiStream, DelphiMultiStreamConfig
+    from utils.utils import load_domain_config
+    from utils.ckpt_utils import strip_compiled_prefix
+
+    arch_str = params["arch"]
+
+    # load_run_params wraps a plain (non-literal) attention_scheme in a list;
+    # MultiStream takes a single policy string.
+    attention_scheme = params["attention_scheme"]
+    if isinstance(attention_scheme, (list, tuple)):
+        distinct = set(attention_scheme)
+        if len(distinct) != 1:
+            raise ValueError(
+                f"Run {run_id}: MultiStream needs a single attention_scheme string, got {attention_scheme!r}"
+            )
+        attention_scheme = distinct.pop()
+
+    yaml_path = DELPHI_DIR / "config" / find_run_domain_yaml(run_id)
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Expected local domain config at {yaml_path} (from run {run_id}'s logged artifact)")
+
+    domain_names = sorted(set(
+        name.strip()
+        for group in re.findall(r"\[([^\]]+)\]", arch_str)
+        for name in group.split(",")
+    ))
+    all_domains = load_domain_config(yaml_path, DELPHI_DIR / "data" / "transforms" / "tokens")
+    missing = [d for d in domain_names if d not in all_domains]
+    if missing:
+        raise ValueError(f"Domains in arch string not found in {yaml_path}: {missing}")
+    domain_cfg = {
+        k: v for k, v in all_domains.items()
+        if k in domain_names or k in ("padding", "no_event")
+    }
+
+    stored_block_size = params.get("block_size", "64")
+    block_size = AUTO_BLOCK_SIZE if stored_block_size == "auto" else int(stored_block_size)
+
+    config = DelphiMultiStreamConfig(
+        domains=domain_cfg,
+        token_dropout=float(params.get("token_dropout", 0.1)),
+        block_size=block_size,
+        seed=int(params.get("seed", 142)),
+    )
+    model = DelphiMultiStream.from_scheme_string(
+        arch_str=arch_str, attention_scheme=attention_scheme, config=config,
+    )
+    missing_keys, unexpected_keys = model.load_state_dict(
+        strip_compiled_prefix(ckpt["state_dict"]), strict=False
+    )
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint state_dict mismatch for run {run_id}: "
+            f"missing={missing_keys} unexpected={unexpected_keys}"
+        )
+    return model
+
+
+def _build_delphi_from_state_dict(run_id, params, ckpt):
+    """
+    Legacy single-trunk Delphi path: infer the architecture from the state dict,
+    domains from the run's 'domains' param, and apply legacy weight migrations.
     """
     from delphi.model import Delphi, DelphiConfig
-    from utils.mlflow_utils import load_run_params, load_checkpoint, parse_domains_param
+    from utils.mlflow_utils import parse_domains_param
     from utils.ckpt_utils import (
         infer_delphi_config_from_state_dict,
         migrate_legacy_state_dict,
@@ -324,13 +400,10 @@ def reconstruct_model(run_id: str):
         strip_compiled_prefix,
     )
 
-    params = load_run_params(run_id)
     attn_scheme = params["attention_scheme"]
 
-    ckpt, ckpt_path = load_checkpoint(run_id)
     weights = strip_compiled_prefix(ckpt["state_dict"])
     weights = migrate_legacy_state_dict(weights)
-    test_ids = ckpt["metadata"]["test_ids"]
 
     cfg = infer_delphi_config_from_state_dict(weights)
     domain_cfg = parse_domains_param(params["domains"], run_id=run_id)
@@ -354,8 +427,60 @@ def reconstruct_model(run_id: str):
     model = Delphi(delphi_cfg)
     weights = migrate_domain_embed_to_global_embed(weights, model)
     model.load_state_dict(weights, strict=True)
+    return model
+
+
+def reconstruct_model(run_id: str):
+    """
+    Lightweight model-only reconstruction from an MLflow run (Delphi or
+    DelphiMultiStream), with domain data paths under DELPHI_DIR/data/transforms/tokens.
+
+    The model is built from, in order of preference:
+      1. ckpt["model_spec"] (self-contained checkpoints, either class);
+      2. the run's 'arch' param (older DelphiMultiStream runs);
+      3. the state dict + 'domains' param (older single-trunk Delphi runs).
+
+    The no-event token settings used at training time are resolved and stored in
+    the returned params as params["no_event_token_rate"] (float) and
+    params["no_event_token_insertion_mode"] (str), taking the first available of:
+    ckpt["metadata"]["data_config"], the run's MLflow params, the model config
+    (DelphiConfig has them, DelphiMultiStreamConfig doesn't), and the defaults
+    5.0 / "random".
+
+    Returns: model, test_ids, ckpt_path, params
+    """
+    from utils.mlflow_utils import load_run_params, load_checkpoint
+    from utils.ckpt_utils import load_model_from_checkpoint
+
+    params = load_run_params(run_id)
+    ckpt, ckpt_path = load_checkpoint(run_id)
+    test_ids = ckpt["metadata"]["test_ids"]
+
+    if ckpt.get("model_spec") is not None:
+        from utils.ckpt_utils import check_spec_domain_order
+        check_spec_domain_order(ckpt["model_spec"], params.get("domains"), run_id)
+        tokens_dir = DELPHI_DIR / "data" / "transforms" / "tokens"
+        model = load_model_from_checkpoint(
+            {**ckpt, "model_spec": _spec_with_tokens_path(ckpt["model_spec"], tokens_dir)}
+        )
+    elif "arch" in params:
+        model = _build_multistream_from_params(run_id, params, ckpt)
+    else:
+        model = _build_delphi_from_state_dict(run_id, params, ckpt)
+
     model.to("cpu")
     model.eval()
+
+    data_config = ckpt.get("metadata", {}).get("data_config") or {}
+    model_cfg = _model_config(model)
+    for key, default in (("no_event_token_rate", 5.0), ("no_event_token_insertion_mode", "random")):
+        for source in (data_config.get(key), params.get(key), getattr(model_cfg, key, None)):
+            if source not in (None, "None"):  # MLflow logs a missing value as "None"
+                params[key] = source
+                break
+        else:
+            params[key] = default
+    params["no_event_token_rate"] = float(params["no_event_token_rate"])
 
     return model, test_ids, ckpt_path, params
 
