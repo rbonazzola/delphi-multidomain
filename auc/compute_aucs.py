@@ -44,7 +44,7 @@ DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 if (DELPHI_DIR := Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(DELPHI_DIR))
 
-from auc.aucs import evaluate_aucs
+from auc.aucs import DEFAULT_WASHOUT_DAYS, auc_filename, evaluate_aucs
 from utils.mlflow_utils import setup_mlflow, get_checkpoint_path, load_run_params, parse_domains_param
 from utils.run_loader import reconstruct_from_run, AUTO_BLOCK_SIZE
 
@@ -67,12 +67,15 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--n_jobs", type=int, default=8, help="Parallel jobs for AUC computation")
     parser.add_argument("--output_file", type=str, default=None,
-                        help="Filename for the AUC results. Defaults to 'aucs.csv' for "
-                             "--split test, 'aucs_val.csv' for --split val, and both "
-                             "(one per split) for --split both. With --score softmax and no "
-                             "explicit --output_file, defaults instead to 'aucs_softmax.csv' / "
-                             "'aucs_val_softmax.csv' so the two score variants never clobber "
-                             "each other.")
+                        help="Filename for the AUC results. Defaults to "
+                             "'aucs_washout{N}d.csv' for --split test, "
+                             "'aucs_val_washout{N}d.csv' for --split val, and both (one per "
+                             "split) for --split both. With --score softmax: "
+                             "'aucs[_val]_softmax_washout{N}d.csv'.")
+    parser.add_argument("--washout_days", type=float, default=DEFAULT_WASHOUT_DAYS,
+                        help="Score each case at the last token at least this many days before "
+                             "the diagnosis (cases without one are dropped). Default: %(default)g. "
+                             "See auc/aucs.py:evaluate_aucs")
     parser.add_argument("--score", choices=["logit", "softmax"], default="logit",
                         help="AUC score input: 'logit' (default, original behavior) uses the "
                              "raw per-token logit; 'softmax' uses softmax(logits)[token_id] "
@@ -97,11 +100,10 @@ def main():
     args = parser.parse_args()
 
     splits = ["val", "test"] if args.split == "both" else [args.split]
-    default_output_files = (
-        {"test": "aucs_softmax.csv", "val": "aucs_val_softmax.csv"}
-        if args.score == "softmax"
-        else {"test": "aucs.csv", "val": "aucs_val.csv"}
-    )
+    default_output_files = {
+        s: auc_filename(s, args.washout_days, suffix="_softmax" if args.score == "softmax" else "")
+        for s in ("test", "val")
+    }
 
     model, loaders, run_params = reconstruct_from_run(
         args.runid,
@@ -137,6 +139,7 @@ def main():
                 logger=logger,
                 output_file=output_file,
                 score_transform=args.score,
+                washout_days=args.washout_days,
             )
             logging.info(f"Done ({split}). {len(auc_df)} AUC rows computed.")
     finally:

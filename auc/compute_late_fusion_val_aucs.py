@@ -25,7 +25,7 @@ from utils.mlflow_utils import setup_mlflow, get_checkpoint_path
 from utils.run_loader import reconstruct_from_run
 from utils.trainer import MLFlowLogger
 from train_late_fusion import build_encoder, build_hla_features
-from auc.aucs import DEFAULT_WASHOUT_DAYS
+from auc.aucs import DEFAULT_WASHOUT_DAYS, auc_filename
 from auc.late_fusion_aucs import evaluate_aucs_late_fusion
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -89,7 +89,7 @@ def main():
     auc_loader = DataLoader(lf_dataset, batch_size=args.eval_batch_size, shuffle=False,
                              num_workers=args.num_workers, pin_memory=True, collate_fn=auc_collate)
 
-    output_file = "aucs_val.csv" if args.split == "val" else "aucs.csv"
+    output_file = auc_filename(args.split, args.washout_days)
     logger = MLFlowLogger(experiment_name=None, run_name=None, autostart=False)
     logger.start(resume_run_id=args.runid)
     try:

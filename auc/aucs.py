@@ -38,8 +38,8 @@ warnings.filterwarnings("ignore")
 DAYS_PER_YEAR = 365.25
 
 # Washout used to score cases in the AUCs (see add_washout_previous): each case is scored at
-# the last token at least this many days before its diagnosis.
-DEFAULT_WASHOUT_DAYS = 90.0
+# the last token at least this many days before its diagnosis. Was 90 until 2026-11-14.
+DEFAULT_WASHOUT_DAYS = 180.0
 SEX_TOKENS = {"female": 0, "male": 1}
 AGE_RANGES = [(a, a + 5) for a in range(0, 85, 5)]
 EMPTY = (np.array([], dtype=int), np.array([], dtype=int))
@@ -48,6 +48,16 @@ EMPTY = (np.array([], dtype=int), np.array([], dtype=int))
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Token DataFrame construction
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def auc_filename(split: str, washout_days: float, kind: str = "aucs", suffix: str = "") -> str:
+    """Artifact name of an AUC table: `{kind}[_val]{suffix}_washout{N}d.csv`, e.g.
+    aucs_washout180d.csv (test), aucs_val_washout180d.csv, freqbin20_val_washout180d.csv,
+    aucs_softmax_washout180d.csv. The washout is in the name so tables computed with different
+    washouts never overwrite each other (aucs.csv / aucs_val.csv are the older, unsuffixed ones)."""
+    if split not in ("test", "val"):
+        raise ValueError(f"split must be 'test' or 'val', got {split!r}")
+    return f"{kind}{'_val' if split == 'val' else ''}{suffix}_washout{washout_days:g}d.csv"
+
 
 def batch_to_tokens_df(batch, int_to_domain: Dict[int, str], domain_offsets: Dict[int, int]):
     """
@@ -433,7 +443,7 @@ def evaluate_aucs(
     washout_days : float
         Where a case is scored, which also sets its age bin: at the last token recorded at least
         `washout_days` days before the diagnosis token (see `add_washout_previous`); cases with
-        no such token are dropped. Default: DEFAULT_WASHOUT_DAYS (90), so neither codes recorded
+        no such token are dropped. Default: DEFAULT_WASHOUT_DAYS (180), so neither codes recorded
         together with the diagnosis (e.g. L40 with M07) nor the work-up that leads to it are seen.
         1: any earlier day. 0: the token right before the diagnosis token, whatever its date (the
         behavior before 2026-10-09; reproduces earlier aucs.csv files). Controls are scored as

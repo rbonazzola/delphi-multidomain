@@ -55,7 +55,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from auc.aucs import DEFAULT_WASHOUT_DAYS, evaluate_aucs
+from auc.aucs import DEFAULT_WASHOUT_DAYS, auc_filename, evaluate_aucs
 from data.dataset import DelphiDataset, DelphiCollateFn, AgeSampler
 from utils.ckpt_utils import load_model_from_checkpoint, strip_compiled_prefix, _domain_configs_from_spec
 from utils.mlflow_utils import setup_mlflow
@@ -369,12 +369,12 @@ def eval_jobs(args, subjects_arg, metadata, launch_dir, output_arg):
     if subjects_arg:
         if args.split != "test":
             print("WARNING: ignoring --split since --subjects was given")
-        jobs = [(f"{subjects_arg.name}", read_subject_ids(subjects_arg), "aucs.csv")]
+        jobs = [(f"{subjects_arg.name}", read_subject_ids(subjects_arg), "test")]
     else:
         splits = ["val", "test"] if args.split == "both" else [args.split]
-        jobs = [(s, list(metadata[SPLIT_KEYS[s]]), "aucs.csv" if s == "test" else "aucs_val.csv") for s in splits]
-    if args.score == "softmax":
-        jobs = [(label, ids, out.replace(".csv", "_softmax.csv")) for label, ids, out in jobs]
+        jobs = [(s, list(metadata[SPLIT_KEYS[s]]), s) for s in splits]
+    suffix = "_softmax" if args.score == "softmax" else ""
+    jobs = [(label, ids, auc_filename(split, args.washout_days, suffix=suffix)) for label, ids, split in jobs]
     jobs = [(label, ids, launch_dir / out) for label, ids, out in jobs]
     if output_arg and len(jobs) == 1:
         jobs = [(jobs[0][0], jobs[0][1], output_arg)]
@@ -435,7 +435,8 @@ def main():
                          "0: the token right before the diagnosis (AUCs computed before 2026-10-09). "
                          "See auc/aucs.py:evaluate_aucs")
     ap.add_argument("--output", default=None,
-                    help="Output CSV. Default: aucs.csv / aucs_val.csv (with a _softmax suffix if --score softmax). "
+                    help="Output CSV. Default: aucs_washout{N}d.csv / aucs_val_washout{N}d.csv "
+                         "(aucs[_val]_softmax_washout{N}d.csv with --score softmax). "
                          "With --split both the defaults are always used.")
     ap.add_argument("--log_mlflow", action="store_true",
                     help="Also log the CSV as a run artifact (the run must be in MLflow)")
